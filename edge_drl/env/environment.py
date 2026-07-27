@@ -210,7 +210,7 @@ class EdgeComputingEnv:
             if not np.any(mask):
                 invalid += 1
                 continue
-            if hasattr(scheduler, "select_path_with_obs"):
+            if hasattr(scheduler, "select_path_with_obs") or getattr(scheduler, "use_top_k_mask", False):
                 mask = self._top_k_scheduler_mask(
                     task,
                     mask,
@@ -219,6 +219,7 @@ class EdgeComputingEnv:
                     pending_node,
                     pending_link,
                 )
+            if hasattr(scheduler, "select_path_with_obs"):
                 task_obs = self.task_observation(task, pending_node, pending_link)
                 action = scheduler.select_path_with_obs(task, mask, task_obs)
             elif hasattr(scheduler, "select_path"):

@@ -37,7 +37,7 @@ class PPOUpdater:
         gae_lambda: float = 0.95,
         clip_ratio: float = 0.2,
         value_coef: float = 0.5,
-        entropy_coef: float = 0.01,
+        entropy_coef: float = 0.001,
         normalize_rewards: bool = True,
     ):
         self.model = model

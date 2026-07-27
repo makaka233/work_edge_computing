@@ -4,7 +4,8 @@ param(
     [int]$ValidationEvery = 5,
     [int]$ValidationSeed = 10007,
     [int]$Seed = 7,
-    [int]$TopK = 16
+    [int]$TopK = 16,
+    [double]$EntropyCoef = 0.001
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,6 +39,7 @@ $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     --seconds $Seconds `
     --agent-d-warmup-episodes $Episodes `
     --ppo-lr 0.00005 `
+    --ppo-entropy-coef $EntropyCoef `
     --val-seconds $Seconds `
     --val-every $ValidationEvery `
     --val-seed $ValidationSeed `

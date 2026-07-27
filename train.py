@@ -111,6 +111,7 @@ def main() -> None:
     parser.add_argument("--agent-s-top-k-actions", type=int, default=None)
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
     parser.add_argument("--ppo-gae-lambda", type=float, default=0.95)
+    parser.add_argument("--ppo-entropy-coef", type=float, default=0.001)
     parser.add_argument("--val-seconds", type=int, default=0)
     parser.add_argument("--val-every", type=int, default=1)
     parser.add_argument("--val-freeze-agent-d", action="store_true")
@@ -145,6 +146,7 @@ def main() -> None:
             device=device,
             ppo_lr=args.ppo_lr,
             ppo_gae_lambda=args.ppo_gae_lambda,
+            ppo_entropy_coef=args.ppo_entropy_coef,
         )
         bc_stats = None
         if args.bc_seconds > 0:

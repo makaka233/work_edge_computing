@@ -35,6 +35,7 @@ class IntegratedTrainer:
         world_batch_size: int = 64,
         ppo_lr: float = 3e-4,
         ppo_gae_lambda: float = 0.95,
+        ppo_entropy_coef: float = 0.001,
     ):
         self.env = EdgeComputingEnv(config)
         self.device = torch.device(device)
@@ -46,7 +47,7 @@ class IntegratedTrainer:
             num_actions=self.env.path_manager.num_actions,
         ).to(self.device)
         self.scheduler = TorchAgentSScheduler(self.agent_s, device=device)
-        self.ppo = PPOUpdater(self.agent_s, lr=ppo_lr, gae_lambda=ppo_gae_lambda)
+        self.ppo = PPOUpdater(self.agent_s, lr=ppo_lr, gae_lambda=ppo_gae_lambda, entropy_coef=ppo_entropy_coef)
         self.agent_d = AgentDActorCritic(
             obs_dim=self.state_dim,
             num_services=self.env.num_services,

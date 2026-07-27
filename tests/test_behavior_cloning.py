@@ -10,8 +10,10 @@ class BehaviorCloningTest(unittest.TestCase):
     def test_collect_and_pretrain(self):
         cfg = load_config("config/default.yaml")
         cfg["simulation"]["seconds_per_episode"] = 2
+        cfg["simulation"]["agent_s_top_k_actions"] = 8
         samples = collect_bc_samples(cfg, seconds=1, max_samples=64)
         self.assertGreater(samples.size, 0)
+        self.assertLessEqual(int(samples.masks.sum(axis=1).max()), 8)
         env = EdgeComputingEnv(cfg)
         env.reset()
         model = AgentSActorCritic(env.task_obs_dim, env.path_manager.num_actions, hidden_dim=64)

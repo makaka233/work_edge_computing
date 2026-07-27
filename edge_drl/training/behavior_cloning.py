@@ -40,6 +40,7 @@ class RecordingHeuristicScheduler(HeuristicScheduler):
         self.obs: list[np.ndarray] = []
         self.masks: list[np.ndarray] = []
         self.actions: list[int] = []
+        self.use_top_k_mask = True
 
     def record_teacher_sample(self, task: Task, mask: np.ndarray, task_obs: np.ndarray, action: int) -> None:
         del task

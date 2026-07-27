@@ -15,9 +15,9 @@ from edge_drl.training import IntegratedTrainer
 from edge_drl.utils import append_csv_row, save_json, timestamped_run_dir
 
 
-def evaluate_baseline(config: dict, mode: str, episodes: int, seconds: int | None) -> list[dict[str, float]]:
+def evaluate_baseline(config: dict, mode: str, episodes: int, seconds: int | None, seed: int | None) -> list[dict[str, float]]:
     rows = []
-    base_seed = int(config["simulation"]["seed"])
+    base_seed = int(config["simulation"]["seed"] if seed is None else seed)
     for ep in range(episodes):
         cfg = dict(config)
         cfg["simulation"] = dict(config["simulation"])
@@ -42,6 +42,7 @@ def evaluate_neural(
     seconds: int | None,
     device: str,
     freeze_agent_d: bool,
+    seed: int | None,
 ) -> list[dict[str, float]]:
     payload_config = None
     trainer = None
@@ -51,7 +52,7 @@ def evaluate_neural(
         if trainer is None:
             payload = torch.load(checkpoint, map_location=device)
             payload_config = copy.deepcopy(payload["config"])
-            base_seed = int(payload_config["simulation"]["seed"])
+            base_seed = int(payload_config["simulation"]["seed"] if seed is None else seed)
             if seconds is not None:
                 payload_config["simulation"]["seconds_per_episode"] = int(seconds)
             trainer = IntegratedTrainer(payload_config, device=device)
@@ -141,6 +142,7 @@ def main() -> None:
     parser.add_argument("--seconds", type=int, default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--freeze-agent-d", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--run-root", default="runs_eval")
     parser.add_argument("--run-name", default=None)
     args = parser.parse_args()
@@ -151,10 +153,10 @@ def main() -> None:
     if args.mode == "neural":
         if args.checkpoint is None:
             raise ValueError("--checkpoint is required for --mode neural")
-        rows = evaluate_neural(Path(args.checkpoint), args.episodes, args.seconds, args.device, args.freeze_agent_d)
+        rows = evaluate_neural(Path(args.checkpoint), args.episodes, args.seconds, args.device, args.freeze_agent_d, args.seed)
     else:
         config = load_config(args.config)
-        rows = evaluate_baseline(config, args.mode, args.episodes, args.seconds)
+        rows = evaluate_baseline(config, args.mode, args.episodes, args.seconds, args.seed)
 
     for row in rows:
         append_csv_row(run_dir / "eval_log.csv", row)
