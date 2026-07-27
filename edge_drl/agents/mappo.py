@@ -34,16 +34,20 @@ class PPOUpdater:
         model: nn.Module,
         lr: float = 3e-4,
         gamma: float = 0.99,
+        gae_lambda: float = 0.95,
         clip_ratio: float = 0.2,
         value_coef: float = 0.5,
         entropy_coef: float = 0.01,
+        normalize_rewards: bool = True,
     ):
         self.model = model
         self.opt = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
+        self.gae_lambda = gae_lambda
         self.clip_ratio = clip_ratio
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
+        self.normalize_rewards = normalize_rewards
 
     def update(
         self,
@@ -66,9 +70,11 @@ class PPOUpdater:
         masks = torch.stack(buffer.masks).to(device)
         actions = torch.stack(buffer.actions).to(device)
         old_log_probs = torch.stack(buffer.log_probs).detach().to(device)
-        returns = self._returns(buffer.rewards, buffer.dones, device)
         values = torch.stack(buffer.values).detach().to(device)
-        advantages = returns - values
+        rewards = torch.as_tensor(buffer.rewards, dtype=torch.float32, device=device)
+        if self.normalize_rewards and rewards.numel() > 1:
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        value_targets, advantages = self._gae_returns(rewards, buffer.dones, values)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         totals = {
@@ -91,7 +97,7 @@ class PPOUpdater:
             clipped = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
             policy_loss = -torch.min(unclipped, clipped).mean()
             value = self.model.value(obs)
-            value_loss = torch.mean((value - returns) ** 2)
+            value_loss = torch.mean((value - value_targets) ** 2)
             loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
             self.opt.zero_grad()
             loss.backward()
@@ -105,20 +111,29 @@ class PPOUpdater:
             totals["clip_fraction"] += float(clip_fraction.detach().item())
 
         stats = {name: value / max(epochs, 1) for name, value in totals.items()}
-        return_variance = torch.var(returns, unbiased=False)
+        return_variance = torch.var(value_targets, unbiased=False)
         if return_variance > 1e-8:
-            prediction_error = returns - values
+            prediction_error = value_targets - values
             explained_variance = 1.0 - torch.var(prediction_error, unbiased=False) / return_variance
             stats["explained_variance"] = float(explained_variance.item())
         else:
             stats["explained_variance"] = 0.0
         return stats
 
-    def _returns(self, rewards: list[float], dones: list[bool], device: torch.device) -> torch.Tensor:
-        out = []
-        running = 0.0
-        for reward, done in zip(reversed(rewards), reversed(dones)):
-            running = float(reward) + self.gamma * running * (0.0 if done else 1.0)
-            out.append(running)
-        out.reverse()
-        return torch.tensor(out, dtype=torch.float32, device=device)
+    def _gae_returns(
+        self,
+        rewards: torch.Tensor,
+        dones: list[bool],
+        values: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        advantages = torch.zeros_like(values)
+        last_advantage = torch.tensor(0.0, dtype=torch.float32, device=values.device)
+        next_value = torch.tensor(0.0, dtype=torch.float32, device=values.device)
+        for index in reversed(range(rewards.numel())):
+            non_terminal = 0.0 if dones[index] else 1.0
+            delta = rewards[index] + self.gamma * next_value * non_terminal - values[index]
+            last_advantage = delta + self.gamma * self.gae_lambda * non_terminal * last_advantage
+            advantages[index] = last_advantage
+            next_value = values[index]
+        returns = advantages + values
+        return returns.detach(), advantages.detach()

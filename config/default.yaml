@@ -4,6 +4,7 @@ simulation:
   deployment_interval_seconds: 14400
   slots_per_day: 86400
   max_service_replicas: 5
+  agent_s_top_k_actions: 16
   max_request_probability: 0.8
   max_users_per_node_type: 5000
 

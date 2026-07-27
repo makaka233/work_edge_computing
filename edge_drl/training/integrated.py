@@ -34,6 +34,7 @@ class IntegratedTrainer:
         rollout_tasks: int = 512,
         world_batch_size: int = 64,
         ppo_lr: float = 3e-4,
+        ppo_gae_lambda: float = 0.95,
     ):
         self.env = EdgeComputingEnv(config)
         self.device = torch.device(device)
@@ -45,7 +46,7 @@ class IntegratedTrainer:
             num_actions=self.env.path_manager.num_actions,
         ).to(self.device)
         self.scheduler = TorchAgentSScheduler(self.agent_s, device=device)
-        self.ppo = PPOUpdater(self.agent_s, lr=ppo_lr)
+        self.ppo = PPOUpdater(self.agent_s, lr=ppo_lr, gae_lambda=ppo_gae_lambda)
         self.agent_d = AgentDActorCritic(
             obs_dim=self.state_dim,
             num_services=self.env.num_services,
@@ -227,13 +228,17 @@ class IntegratedTrainer:
         return np.array([density, float(violation_score)], dtype=np.float32)
 
     def _append_scheduler_records(self, reward: float, done: bool) -> None:
+        decision_count = len(self.scheduler.decisions)
+        if decision_count <= 0:
+            return
+        per_decision_reward = float(reward) / float(decision_count)
         for record in self.scheduler.decisions:
             self.rollout.obs.append(record.obs)
             self.rollout.masks.append(record.mask)
             self.rollout.actions.append(record.action)
             self.rollout.log_probs.append(record.log_prob)
             self.rollout.values.append(record.value)
-            self.rollout.rewards.append(float(reward))
+            self.rollout.rewards.append(per_decision_reward)
             self.rollout.dones.append(done)
 
     def _train_world_model_step(self) -> float:

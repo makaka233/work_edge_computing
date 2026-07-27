@@ -108,7 +108,9 @@ def main() -> None:
     parser.add_argument("--bc-max-samples", type=int, default=None)
     parser.add_argument("--bc-batch-size", type=int, default=256)
     parser.add_argument("--agent-d-warmup-episodes", type=int, default=0)
+    parser.add_argument("--agent-s-top-k-actions", type=int, default=None)
     parser.add_argument("--ppo-lr", type=float, default=3e-4)
+    parser.add_argument("--ppo-gae-lambda", type=float, default=0.95)
     parser.add_argument("--val-seconds", type=int, default=0)
     parser.add_argument("--val-every", type=int, default=1)
     parser.add_argument("--val-freeze-agent-d", action="store_true")
@@ -122,6 +124,8 @@ def main() -> None:
         config["simulation"]["seed"] = int(args.seed)
     if args.seconds is not None:
         config["simulation"]["seconds_per_episode"] = int(args.seconds)
+    if args.agent_s_top_k_actions is not None:
+        config["simulation"]["agent_s_top_k_actions"] = int(args.agent_s_top_k_actions)
     seed = int(config["simulation"]["seed"])
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -140,6 +144,7 @@ def main() -> None:
             config,
             device=device,
             ppo_lr=args.ppo_lr,
+            ppo_gae_lambda=args.ppo_gae_lambda,
         )
         bc_stats = None
         if args.bc_seconds > 0:

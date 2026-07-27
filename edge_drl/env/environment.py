@@ -211,6 +211,14 @@ class EdgeComputingEnv:
                 invalid += 1
                 continue
             if hasattr(scheduler, "select_path_with_obs"):
+                mask = self._top_k_scheduler_mask(
+                    task,
+                    mask,
+                    node_pressure,
+                    link_pressure,
+                    pending_node,
+                    pending_link,
+                )
                 task_obs = self.task_observation(task, pending_node, pending_link)
                 action = scheduler.select_path_with_obs(task, mask, task_obs)
             elif hasattr(scheduler, "select_path"):
@@ -237,6 +245,67 @@ class EdgeComputingEnv:
             self._add_pending_load(task, path, pending_node, pending_link)
 
         return scheduled, invalid
+
+    def _top_k_scheduler_mask(
+        self,
+        task: Task,
+        mask: np.ndarray,
+        node_pressure: np.ndarray,
+        link_pressure: np.ndarray,
+        pending_node: np.ndarray,
+        pending_link: np.ndarray,
+    ) -> np.ndarray:
+        top_k = int(self.config["simulation"].get("agent_s_top_k_actions", 0))
+        feasible = np.flatnonzero(mask)
+        if top_k <= 0 or feasible.size <= top_k:
+            return mask
+
+        scored = []
+        for action in feasible:
+            path = self.path_manager.path(int(action))
+            score = self._path_score(task, path, node_pressure, link_pressure, pending_node, pending_link)
+            scored.append((score, int(action)))
+        scored.sort(key=lambda item: item[0])
+
+        top_mask = np.zeros_like(mask)
+        for _, action in scored[:top_k]:
+            top_mask[action] = True
+        return top_mask
+
+    def _path_score(
+        self,
+        task: Task,
+        path: tuple[int, int, int],
+        node_pressure: np.ndarray,
+        link_pressure: np.ndarray,
+        pending_node: np.ndarray,
+        pending_link: np.ndarray,
+    ) -> float:
+        active = path[: task.stage_count]
+        score = 0.0
+        for j, node in enumerate(active):
+            capacity = max(float(self.compute_capacity[node]), 1e-6)
+            pressure = float(node_pressure[node]) + float(pending_node[node]) / capacity
+            score += float(task.compute_gcycles[j]) / capacity * (1.0 + pressure)
+
+        if active[0] != task.source_node:
+            score += self._link_score(task.input_mb, task.source_node, active[0], link_pressure, pending_link)
+        for j, (left, right) in enumerate(zip(active[:-1], active[1:])):
+            if left != right:
+                score += self._link_score(task.output_mb[j], left, right, link_pressure, pending_link)
+        return score
+
+    def _link_score(
+        self,
+        data_mb: float,
+        left: int,
+        right: int,
+        link_pressure: np.ndarray,
+        pending_link: np.ndarray,
+    ) -> float:
+        capacity = max(float(self.bandwidth[left, right]), 1e-6)
+        pressure = float(link_pressure[left, right]) + float(pending_link[left, right]) / capacity
+        return float(data_mb) / capacity * (1.0 + pressure)
 
     def _add_pending_load(
         self,
