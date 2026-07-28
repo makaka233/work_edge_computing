@@ -116,6 +116,9 @@ def main() -> None:
     parser.add_argument("--val-every", type=int, default=1)
     parser.add_argument("--val-freeze-agent-d", action="store_true")
     parser.add_argument("--val-seed", type=int, default=10007)
+    parser.add_argument("--restore-best-patience", type=int, default=0)
+    parser.add_argument("--restore-min-delta", type=float, default=0.0)
+    parser.add_argument("--restore-lr-decay", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = parser.parse_args()
@@ -166,6 +169,8 @@ def main() -> None:
                 )
             )
         best_reward = -float("inf")
+        stale_validations = 0
+        current_ppo_lr = float(args.ppo_lr)
         history = []
         base_seed = int(config["simulation"]["seed"])
         for _ in range(args.episodes):
@@ -194,19 +199,43 @@ def main() -> None:
                         "val_tasks_total": float("nan"),
                     }
                 )
+            score = item["val_reward_mean"] if did_validate else (item["reward"] if args.val_seconds <= 0 else None)
+            if score is not None and score > best_reward:
+                best_reward = score
+                stale_validations = 0
+                item["restored_best"] = 0.0
+                item["restored_ppo_lr"] = float(trainer.ppo.opt.param_groups[0]["lr"])
+                trainer.save_checkpoint(
+                    run_dir / "checkpoints" / "best.pt",
+                    episode=int(item["episode"]),
+                    extra={"train": item, "bc": bc_stats},
+                )
+            elif did_validate and args.restore_best_patience > 0:
+                if score is not None and score < best_reward - float(args.restore_min_delta):
+                    stale_validations += 1
+                else:
+                    stale_validations = 0
+                if stale_validations >= args.restore_best_patience and (run_dir / "checkpoints" / "best.pt").exists():
+                    current_ppo_lr *= float(args.restore_lr_decay)
+                    trainer.load_checkpoint(run_dir / "checkpoints" / "best.pt")
+                    restored_lr = trainer.set_ppo_lr(current_ppo_lr)
+                    item["restored_best"] = 1.0
+                    item["restored_ppo_lr"] = restored_lr
+                    stale_validations = 0
+                else:
+                    item["restored_best"] = 0.0
+                    item["restored_ppo_lr"] = float(trainer.ppo.opt.param_groups[0]["lr"])
+            elif did_validate:
+                item["restored_best"] = 0.0
+                item["restored_ppo_lr"] = float(trainer.ppo.opt.param_groups[0]["lr"])
+            else:
+                item["restored_best"] = 0.0
+                item["restored_ppo_lr"] = float(trainer.ppo.opt.param_groups[0]["lr"])
             history.append(item)
             append_csv_row(run_dir / "train_log.csv", item)
             if int(item["episode"]) % max(args.save_every, 1) == 0:
                 trainer.save_checkpoint(
                     run_dir / "checkpoints" / "latest.pt",
-                    episode=int(item["episode"]),
-                    extra={"train": item, "bc": bc_stats},
-                )
-            score = item["val_reward_mean"] if did_validate else (item["reward"] if args.val_seconds <= 0 else None)
-            if score is not None and score > best_reward:
-                best_reward = score
-                trainer.save_checkpoint(
-                    run_dir / "checkpoints" / "best.pt",
                     episode=int(item["episode"]),
                     extra={"train": item, "bc": bc_stats},
                 )

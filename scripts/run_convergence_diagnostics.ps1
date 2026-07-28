@@ -5,7 +5,9 @@ param(
     [int]$ValidationSeed = 10007,
     [int]$Seed = 7,
     [int]$TopK = 16,
-    [double]$EntropyCoef = 0.001
+    [double]$EntropyCoef = 0.001,
+    [int]$RestorePatience = 2,
+    [double]$RestoreLrDecay = 0.5
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +46,8 @@ $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     --val-every $ValidationEvery `
     --val-seed $ValidationSeed `
     --val-freeze-agent-d `
+    --restore-best-patience $RestorePatience `
+    --restore-lr-decay $RestoreLrDecay `
     --save-every 5 `
     --run-name $runName `
     1>> $stdoutPath 2>> $stderrPath

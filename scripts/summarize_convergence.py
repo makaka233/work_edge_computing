@@ -49,6 +49,8 @@ def summarize(train_log: Path, heuristic_log: Path | None = None, tail: int = 5)
         "ppo_entropy_last": _finite_float(rows[-1].get("ppo_entropy", "")),
         "ppo_explained_variance_last": _finite_float(rows[-1].get("ppo_explained_variance", "")),
         "ppo_value_loss_last": _finite_float(rows[-1].get("ppo_value_loss", "")),
+        "restore_count": sum(1 for row in rows if _finite_float(row.get("restored_best", "")) == 1.0),
+        "restored_ppo_lr_last": _finite_float(rows[-1].get("restored_ppo_lr", "")),
     }
 
     if heuristic_log is not None:

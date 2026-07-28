@@ -15,6 +15,10 @@ Core design:
 - Continuous compute and bandwidth allocation is solved analytically with KKT.
 - A world model predicts next-second state and reward as a diagnostic module.
 
+Reference-guided roadmap:
+
+- [docs/reference_guided_roadmap.md](docs/reference_guided_roadmap.md)
+
 Run a smoke simulation:
 
 ```powershell
@@ -38,7 +42,13 @@ python train.py --config config/default.yaml --mode neural --bc-seconds 10 --bc-
 Run BC pretraining followed by PPO with validation-based checkpointing:
 
 ```powershell
-python train.py --config config/default.yaml --mode neural --seed 7 --agent-s-top-k-actions 16 --bc-seconds 60 --bc-epochs 50 --bc-max-samples 12000 --episodes 100 --seconds 300 --agent-d-warmup-episodes 100 --ppo-lr 0.00005 --ppo-entropy-coef 0.001 --val-seconds 300 --val-every 5 --val-freeze-agent-d --run-name convergence_seed7_topk16
+python train.py --config config/default.yaml --mode neural --seed 7 --agent-s-top-k-actions 16 --bc-seconds 60 --bc-epochs 50 --bc-max-samples 12000 --episodes 100 --seconds 300 --agent-d-warmup-episodes 100 --ppo-lr 0.00005 --ppo-entropy-coef 0.001 --val-seconds 300 --val-every 5 --val-freeze-agent-d --restore-best-patience 2 --restore-lr-decay 0.5 --run-name convergence_seed7_stable
+```
+
+Summarize convergence against a strict same-seed heuristic run:
+
+```powershell
+python scripts/summarize_convergence.py runs/convergence_seed7_stable/train_log.csv --heuristic-log runs_eval/heuristic_eval_seed10007_120_strict/eval_log.csv
 ```
 
 Evaluate a baseline:

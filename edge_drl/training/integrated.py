@@ -209,6 +209,9 @@ class IntegratedTrainer:
             "agent_s": self.agent_s.state_dict(),
             "agent_d": self.agent_d.state_dict(),
             "world_model": self.world_model.state_dict(),
+            "ppo_optimizer": self.ppo.opt.state_dict(),
+            "agent_d_optimizer": self.agent_d_updater.opt.state_dict(),
+            "world_optimizer": self.world_opt.state_dict(),
             "extra": extra or {},
         }
         torch.save(payload, path)
@@ -218,7 +221,22 @@ class IntegratedTrainer:
         self.agent_s.load_state_dict(payload["agent_s"], strict=strict)
         self.agent_d.load_state_dict(payload["agent_d"], strict=strict)
         self.world_model.load_state_dict(payload["world_model"], strict=strict)
+        if "ppo_optimizer" in payload:
+            self.ppo.opt.load_state_dict(payload["ppo_optimizer"])
+        if "agent_d_optimizer" in payload:
+            self.agent_d_updater.opt.load_state_dict(payload["agent_d_optimizer"])
+        if "world_optimizer" in payload:
+            self.world_opt.load_state_dict(payload["world_optimizer"])
         return payload
+
+    def scale_ppo_lr(self, factor: float) -> float:
+        current = float(self.ppo.opt.param_groups[0]["lr"])
+        return self.set_ppo_lr(current * float(factor))
+
+    def set_ppo_lr(self, lr: float) -> float:
+        for group in self.ppo.opt.param_groups:
+            group["lr"] = float(lr)
+        return float(lr)
 
     def _deployment_action_features(self, deployment_action: np.ndarray | None) -> np.ndarray:
         if deployment_action is None:
