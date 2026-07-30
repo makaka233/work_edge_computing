@@ -171,19 +171,58 @@ class RolloutProgress:
         self.last_print_at = self.started_at
         self.printed = False
 
-    def maybe_print(self, env: EdgeComputingEnv) -> None:
+    def should_print(self) -> bool:
         if self.interval_seconds <= 0:
-            return
+            return False
         now = time.monotonic()
-        if not self.printed or now - self.last_print_at >= self.interval_seconds:
-            self._print(env, now=now)
+        return not self.printed or now - self.last_print_at >= self.interval_seconds
 
-    def finish(self, env: EdgeComputingEnv) -> None:
+    def maybe_print(
+        self,
+        env: EdgeComputingEnv,
+        *,
+        avg_reward: float = float("nan"),
+        avg_train_reward: float = float("nan"),
+        avg_latency_s: float | None = None,
+    ) -> None:
+        if self.should_print():
+            self._print(
+                env,
+                now=time.monotonic(),
+                avg_reward=avg_reward,
+                avg_train_reward=avg_train_reward,
+                avg_latency_s=avg_latency_s,
+            )
+
+    def finish(
+        self,
+        env: EdgeComputingEnv,
+        *,
+        avg_reward: float = float("nan"),
+        avg_train_reward: float = float("nan"),
+        avg_latency_s: float | None = None,
+    ) -> None:
         if self.interval_seconds <= 0:
             return
-        self._print(env, now=time.monotonic(), final=True)
+        self._print(
+            env,
+            now=time.monotonic(),
+            final=True,
+            avg_reward=avg_reward,
+            avg_train_reward=avg_train_reward,
+            avg_latency_s=avg_latency_s,
+        )
 
-    def _print(self, env: EdgeComputingEnv, *, now: float, final: bool = False) -> None:
+    def _print(
+        self,
+        env: EdgeComputingEnv,
+        *,
+        now: float,
+        final: bool = False,
+        avg_reward: float = float("nan"),
+        avg_train_reward: float = float("nan"),
+        avg_latency_s: float | None = None,
+    ) -> None:
         requests = float(env.metrics.get("requests", 0.0))
         aggregate_events = int(env.metrics.get("aggregate_events", 0.0))
         sim_hours = env.current_time_minute / 60.0
@@ -192,7 +231,8 @@ class RolloutProgress:
             progress = min(episode_fraction, 1.0)
         else:
             progress = min(requests / max(float(self.target_requests or 1), 1.0), 1.0)
-        avg_latency = env.metrics["total_latency_s"] / max(requests, 1.0)
+        if avg_latency_s is None:
+            avg_latency_s = env.metrics["total_latency_s"] / max(requests, 1.0)
         elapsed = max(now - self.started_at, 1e-9)
         eta = elapsed * (1.0 - progress) / max(progress, 1e-9) if progress > 0 else float("nan")
         total_windows = max(int(np.ceil(self.episode_hours * 60.0 / max(self.deployment_interval_minutes, 1))), 1)
@@ -210,22 +250,24 @@ class RolloutProgress:
             else:
                 total_elapsed = max(now - self.overall_started_at, 1e-9)
             total_eta = total_elapsed * (1.0 - overall_progress) / max(overall_progress, 1e-9)
-            overall_text = f" all={overall_progress * 100:5.1f}% total_eta={_format_duration(total_eta)}"
+            overall_text = (
+                f" | all [{_progress_bar(overall_progress, width=12)}] "
+                f"{overall_progress * 100:4.1f}% ETA {_format_duration(total_eta)}"
+            )
         line = (
-            f"\r{self.label} {progress * 100:6.2f}% "
-            f"req={int(requests):>7}/{request_target:<7} "
-            f"events={aggregate_events:>5} "
-            f"sim_h={sim_hours:5.2f}/{self.episode_hours:<2} "
-            f"win={current_window}/{total_windows} "
-            f"deploy={int(env.metrics.get('deployment_updates', 0.0)):>2} "
-            f"lat={avg_latency * 1000:7.2f}ms "
-            f"sim_req/s={sim_request_rate:6.1f} "
-            f"wall_ev/s={wall_event_rate:5.1f} "
-            f"elapsed={_format_duration(elapsed)} "
-            f"eta={_format_duration(eta)}"
+            f"\r{self.label} [{_progress_bar(progress, width=24)}] {progress * 100:5.1f}% "
+            f"| epR={_format_metric(avg_reward, 4)} "
+            f"trainR={_format_metric(avg_train_reward, 4)} "
+            f"Lat={avg_latency_s * 1000:6.1f}ms "
+            f"| win={current_window}/{total_windows} deploy={int(env.metrics.get('deployment_updates', 0.0)):>2} "
+            f"sim={sim_hours:4.1f}/{self.episode_hours}h "
+            f"req={int(requests)}/{request_target} "
+            f"ev={aggregate_events} "
+            f"spd={wall_event_rate:4.1f}ev/s "
+            f"ETA {_format_duration(eta)}"
             f"{overall_text}"
         )
-        sys.stdout.write(line[:260])
+        sys.stdout.write(line[:240])
         if final:
             sys.stdout.write("\n")
         sys.stdout.flush()
@@ -242,6 +284,18 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def _progress_bar(progress: float, *, width: int) -> str:
+    progress = min(max(float(progress), 0.0), 1.0)
+    filled = int(round(progress * width))
+    return "#" * filled + "-" * (width - filled)
+
+
+def _format_metric(value: float, precision: int) -> str:
+    if not np.isfinite(value):
+        return "--"
+    return f"{value:.{precision}f}"
 
 
 def estimate_episode_requests(env: EdgeComputingEnv) -> int:
@@ -337,8 +391,19 @@ def rollout(
         if greedy_info is not None:
             greedy_latencies.append(float(greedy_info["latency_s"]))
             greedy_weights.append(request_count)
-        progress.maybe_print(env)
-    progress.finish(env)
+        if progress.should_print():
+            progress.maybe_print(
+                env,
+                avg_reward=_weighted_mean(rewards, weights),
+                avg_train_reward=_weighted_mean(train_rewards, weights),
+                avg_latency_s=_weighted_mean(latencies, weights),
+            )
+    progress.finish(
+        env,
+        avg_reward=_weighted_mean(rewards, weights),
+        avg_train_reward=_weighted_mean(train_rewards, weights),
+        avg_latency_s=_weighted_mean(latencies, weights),
+    )
     if record and env.metrics["requests"] > 0:
         agent.flush_slow_window_reward(done=True)
     window_stats = _deployment_window_latency_stats(window_latencies)
