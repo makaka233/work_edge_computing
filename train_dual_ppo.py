@@ -72,6 +72,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-entropy-coef", type=float, default=0.0)
     parser.add_argument("--slow-target-kl", type=float, default=0.03)
     parser.add_argument("--fast-target-kl", type=float, default=0.03)
+    parser.add_argument("--slow-minibatch-size", type=int, default=2048)
+    parser.add_argument("--fast-minibatch-size", type=int, default=512)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--load-checkpoint", type=str, default="")
     parser.add_argument("--deterministic-eval", action="store_true")
@@ -783,6 +785,8 @@ def main() -> None:
         fast_entropy_coef=args.fast_entropy_coef,
         slow_target_kl=args.slow_target_kl,
         fast_target_kl=args.fast_target_kl,
+        slow_minibatch_size=args.slow_minibatch_size,
+        fast_minibatch_size=args.fast_minibatch_size,
         fast_policy_kind=args.fast_policy_kind,
     )
     loaded_metadata: dict[str, object] = {}
@@ -822,6 +826,7 @@ def main() -> None:
             args.fast_entropy_coef,
         )
     )
+    print(f"  ppo_minibatch slow={args.slow_minibatch_size} fast={args.fast_minibatch_size}")
     print("  slow_agent=service deployment every 240 minutes")
     print("  fast_agent=stage scheduling per task request")
     if args.fast_bc_requests > 0:

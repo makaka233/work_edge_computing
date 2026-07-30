@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--max-replicas-per-stage", dest="replicas_per_stage", type=int, default=5)
+    parser.add_argument("--slow-minibatch-size", type=int, default=2048)
+    parser.add_argument("--fast-minibatch-size", type=int, default=512)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--progress-interval-seconds", type=float, default=10.0)
     parser.add_argument("--fixed-scenario", action="store_true")
@@ -94,6 +96,10 @@ def main() -> None:
         args.fast_policy_kind,
         "--max-replicas-per-stage",
         str(args.replicas_per_stage),
+        "--slow-minibatch-size",
+        str(args.slow_minibatch_size),
+        "--fast-minibatch-size",
+        str(args.fast_minibatch_size),
         "--eval-seeds",
         str(args.eval_seeds),
         "--eval-requests",

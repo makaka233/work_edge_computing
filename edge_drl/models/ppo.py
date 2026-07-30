@@ -265,6 +265,7 @@ class PPOAgent:
         entropy_coef: float = 0.01,
         value_coef: float = 0.5,
         target_kl: float | None = 0.03,
+        minibatch_size: int = 512,
         policy_kind: str = "flat",
         global_dim: int | None = None,
         node_feature_dim: int | None = None,
@@ -279,6 +280,7 @@ class PPOAgent:
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.target_kl = target_kl
+        self.minibatch_size = minibatch_size
         self.device = torch.device(device)
         if policy_kind == "flat":
             self.policy = MaskedActorCritic(obs_dim, action_dim, hidden_dim).to(self.device)
@@ -340,41 +342,52 @@ class PPOAgent:
         if len(self.buffer.rewards) != len(self.buffer.actions):
             raise ValueError("buffer contains pending transitions without rewards")
 
-        states = torch.as_tensor(np.stack(self.buffer.states), dtype=torch.float32, device=self.device)
-        masks = torch.as_tensor(np.stack(self.buffer.masks), dtype=torch.bool, device=self.device)
-        actions = torch.as_tensor(self.buffer.actions, dtype=torch.long, device=self.device)
-        old_logprobs = torch.as_tensor(self.buffer.logprobs, dtype=torch.float32, device=self.device)
         advantages_np, returns_np = self._gae_advantages_and_returns()
-        advantages = torch.as_tensor(advantages_np, dtype=torch.float32, device=self.device)
-        returns = torch.as_tensor(returns_np, dtype=torch.float32, device=self.device)
-        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+        advantages_np = (advantages_np - advantages_np.mean()) / (advantages_np.std() + 1e-8)
+
+        actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
+        old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
+        n = len(actions_np)
+        minibatch_size = max(1, min(self.minibatch_size, n))
 
         last_metrics: dict[str, float] = {}
         for _ in range(self.k_epochs):
-            dist, values = self.policy(states, masks)
-            logprobs = dist.log_prob(actions)
-            entropy = dist.entropy().mean()
-            ratios = torch.exp(logprobs - old_logprobs)
-            approx_kl = (old_logprobs - logprobs).mean()
+            order = np.random.permutation(n)
+            approx_kls: list[float] = []
+            for start in range(0, n, minibatch_size):
+                idx = order[start : start + minibatch_size]
+                states = torch.as_tensor(np.stack([self.buffer.states[i] for i in idx]), dtype=torch.float32, device=self.device)
+                masks = torch.as_tensor(np.stack([self.buffer.masks[i] for i in idx]), dtype=torch.bool, device=self.device)
+                actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
+                old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
+                advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
+                returns = torch.as_tensor(returns_np[idx], dtype=torch.float32, device=self.device)
 
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = nn.functional.mse_loss(values, returns)
-            loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                dist, values = self.policy(states, masks)
+                logprobs = dist.log_prob(actions)
+                entropy = dist.entropy().mean()
+                ratios = torch.exp(logprobs - old_logprobs)
+                approx_kl = (old_logprobs - logprobs).mean()
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
-            self.optimizer.step()
-            last_metrics = {
-                "loss": float(loss.item()),
-                "policy_loss": float(policy_loss.item()),
-                "value_loss": float(value_loss.item()),
-                "entropy": float(entropy.item()),
-                "approx_kl": float(approx_kl.item()),
-            }
-            if self.target_kl is not None and approx_kl.item() > self.target_kl:
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = nn.functional.mse_loss(values, returns)
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.optimizer.step()
+                approx_kls.append(float(approx_kl.item()))
+                last_metrics = {
+                    "loss": float(loss.item()),
+                    "policy_loss": float(policy_loss.item()),
+                    "value_loss": float(value_loss.item()),
+                    "entropy": float(entropy.item()),
+                    "approx_kl": float(approx_kl.item()),
+                }
+            if self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
                 break
 
         self.buffer.clear()

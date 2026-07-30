@@ -36,6 +36,7 @@ class SlowDeploymentPPOAgent:
     k_epochs: int = 3
     entropy_coef: float = 0.001
     target_kl: float | None = 0.03
+    minibatch_size: int = 2048
     device: str = "cpu"
     ppo: PPOAgent = field(init=False)
     pending_indices: list[int] = field(default_factory=list)
@@ -50,6 +51,7 @@ class SlowDeploymentPPOAgent:
             k_epochs=self.k_epochs,
             entropy_coef=self.entropy_coef,
             target_kl=self.target_kl,
+            minibatch_size=self.minibatch_size,
             device=self.device,
         )
 
@@ -206,6 +208,7 @@ class FastSchedulingPPOAgent:
     k_epochs: int = 4
     entropy_coef: float = 0.0
     target_kl: float | None = 0.03
+    minibatch_size: int = 512
     device: str = "cpu"
     ppo: PPOAgent = field(init=False)
 
@@ -219,6 +222,7 @@ class FastSchedulingPPOAgent:
             k_epochs=self.k_epochs,
             entropy_coef=self.entropy_coef,
             target_kl=self.target_kl,
+            minibatch_size=self.minibatch_size,
             policy_kind=self.policy_kind,
             global_dim=FAST_GLOBAL_DIM,
             node_feature_dim=FAST_NODE_FEATURE_DIM,
@@ -406,6 +410,8 @@ class HierarchicalPPOAgent:
         fast_entropy_coef: float = 0.0,
         slow_target_kl: float | None = 0.03,
         fast_target_kl: float | None = 0.03,
+        slow_minibatch_size: int = 2048,
+        fast_minibatch_size: int = 512,
         fast_policy_kind: str = "gat_node_scorer",
     ) -> "HierarchicalPPOAgent":
         return cls(
@@ -418,6 +424,7 @@ class HierarchicalPPOAgent:
                 k_epochs=slow_k_epochs,
                 entropy_coef=slow_entropy_coef,
                 target_kl=slow_target_kl,
+                minibatch_size=slow_minibatch_size,
                 device=device,
             ),
             fast_agent=FastSchedulingPPOAgent(
@@ -428,6 +435,7 @@ class HierarchicalPPOAgent:
                 k_epochs=fast_k_epochs,
                 entropy_coef=fast_entropy_coef,
                 target_kl=fast_target_kl,
+                minibatch_size=fast_minibatch_size,
                 device=device,
             ),
         )
