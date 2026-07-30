@@ -1,125 +1,40 @@
-simulation:
-  seed: 7
-  seconds_per_episode: 3600
-  deployment_interval_seconds: 14400
-  slots_per_day: 86400
-  max_service_replicas: 5
-  agent_s_top_k_actions: 16
-  max_request_probability: 0.8
-  max_users_per_node_type: 5000
+# Default experiment settings.
+# The Python entrypoint currently parses the most important values directly via
+# argparse; this file is kept as the readable experiment contract.
 
-nodes:
-  - {name: E1_core, type: core, compute_gcycles_per_s: 120.0, memory_gb: 128.0, storage_gb: 2048.0, tidal: business}
-  - {name: E2_regional, type: regional, compute_gcycles_per_s: 95.0, memory_gb: 96.0, storage_gb: 1536.0, tidal: business}
-  - {name: E3_residential, type: regional, compute_gcycles_per_s: 75.0, memory_gb: 64.0, storage_gb: 1024.0, tidal: residential}
-  - {name: E4_industrial, type: regional, compute_gcycles_per_s: 85.0, memory_gb: 64.0, storage_gb: 1024.0, tidal: industrial}
-  - {name: E5_traffic, type: access, compute_gcycles_per_s: 55.0, memory_gb: 48.0, storage_gb: 768.0, tidal: traffic}
-  - {name: E6_medical, type: access, compute_gcycles_per_s: 60.0, memory_gb: 48.0, storage_gb: 768.0, tidal: business}
-  - {name: E7_campus, type: access, compute_gcycles_per_s: 50.0, memory_gb: 32.0, storage_gb: 512.0, tidal: residential}
-  - {name: E8_suburban, type: light, compute_gcycles_per_s: 35.0, memory_gb: 24.0, storage_gb: 384.0, tidal: mild}
-  - {name: E9_roadside, type: light, compute_gcycles_per_s: 40.0, memory_gb: 24.0, storage_gb: 384.0, tidal: traffic}
-  - {name: E10_light, type: light, compute_gcycles_per_s: 30.0, memory_gb: 16.0, storage_gb: 256.0, tidal: mild}
+scenario:
+  seed: 2026
+  num_users: 12000
+  num_edge_nodes: 48
+  num_service_types: 5
+  max_service_stages: 3
+  episode_hours: 24
 
-bandwidth_mb_per_s:
-  - [0, 900, 600, 700, 250, 350, 300, 0, 220, 0]
-  - [900, 0, 650, 500, 260, 300, 280, 180, 0, 0]
-  - [600, 650, 0, 300, 180, 220, 380, 240, 0, 160]
-  - [700, 500, 300, 0, 260, 200, 0, 180, 210, 0]
-  - [250, 260, 180, 260, 0, 0, 140, 0, 360, 120]
-  - [350, 300, 220, 200, 0, 0, 190, 160, 0, 130]
-  - [300, 280, 380, 0, 140, 190, 0, 220, 0, 180]
-  - [0, 180, 240, 180, 0, 160, 220, 0, 110, 200]
-  - [220, 0, 0, 210, 360, 0, 0, 110, 0, 140]
-  - [0, 0, 160, 0, 120, 130, 180, 200, 140, 0]
+time_scales:
+  slow_deployment_interval_minutes: 240
+  fast_scheduling_epoch: per_task_arrival
 
-services:
-  - name: video_monitoring
-    input_mb_mean: 45.0
-    input_mb_cv: 0.45
-    stages:
-      - {name: preprocess, memory_gb: 2.0, storage_gb: 12.0, compute_gcycles_mean: 3.5, compute_cv: 0.35, output_ratio: 0.55}
-      - {name: detection, memory_gb: 6.0, storage_gb: 40.0, compute_gcycles_mean: 18.0, compute_cv: 0.45, output_ratio: 0.20}
-      - {name: event_recognition, memory_gb: 4.0, storage_gb: 25.0, compute_gcycles_mean: 6.0, compute_cv: 0.35, output_ratio: 0.05}
-  - name: vehicular_perception
-    input_mb_mean: 16.0
-    input_mb_cv: 0.50
-    stages:
-      - {name: cleanup, memory_gb: 1.5, storage_gb: 8.0, compute_gcycles_mean: 2.0, compute_cv: 0.30, output_ratio: 0.70}
-      - {name: object_recognition, memory_gb: 5.0, storage_gb: 30.0, compute_gcycles_mean: 10.0, compute_cv: 0.45, output_ratio: 0.25}
-      - {name: traffic_decision, memory_gb: 2.0, storage_gb: 12.0, compute_gcycles_mean: 3.0, compute_cv: 0.35, output_ratio: 0.08}
-  - name: industrial_inspection
-    input_mb_mean: 25.0
-    input_mb_cv: 0.40
-    stages:
-      - {name: enhancement, memory_gb: 2.0, storage_gb: 10.0, compute_gcycles_mean: 3.0, compute_cv: 0.25, output_ratio: 0.65}
-      - {name: defect_detection, memory_gb: 5.5, storage_gb: 32.0, compute_gcycles_mean: 14.0, compute_cv: 0.40, output_ratio: 0.12}
-      - {name: classification, memory_gb: 2.5, storage_gb: 15.0, compute_gcycles_mean: 4.0, compute_cv: 0.30, output_ratio: 0.04}
-  - name: ar_assistance
-    input_mb_mean: 8.0
-    input_mb_cv: 0.60
-    stages:
-      - {name: pose_estimation, memory_gb: 2.5, storage_gb: 16.0, compute_gcycles_mean: 4.0, compute_cv: 0.40, output_ratio: 0.70}
-      - {name: scene_understanding, memory_gb: 5.0, storage_gb: 35.0, compute_gcycles_mean: 12.0, compute_cv: 0.50, output_ratio: 0.30}
-      - {name: render_assist, memory_gb: 3.0, storage_gb: 16.0, compute_gcycles_mean: 5.0, compute_cv: 0.35, output_ratio: 0.15}
-  - name: medical_screening
-    input_mb_mean: 4.0
-    input_mb_cv: 0.70
-    stages:
-      - {name: signal_preprocess, memory_gb: 1.0, storage_gb: 5.0, compute_gcycles_mean: 1.0, compute_cv: 0.30, output_ratio: 0.80}
-      - {name: inference, memory_gb: 4.0, storage_gb: 28.0, compute_gcycles_mean: 7.0, compute_cv: 0.40, output_ratio: 0.20}
-      - {name: risk_classification, memory_gb: 1.5, storage_gb: 8.0, compute_gcycles_mean: 1.5, compute_cv: 0.30, output_ratio: 0.05}
-  - name: environment_monitoring
-    input_mb_mean: 1.5
-    input_mb_cv: 0.70
-    stages:
-      - {name: fusion, memory_gb: 0.8, storage_gb: 4.0, compute_gcycles_mean: 0.7, compute_cv: 0.25, output_ratio: 0.75}
-      - {name: anomaly_detection, memory_gb: 2.0, storage_gb: 12.0, compute_gcycles_mean: 2.0, compute_cv: 0.35, output_ratio: 0.10}
+traffic:
+  # By default the environment derives aggregate arrivals from user behavior:
+  # num_users * active_user_ratio * active_user_request_rate_per_minute,
+  # then applies a daily curve with lower night load and morning/evening peaks.
+  # For 10,000 users this is about 29 requests/s on average and 43 requests/s
+  # at peak; for 12,000 users it is about 35 requests/s on average.
+  mean_requests_per_minute: null
+  active_user_ratio: 0.15
+  active_user_request_rate_per_minute: 1.5
+  traffic_scale: 1.0
+  load_ewma_tau_minutes: 1.0
 
-user_types:
-  camera:
-    base_request_probability: 0.08
-    leave_probability: 0.00001
-    arrival_rate: 0.005
-    service_probs: {video_monitoring: 0.90, environment_monitoring: 0.10}
-  vehicle:
-    base_request_probability: 0.35
-    leave_probability: 0.005
-    arrival_rate: 0.30
-    service_probs: {vehicular_perception: 1.0}
-  industrial:
-    base_request_probability: 0.18
-    leave_probability: 0.00002
-    arrival_rate: 0.003
-    service_probs: {industrial_inspection: 1.0}
-  ar:
-    base_request_probability: 0.08
-    leave_probability: 0.001
-    arrival_rate: 0.05
-    service_probs: {ar_assistance: 1.0}
-  medical:
-    base_request_probability: 0.004
-    leave_probability: 0.0002
-    arrival_rate: 0.01
-    service_probs: {medical_screening: 1.0}
-  sensor:
-    base_request_probability: 0.04
-    leave_probability: 0.00001
-    arrival_rate: 0.002
-    service_probs: {environment_monitoring: 1.0}
-  mobile:
-    base_request_probability: 0.015
-    leave_probability: 0.001
-    arrival_rate: 0.08
-    service_probs: {ar_assistance: 0.25, video_monitoring: 0.20, environment_monitoring: 0.55}
-
-initial_users:
-  E1_core: {camera: 30, vehicle: 80, industrial: 10, ar: 50, medical: 25, sensor: 40, mobile: 260}
-  E2_regional: {camera: 35, vehicle: 75, industrial: 20, ar: 45, medical: 20, sensor: 35, mobile: 220}
-  E3_residential: {camera: 25, vehicle: 45, industrial: 5, ar: 60, medical: 18, sensor: 45, mobile: 300}
-  E4_industrial: {camera: 20, vehicle: 45, industrial: 120, ar: 15, medical: 5, sensor: 50, mobile: 90}
-  E5_traffic: {camera: 30, vehicle: 160, industrial: 5, ar: 20, medical: 5, sensor: 30, mobile: 120}
-  E6_medical: {camera: 20, vehicle: 45, industrial: 5, ar: 25, medical: 80, sensor: 35, mobile: 160}
-  E7_campus: {camera: 25, vehicle: 35, industrial: 5, ar: 70, medical: 15, sensor: 30, mobile: 240}
-  E8_suburban: {camera: 15, vehicle: 30, industrial: 5, ar: 15, medical: 8, sensor: 60, mobile: 120}
-  E9_roadside: {camera: 20, vehicle: 140, industrial: 5, ar: 10, medical: 5, sensor: 35, mobile: 80}
-  E10_light: {camera: 12, vehicle: 25, industrial: 3, ar: 10, medical: 5, sensor: 70, mobile: 90}
+agent:
+  reference_project: DRL-AC-Allocation
+  architecture: hierarchical
+  slow_policy: service_stage_placement
+  fast_policy: request_level_stage_scheduling
+  continuous_resource_solver: kkt_closed_form
+  drl:
+    type: dual_agent_ppo
+    slow_agent_update: every_240_minutes
+    fast_agent_update: per_task_request
+    masked_actions: true
+    feasibility_repair: true

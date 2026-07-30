@@ -1,5 +1,4 @@
-from .environment import EdgeComputingEnv
-from .requests import Task
+from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 
-__all__ = ["EdgeComputingEnv", "Task"]
+__all__ = ["EdgeComputingEnv", "EdgeEnvConfig"]
 

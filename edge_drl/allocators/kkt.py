@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class ComputeDemand:
+    demand_id: str
+    node_id: int
+    compute_gcycles: float
+
+
+@dataclass(frozen=True)
+class LinkDemand:
+    demand_id: str
+    src_node: int
+    dst_node: int
+    data_mb: float
+
+
+def allocate_compute_kkt(
+    demands: list[ComputeDemand],
+    node_capacities: np.ndarray,
+) -> tuple[dict[str, float], dict[str, float], float]:
+    """Allocate node compute by the KKT sqrt(C) rule.
+
+    Returns per-demand allocated compute rate, per-demand delay, and total delay.
+    Capacities are in Gcycles/s, demands are in Gcycles, delays are seconds.
+    """
+
+    allocations: dict[str, float] = {}
+    delays: dict[str, float] = {}
+    total_delay = 0.0
+    by_node: dict[int, list[ComputeDemand]] = {}
+    for demand in demands:
+        if demand.compute_gcycles <= 0:
+            allocations[demand.demand_id] = 0.0
+            delays[demand.demand_id] = 0.0
+            continue
+        by_node.setdefault(demand.node_id, []).append(demand)
+
+    for node_id, node_demands in by_node.items():
+        capacity = float(node_capacities[node_id])
+        if capacity <= 0:
+            raise ValueError(f"node {node_id} has non-positive compute capacity")
+        sqrt_loads = np.sqrt([d.compute_gcycles for d in node_demands])
+        sqrt_sum = float(sqrt_loads.sum())
+        for demand, sqrt_load in zip(node_demands, sqrt_loads):
+            rate = capacity * float(sqrt_load) / sqrt_sum
+            delay = demand.compute_gcycles / rate
+            allocations[demand.demand_id] = rate
+            delays[demand.demand_id] = delay
+            total_delay += delay
+
+    return allocations, delays, total_delay
+
+
+def allocate_link_kkt(
+    demands: list[LinkDemand],
+    link_capacities: np.ndarray,
+) -> tuple[dict[str, float], dict[str, float], float]:
+    """Allocate link bandwidth by the KKT sqrt(D) rule."""
+
+    allocations: dict[str, float] = {}
+    delays: dict[str, float] = {}
+    total_delay = 0.0
+    by_link: dict[tuple[int, int], list[LinkDemand]] = {}
+    for demand in demands:
+        if demand.src_node == demand.dst_node or demand.data_mb <= 0:
+            allocations[demand.demand_id] = 0.0
+            delays[demand.demand_id] = 0.0
+            continue
+        key = (demand.src_node, demand.dst_node)
+        by_link.setdefault(key, []).append(demand)
+
+    for (src, dst), link_demands in by_link.items():
+        capacity = float(link_capacities[src, dst])
+        if not np.isfinite(capacity) or capacity <= 0:
+            raise ValueError(f"link ({src}, {dst}) has non-positive bandwidth")
+        sqrt_loads = np.sqrt([d.data_mb for d in link_demands])
+        sqrt_sum = float(sqrt_loads.sum())
+        for demand, sqrt_load in zip(link_demands, sqrt_loads):
+            rate = capacity * float(sqrt_load) / sqrt_sum
+            delay = demand.data_mb / rate
+            allocations[demand.demand_id] = rate
+            delays[demand.demand_id] = delay
+            total_delay += delay
+
+    return allocations, delays, total_delay
+

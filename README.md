@@ -1,70 +1,52 @@
-# World-Model Dual-Agent DRL for Edge Computing
+# Edge DRL for Staged Edge Services
 
-This project implements a simulation and learning framework for staged service
-deployment, task scheduling, and KKT-based resource allocation in an edge
-computing network.
+This project implements the first runnable scaffold for the staged edge-service
+optimization model described in `数学模型.docx` and `KKT条件推导.docx`.
 
-Core design:
+The engineering layout mainly follows the useful shape of
+`acsicuib/DRL-AC-Allocation`: environment logic is isolated from policy logic,
+instances are generated reproducibly, and training/evaluation entrypoints are
+kept thin. The problem model is different, so the code is specialized for:
 
-- 10 edge nodes with heterogeneous compute, memory, storage, and links.
-- Dynamic user counts and user-driven task generation.
-- Services have at most 3 sequential stages.
-- Agent-D updates service deployment on a slow time scale, such as 4 hours.
-- Agent-S schedules each arriving task immediately, while the simulator settles
-  resource allocation and reward once per second.
-- Continuous compute and bandwidth allocation is solved analytically with KKT.
-- A world model predicts next-second state and reward as a diagnostic module.
+- 10,000 to 15,000 users in a city-scale edge network.
+- Staged services with at most 3 stages.
+- Slow service-stage deployment every 4 hours.
+- Fast request-level scheduling when each task request arrives.
+- KKT closed-form allocation for continuous compute and link bandwidth.
+- City-scale traffic derived from active users by default. For 10,000 users,
+  the default traffic model produces about 29 requests/s on average and about
+  43 requests/s at peak before optional CLI scaling.
 
-Reference-guided roadmap:
+## Current Modules
 
-- [docs/reference_guided_roadmap.md](docs/reference_guided_roadmap.md)
+- `edge_drl/env/scenario.py`: realistic synthetic MEC scenario generator.
+- `edge_drl/env/environment.py`: event-driven environment and action masks.
+- `edge_drl/allocators/kkt.py`: KKT sqrt-rule resource allocator.
+- `edge_drl/agents/hierarchical.py`: slow greedy deployment and fast greedy scheduler baseline.
+- `edge_drl/agents/drl.py`: trainable hierarchical dual-agent PPO scaffold.
+- `edge_drl/models/ppo.py`: masked categorical PPO core, following the rollout-memory style used by DRL-AC-Allocation.
+- `train.py`: runnable rollout entrypoint.
+- `train_dual_ppo.py`: slow deployment PPO + fast scheduling PPO training smoke entrypoint.
+- `tests/test_env_smoke.py`: KKT and environment smoke tests.
+- `tests/test_dual_ppo_smoke.py`: dual-agent PPO rollout/update tests.
 
-Run a smoke simulation:
-
-```powershell
-python train.py --config config/default.yaml --episodes 1 --seconds 30 --mode heuristic
-```
-
-Run the integrated neural trainer. This enables Agent-D slow deployment,
-Agent-S event-driven scheduling, KKT allocation, PPO updates, and world-model
-diagnostics in one loop:
-
-```powershell
-python train.py --config config/default.yaml --episodes 1 --seconds 10 --mode neural --run-name smoke_neural
-```
-
-Run Agent-S behavior cloning before neural training:
+## Run
 
 ```powershell
-python train.py --config config/default.yaml --mode neural --bc-seconds 10 --bc-epochs 3 --episodes 5 --seconds 60 --run-name bc_then_ppo
+python train.py --max-requests 1000
+python train_dual_ppo.py --updates 2 --requests-per-update 64
+python train_dual_ppo.py --updates 20 --requests-per-update 48 --eval-interval 5 --eval-seeds 2 --reward-scale 0.1
+python scripts/run_full_training.py --fixed-scenario
+python scripts/summarize_full_training.py runs
+python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
+python -m pytest tests
 ```
 
-Run BC pretraining followed by PPO with validation-based checkpointing:
+Two agent families are available:
 
-```powershell
-python train.py --config config/default.yaml --mode neural --seed 7 --agent-s-top-k-actions 16 --bc-seconds 60 --bc-epochs 50 --bc-max-samples 12000 --episodes 100 --seconds 300 --agent-d-warmup-episodes 100 --ppo-lr 0.00005 --ppo-entropy-coef 0.001 --val-seconds 300 --val-every 5 --val-freeze-agent-d --restore-best-patience 2 --restore-lr-decay 0.5 --run-name convergence_seed7_stable
-```
+- `HierarchicalBaselineAgent`: deterministic baseline for sanity checks.
+- `HierarchicalPPOAgent`: trainable dual-agent DRL scaffold.
 
-Summarize convergence against a strict same-seed heuristic run:
-
-```powershell
-python scripts/summarize_convergence.py runs/convergence_seed7_stable/train_log.csv --heuristic-log runs_eval/heuristic_eval_seed10007_120_strict/eval_log.csv
-```
-
-Evaluate a baseline:
-
-```powershell
-python evaluate.py --config config/default.yaml --mode heuristic --episodes 1 --seconds 10
-```
-
-Evaluate a saved neural checkpoint:
-
-```powershell
-python evaluate.py --mode neural --checkpoint runs/smoke_neural/checkpoints/best.pt --episodes 1 --seconds 10
-```
-
-Run tests:
-
-```powershell
-python -m unittest discover tests
-```
+The DRL version has a slow PPO agent for service-stage deployment and a fast PPO
+agent for request-level stage scheduling. Continuous compute and bandwidth
+allocation remains outside the neural policy and is solved by the KKT module.

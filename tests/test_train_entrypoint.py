@@ -1,0 +1,116 @@
+import subprocess
+import sys
+from pathlib import Path
+
+
+def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--requests-per-update",
+        "4",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "1",
+        "--eval-baseline",
+        "--eval-requests",
+        "4",
+        "--save-best",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "baseline requests=4" in result.stdout
+    assert "update=001" in result.stdout
+    assert (log_dir / "training.csv").exists()
+    assert (save_dir / "last.pt").exists()
+    assert (save_dir / "best.pt").exists()
+
+
+def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--train-mode",
+        "fast-only",
+        "--updates",
+        "1",
+        "--requests-per-update",
+        "4",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "1",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "train_mode=fast-only" in result.stdout
+    assert (log_dir / "training.csv").exists()
+    assert (save_dir / "last.pt").exists()
+
+
+def test_default_entrypoint_writes_under_runs(tmp_path):
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--requests-per-update",
+        "4",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "1",
+        "--run-root",
+        str(tmp_path / "runs"),
+        "--run-name",
+        "organized_run",
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "runs" in result.stdout
+    assert (tmp_path / "runs" / "organized_run" / "logs" / "training.csv").exists()
+    assert (tmp_path / "runs" / "organized_run" / "checkpoints" / "last.pt").exists()
+    assert (tmp_path / "runs" / "organized_run" / "metadata.json").exists()
+
+
+def test_convergence_analyzer_reads_training_log(tmp_path):
+    log_path = tmp_path / "training.csv"
+    log_path.write_text(
+        "update,requests,avg_latency_s,eval_avg_latency_s,invalid_actions\n"
+        "1,10,2.0,nan,0\n"
+        "2,10,1.6,nan,0\n"
+        "3,10,1.2,nan,0\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [sys.executable, "scripts/analyze_convergence.py", str(log_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Convergence report" in result.stdout
+    assert "verdict=" in result.stdout

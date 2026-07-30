@@ -1,15 +1,19 @@
-from .baselines import HeuristicScheduler, RandomScheduler
-from .deployment import DeploymentActorCriticUpdater, TorchAgentDDeployer
-from .networks import AgentDActor, AgentDActorCritic, AgentSActorCritic
-from .torch_schedulers import TorchAgentSScheduler
+from edge_drl.agents.hierarchical import (
+    FastGreedyScheduler,
+    HierarchicalBaselineAgent,
+    SlowGreedyDeploymentPolicy,
+)
+from edge_drl.agents.drl import (
+    FastSchedulingPPOAgent,
+    HierarchicalPPOAgent,
+    SlowDeploymentPPOAgent,
+)
 
 __all__ = [
-    "HeuristicScheduler",
-    "RandomScheduler",
-    "AgentDActor",
-    "AgentDActorCritic",
-    "AgentSActorCritic",
-    "TorchAgentDDeployer",
-    "DeploymentActorCriticUpdater",
-    "TorchAgentSScheduler",
+    "FastGreedyScheduler",
+    "FastSchedulingPPOAgent",
+    "HierarchicalBaselineAgent",
+    "HierarchicalPPOAgent",
+    "SlowDeploymentPPOAgent",
+    "SlowGreedyDeploymentPolicy",
 ]

@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from edge_drl.env.environment import EdgeComputingEnv
+from edge_drl.env.scenario import TaskRequest
+from edge_drl.models.ppo import PPOAgent
+
+
+def slow_obs_dim(num_nodes: int, num_service_types: int) -> int:
+    return 6 + num_nodes * 5 + num_nodes * num_service_types
+
+
+def fast_obs_dim(num_nodes: int) -> int:
+    return 8 + num_nodes * 5
+
+
+FAST_GLOBAL_DIM = 8
+FAST_NODE_FEATURE_DIM = 5
+
+
+@dataclass
+class SlowDeploymentPPOAgent:
+    num_nodes: int
+    num_service_types: int
+    max_service_stages: int
+    replicas_per_stage: int = 5
+    coverage_repair: bool = True
+    lr: float = 3e-4
+    k_epochs: int = 3
+    entropy_coef: float = 0.001
+    target_kl: float | None = 0.03
+    device: str = "cpu"
+    ppo: PPOAgent = field(init=False)
+    pending_indices: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.ppo = PPOAgent(
+            obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
+            action_dim=self.num_nodes,
+            hidden_dim=128,
+            lr=self.lr,
+            gamma=0.99,
+            k_epochs=self.k_epochs,
+            entropy_coef=self.entropy_coef,
+            target_kl=self.target_kl,
+            device=self.device,
+        )
+
+    def plan_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> np.ndarray:
+        env._require_ready()
+        assert env.scenario is not None
+        current = env.deployment if env.deployment is not None else np.zeros(
+            (self.num_service_types, self.max_service_stages, self.num_nodes), dtype=bool
+        )
+        deployment = np.zeros_like(current, dtype=bool)
+        remaining_memory = np.array([n.memory_gb for n in env.scenario.nodes], dtype=np.float64)
+        remaining_storage = np.array([n.storage_gb for n in env.scenario.nodes], dtype=np.float64)
+        demand = self._node_service_demand(env)
+        self.pending_indices.clear()
+
+        for service in env.scenario.services:
+            for stage in service.stages:
+                for replica_idx in range(self.replicas_per_stage):
+                    state = self._build_state(env, demand, remaining_memory, remaining_storage, service.service_id, stage.stage_id, replica_idx)
+                    mask = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb)
+                    already = deployment[service.service_id, stage.stage_id]
+                    if already.any() and replica_idx > 0:
+                        mask &= ~already
+                    if not mask.any():
+                        mask = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb)
+                    if not mask.any():
+                        break
+
+                    action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
+                    if not mask[action]:
+                        action = int(np.where(mask)[0][0])
+                    deployment[service.service_id, stage.stage_id, action] = True
+                    remaining_memory[action] -= stage.memory_gb
+                    remaining_storage[action] -= stage.storage_gb
+
+                    if record:
+                        self.ppo.buffer.states.append(state)
+                        self.ppo.buffer.masks.append(mask.astype(bool))
+                        self.ppo.buffer.actions.append(action)
+                        self.ppo.buffer.logprobs.append(logprob)
+                        self.ppo.buffer.values.append(value)
+                        self.pending_indices.append(len(self.ppo.buffer.actions) - 1)
+
+        if self.coverage_repair:
+            self._coverage_repair(env, deployment, remaining_memory, remaining_storage)
+
+        feasible, reason = env.check_deployment_feasible(deployment)
+        if not feasible:
+            deployment = self._repair_with_current_or_full(env, deployment)
+        return deployment
+
+    def assign_pending_reward(self, reward: float, done: bool) -> None:
+        missing = len(self.ppo.buffer.actions) - len(self.ppo.buffer.rewards)
+        for action_idx in range(missing):
+            self.ppo.buffer.rewards.append(float(reward))
+            self.ppo.buffer.dones.append(bool(done or action_idx == missing - 1))
+        self.pending_indices.clear()
+
+    def update(self) -> dict[str, float]:
+        self.assign_pending_reward(0.0, True)
+        return self.ppo.update()
+
+    def _build_state(
+        self,
+        env: EdgeComputingEnv,
+        demand: np.ndarray,
+        remaining_memory: np.ndarray,
+        remaining_storage: np.ndarray,
+        service_id: int,
+        stage_id: int,
+        replica_idx: int,
+    ) -> np.ndarray:
+        assert env.scenario is not None
+        nodes = env.scenario.nodes
+        max_mem = max(n.memory_gb for n in nodes)
+        max_storage = max(n.storage_gb for n in nodes)
+        max_compute = max(n.compute_gcycles_per_s for n in nodes)
+        node_features = []
+        for node in nodes:
+            node_features.extend(
+                [
+                    remaining_memory[node.node_id] / max_mem,
+                    remaining_storage[node.node_id] / max_storage,
+                    node.compute_gcycles_per_s / max_compute,
+                    env.node_compute_load[node.node_id],
+                    demand[node.node_id, service_id] / max(demand[:, service_id].max(), 1e-9),
+                ]
+            )
+        scalars = [
+            service_id / max(self.num_service_types - 1, 1),
+            stage_id / max(self.max_service_stages - 1, 1),
+            replica_idx / max(self.replicas_per_stage - 1, 1),
+            env.current_time_minute / max(env.config.episode_hours * 60, 1),
+            len(env.scenario.services[service_id].stages) / self.max_service_stages,
+            1.0,
+        ]
+        return np.asarray(scalars + node_features + demand.reshape(-1).tolist(), dtype=np.float32)
+
+    def _node_service_demand(self, env: EdgeComputingEnv) -> np.ndarray:
+        assert env.scenario is not None
+        demand = np.zeros((self.num_nodes, self.num_service_types), dtype=np.float32)
+        for user in env.scenario.users:
+            demand[user.home_node] += np.asarray(user.service_weights, dtype=np.float32)
+        demand /= max(demand.max(), 1e-9)
+        return demand
+
+    def _repair_with_current_or_full(self, env: EdgeComputingEnv, deployment: np.ndarray) -> np.ndarray:
+        feasible, _ = env.check_deployment_feasible(deployment)
+        if feasible:
+            return deployment
+        if env.deployment is not None:
+            feasible, _ = env.check_deployment_feasible(env.deployment)
+            if feasible:
+                return env.deployment.copy()
+        raise RuntimeError("slow PPO produced infeasible deployment and no feasible fallback exists")
+
+    def _coverage_repair(
+        self,
+        env: EdgeComputingEnv,
+        deployment: np.ndarray,
+        remaining_memory: np.ndarray,
+        remaining_storage: np.ndarray,
+    ) -> None:
+        """Add cheap local replicas where capacity permits to reduce invalid fast actions."""
+
+        assert env.scenario is not None
+        demand = self._node_service_demand(env)
+        for service in env.scenario.services:
+            node_order = np.argsort(-demand[:, service.service_id])
+            for stage in service.stages:
+                for node_id in node_order:
+                    if deployment[service.service_id, stage.stage_id, node_id]:
+                        continue
+                    if remaining_memory[node_id] < stage.memory_gb or remaining_storage[node_id] < stage.storage_gb:
+                        continue
+                    deployment[service.service_id, stage.stage_id, node_id] = True
+                    remaining_memory[node_id] -= stage.memory_gb
+                    remaining_storage[node_id] -= stage.storage_gb
+
+
+@dataclass
+class FastSchedulingPPOAgent:
+    num_nodes: int
+    max_service_stages: int
+    lr: float = 3e-4
+    k_epochs: int = 4
+    entropy_coef: float = 0.0
+    target_kl: float | None = 0.03
+    device: str = "cpu"
+    ppo: PPOAgent = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.ppo = PPOAgent(
+            obs_dim=fast_obs_dim(self.num_nodes),
+            action_dim=self.num_nodes,
+            hidden_dim=128,
+            lr=self.lr,
+            gamma=0.99,
+            k_epochs=self.k_epochs,
+            entropy_coef=self.entropy_coef,
+            target_kl=self.target_kl,
+            policy_kind="node_scorer",
+            global_dim=FAST_GLOBAL_DIM,
+            node_feature_dim=FAST_NODE_FEATURE_DIM,
+            num_nodes=self.num_nodes,
+            device=self.device,
+        )
+
+    def schedule(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest | None = None,
+        deterministic: bool = False,
+        record: bool = True,
+    ) -> list[int]:
+        env._require_ready()
+        if request is None:
+            assert env.current_request is not None
+            request = env.current_request
+
+        stage_nodes: list[int] = []
+        masks: list[np.ndarray] = []
+        states: list[np.ndarray] = []
+        actions: list[int] = []
+        logprobs: list[float] = []
+        values: list[float] = []
+
+        for stage_id in range(len(request.stage_compute_gcycles)):
+            state = self._build_state(env, request, stage_id, stage_nodes)
+            mask = self._build_mask(env, request, stage_id, stage_nodes)
+            action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
+            if not mask[action]:
+                action = int(np.where(mask)[0][0])
+            stage_nodes.append(action)
+            states.append(state)
+            masks.append(mask)
+            actions.append(action)
+            logprobs.append(logprob)
+            values.append(value)
+
+        if record:
+            for state, mask, action, logprob, value in zip(states, masks, actions, logprobs, values):
+                self.ppo.buffer.states.append(state)
+                self.ppo.buffer.masks.append(mask.astype(bool))
+                self.ppo.buffer.actions.append(action)
+                self.ppo.buffer.logprobs.append(logprob)
+                self.ppo.buffer.values.append(value)
+        return stage_nodes
+
+    def schedule_with_diagnostics(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest | None = None,
+    ) -> tuple[list[int], list[dict[str, float | int]]]:
+        env._require_ready()
+        if request is None:
+            assert env.current_request is not None
+            request = env.current_request
+
+        stage_nodes: list[int] = []
+        diagnostics: list[dict[str, float | int]] = []
+        for stage_id in range(len(request.stage_compute_gcycles)):
+            state = self._build_state(env, request, stage_id, stage_nodes)
+            mask = self._build_mask(env, request, stage_id, stage_nodes)
+            stats = self.ppo.action_stats(state, mask)
+            action = int(stats["action"])
+            if not mask[action]:
+                action = int(np.where(mask)[0][0])
+                stats["action"] = action
+            stage_nodes.append(action)
+            diagnostics.append(stats)
+        return stage_nodes, diagnostics
+
+    def assign_last_schedule_reward(self, reward: float, stage_count: int, done: bool) -> None:
+        for stage_idx in range(stage_count):
+            self.ppo.buffer.rewards.append(float(reward))
+            self.ppo.buffer.dones.append(bool(done or stage_idx == stage_count - 1))
+
+    def update(self) -> dict[str, float]:
+        return self.ppo.update()
+
+    def _build_state(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        partial_nodes: list[int],
+    ) -> np.ndarray:
+        assert env.scenario is not None
+        prev_node = request.home_node if not partial_nodes else partial_nodes[-1]
+        nodes = env.scenario.nodes
+        max_compute = max(n.compute_gcycles_per_s for n in nodes)
+        max_bandwidth = np.nanmax(np.where(np.isfinite(env.scenario.bandwidth_mb_s), env.scenario.bandwidth_mb_s, 0.0))
+        node_features = []
+        deployed = env.deployment[request.service_id, stage_id] if env.deployment is not None else np.zeros(self.num_nodes, dtype=bool)
+        for node in nodes:
+            bandwidth = env.scenario.bandwidth_mb_s[prev_node, node.node_id]
+            if not np.isfinite(bandwidth):
+                bandwidth = 0.0
+            reachable = prev_node == node.node_id or env.scenario.adjacency[prev_node, node.node_id]
+            node_features.extend(
+                [
+                    float(deployed[node.node_id]),
+                    float(reachable),
+                    node.compute_gcycles_per_s / max_compute,
+                    env.node_compute_load[node.node_id],
+                    bandwidth / max(max_bandwidth, 1e-9),
+                ]
+            )
+        scalars = [
+            request.service_id / max(env.config.num_service_types - 1, 1),
+            stage_id / max(self.max_service_stages - 1, 1),
+            prev_node / max(self.num_nodes - 1, 1),
+            request.input_mb / 100.0,
+            request.stage_compute_gcycles[stage_id] / 200.0,
+            request.deadline_s / 10.0,
+            env.current_time_minute / max(env.config.episode_hours * 60, 1),
+            len(request.stage_compute_gcycles) / self.max_service_stages,
+        ]
+        return np.asarray(scalars + node_features, dtype=np.float32)
+
+    def _build_mask(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        partial_nodes: list[int],
+    ) -> np.ndarray:
+        assert env.scenario is not None
+        mask = env.scheduler_candidate_mask(request)[stage_id].copy()
+        prev_node = request.home_node if not partial_nodes else partial_nodes[-1]
+        reachable = env.scenario.adjacency[prev_node].copy()
+        reachable[prev_node] = True
+        mask &= reachable
+        if not mask.any():
+            mask = env.scheduler_candidate_mask(request)[stage_id].copy()
+        if not mask.any():
+            mask[request.home_node] = True
+        return mask.astype(bool)
+
+
+@dataclass
+class HierarchicalPPOAgent:
+    slow_agent: SlowDeploymentPPOAgent
+    fast_agent: FastSchedulingPPOAgent
+    window_reward: float = 0.0
+    window_steps: int = 0
+
+    @classmethod
+    def from_env(
+        cls,
+        env: EdgeComputingEnv,
+        device: str = "cpu",
+        replicas_per_stage: int = 5,
+        slow_lr: float = 3e-4,
+        fast_lr: float = 3e-4,
+        slow_k_epochs: int = 3,
+        fast_k_epochs: int = 4,
+        slow_entropy_coef: float = 0.001,
+        fast_entropy_coef: float = 0.0,
+        slow_target_kl: float | None = 0.03,
+        fast_target_kl: float | None = 0.03,
+    ) -> "HierarchicalPPOAgent":
+        return cls(
+            slow_agent=SlowDeploymentPPOAgent(
+                num_nodes=env.config.num_edge_nodes,
+                num_service_types=env.config.num_service_types,
+                max_service_stages=env.config.max_service_stages,
+                replicas_per_stage=replicas_per_stage,
+                lr=slow_lr,
+                k_epochs=slow_k_epochs,
+                entropy_coef=slow_entropy_coef,
+                target_kl=slow_target_kl,
+                device=device,
+            ),
+            fast_agent=FastSchedulingPPOAgent(
+                num_nodes=env.config.num_edge_nodes,
+                max_service_stages=env.config.max_service_stages,
+                lr=fast_lr,
+                k_epochs=fast_k_epochs,
+                entropy_coef=fast_entropy_coef,
+                target_kl=fast_target_kl,
+                device=device,
+            ),
+        )
+
+    def maybe_update_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> None:
+        if not env.needs_deployment_update:
+            return
+        if record:
+            self.flush_slow_window_reward(done=False)
+        deployment = self.slow_agent.plan_deployment(env, deterministic=deterministic, record=record)
+        env.apply_deployment(deployment)
+
+    def act(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> list[int]:
+        self.maybe_update_deployment(env, deterministic=deterministic, record=record)
+        return self.fast_agent.schedule(env, deterministic=deterministic, record=record)
+
+    def observe_step_reward(self, reward: float, stage_count: int, done: bool) -> None:
+        self.fast_agent.assign_last_schedule_reward(reward, stage_count, done)
+        self.window_reward += reward
+        self.window_steps += 1
+        if done:
+            self.flush_slow_window_reward(done=True)
+
+    def flush_slow_window_reward(self, done: bool) -> None:
+        if self.window_steps <= 0:
+            return
+        averaged_reward = self.window_reward / float(self.window_steps)
+        self.slow_agent.assign_pending_reward(averaged_reward, done=done)
+        self.window_reward = 0.0
+        self.window_steps = 0
+
+    def update(self) -> dict[str, dict[str, float]]:
+        return {
+            "slow": self.slow_agent.update(),
+            "fast": self.fast_agent.update(),
+        }

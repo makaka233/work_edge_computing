@@ -1,57 +1,142 @@
-import unittest
+import numpy as np
 
-from edge_drl.agents.baselines import HeuristicScheduler
-from edge_drl.agents.networks import AgentSActorCritic
-from edge_drl.agents.torch_schedulers import TorchAgentSScheduler
-from edge_drl.config import load_config
-from edge_drl.env.environment import EdgeComputingEnv
-from edge_drl.training import IntegratedTrainer
+from edge_drl.agents.hierarchical import build_baseline_agent
+from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
+from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 
 
-class EnvironmentSmokeTest(unittest.TestCase):
-    def test_environment_runs_seconds(self):
-        cfg = load_config("config/default.yaml")
-        cfg["simulation"]["seconds_per_episode"] = 5
-        env = EdgeComputingEnv(cfg)
-        scheduler = HeuristicScheduler(env.path_manager, env.compute_capacity, env.bandwidth)
-        obs = env.reset()
-        self.assertGreater(obs.shape[0], 0)
-        total_tasks = 0
-        for _ in range(5):
-            obs, reward, done, info = env.step(scheduler)
-            self.assertGreater(obs.shape[0], 0)
-            self.assertIsInstance(reward, float)
-            total_tasks += info["num_tasks"]
-        self.assertTrue(done)
-        self.assertGreaterEqual(total_tasks, 0)
-
-    def test_neural_scheduler_uses_top_k_mask(self):
-        cfg = load_config("config/default.yaml")
-        cfg["simulation"]["seconds_per_episode"] = 1
-        cfg["simulation"]["agent_s_top_k_actions"] = 3
-        env = EdgeComputingEnv(cfg)
-        env.reset()
-        model = AgentSActorCritic(env.task_obs_dim, env.path_manager.num_actions, hidden_dim=64)
-        scheduler = TorchAgentSScheduler(model, deterministic=True)
-
-        env.step(scheduler)
-
-        self.assertGreater(len(scheduler.decisions), 0)
-        self.assertTrue(all(int(record.mask.sum().item()) <= 3 for record in scheduler.decisions))
-
-    def test_second_reward_is_shared_across_task_decisions(self):
-        cfg = load_config("config/default.yaml")
-        cfg["simulation"]["seconds_per_episode"] = 1
-        trainer = IntegratedTrainer(cfg, device="cpu")
-        trainer.env.reset()
-        trainer.scheduler.reset_records()
-
-        _, reward, done, _ = trainer.env.step(trainer.scheduler)
-        trainer._append_scheduler_records(reward, done)
-
-        self.assertGreater(len(trainer.rollout.rewards), 0)
-        self.assertAlmostEqual(sum(trainer.rollout.rewards), reward, places=6)
+def test_kkt_compute_sqrt_rule():
+    demands = [
+        ComputeDemand("a", 0, 4.0),
+        ComputeDemand("b", 0, 9.0),
+    ]
+    allocations, delays, total = allocate_compute_kkt(demands, np.array([10.0]))
+    assert round(allocations["a"], 6) == 4.0
+    assert round(allocations["b"], 6) == 6.0
+    assert round(delays["a"], 6) == 1.0
+    assert round(delays["b"], 6) == 1.5
+    assert round(total, 6) == 2.5
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_kkt_link_sqrt_rule():
+    demands = [
+        LinkDemand("a", 0, 1, 25.0),
+        LinkDemand("b", 0, 1, 100.0),
+    ]
+    bandwidth = np.zeros((2, 2), dtype=float)
+    bandwidth[0, 1] = 30.0
+    allocations, delays, total = allocate_link_kkt(demands, bandwidth)
+    assert round(allocations["a"], 6) == 10.0
+    assert round(allocations["b"], 6) == 20.0
+    assert round(delays["a"], 6) == 2.5
+    assert round(delays["b"], 6) == 5.0
+    assert round(total, 6) == 7.5
+
+
+def test_environment_constraints_and_rollout():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=7,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=2.0,
+        )
+    )
+    agent = build_baseline_agent()
+    obs = env.reset()
+    assert len(env.scenario.users) == 10_000
+    assert max(len(service.stages) for service in env.scenario.services) <= 3
+    assert env.config.deployment_interval_minutes == 240
+    assert obs["needs_deployment_update"] is True
+
+    agent.maybe_update_deployment(env)
+    assert obs["deployment"].shape == env.deployment.shape
+    feasible, reason = env.check_deployment_feasible(env.deployment)
+    assert feasible, reason
+
+    for _ in range(5):
+        action = agent.act(env)
+        obs, reward, done, info = env.step(action)
+        assert info["valid"], info["violations"]
+        assert np.isfinite(reward)
+        assert info["latency_s"] >= 0
+        if done:
+            break
+
+
+def test_migration_cost_is_charged_once():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=17,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=2.0,
+        )
+    )
+    agent = build_baseline_agent()
+    env.reset()
+    agent.maybe_update_deployment(env)
+    assert env.last_migration_cost > 0
+
+    first_action = agent.act(env)
+    _, _, _, first_info = env.step(first_action)
+    assert first_info["migration_cost"] > 0
+    assert env.last_migration_cost == 0
+
+    second_action = agent.act(env)
+    _, _, _, second_info = env.step(second_action)
+    assert second_info["migration_cost"] == 0
+
+
+def test_scenario_seed_keeps_topology_fixed():
+    config_a = EdgeEnvConfig(
+        seed=101,
+        scenario_seed=7,
+        num_users=10_000,
+        num_edge_nodes=16,
+        num_service_types=3,
+        episode_hours=1,
+    )
+    config_b = EdgeEnvConfig(
+        seed=202,
+        scenario_seed=7,
+        num_users=10_000,
+        num_edge_nodes=16,
+        num_service_types=3,
+        episode_hours=1,
+    )
+    env_a = EdgeComputingEnv(config_a)
+    env_b = EdgeComputingEnv(config_b)
+    env_a.reset()
+    env_b.reset()
+    xy_a = [(node.x_km, node.y_km) for node in env_a.scenario.nodes]
+    xy_b = [(node.x_km, node.y_km) for node in env_b.scenario.nodes]
+    assert xy_a == xy_b
+
+
+def test_default_traffic_is_city_scale_for_ten_thousand_users():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=31,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=24,
+        )
+    )
+    rates = []
+    for minute in range(24 * 60):
+        env.current_time_minute = float(minute)
+        rates.append(env._arrival_rate_per_minute())
+
+    avg_requests_per_second = float(np.mean(rates) / 60.0)
+    peak_requests_per_second = float(np.max(rates) / 60.0)
+    min_requests_per_second = float(np.min(rates) / 60.0)
+
+    assert avg_requests_per_second > 10.0
+    assert peak_requests_per_second > avg_requests_per_second
+    assert min_requests_per_second > 1.0
