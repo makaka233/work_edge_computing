@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import sys
 
 import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Categorical
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - only used when tqdm is unavailable.
+    tqdm = None
 
 
 @dataclass
@@ -336,7 +341,7 @@ class PPOAgent:
             "value": float(value.item()),
         }
 
-    def update(self) -> dict[str, float]:
+    def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         if len(self.buffer) == 0:
             return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
         if len(self.buffer.rewards) != len(self.buffer.actions):
@@ -349,9 +354,22 @@ class PPOAgent:
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
         n = len(actions_np)
         minibatch_size = max(1, min(self.minibatch_size, n))
+        batches_per_epoch = int(np.ceil(n / minibatch_size))
+        progress = None
+        if tqdm is not None and progress_interval_seconds > 0 and progress_label:
+            progress = tqdm(
+                total=self.k_epochs * batches_per_epoch,
+                desc=progress_label,
+                unit="mb",
+                dynamic_ncols=True,
+                mininterval=progress_interval_seconds,
+                leave=True,
+                bar_format="{desc}: {percentage:5.1f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                file=sys.stdout,
+            )
 
         last_metrics: dict[str, float] = {}
-        for _ in range(self.k_epochs):
+        for epoch_idx in range(self.k_epochs):
             order = np.random.permutation(n)
             approx_kls: list[float] = []
             for start in range(0, n, minibatch_size):
@@ -387,8 +405,20 @@ class PPOAgent:
                     "entropy": float(entropy.item()),
                     "approx_kl": float(approx_kl.item()),
                 }
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix_str(
+                        "epoch={} loss={:.4f} kl={:.5f}".format(
+                            epoch_idx + 1,
+                            last_metrics["loss"],
+                            last_metrics["approx_kl"],
+                        ),
+                        refresh=False,
+                    )
             if self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
                 break
+        if progress is not None:
+            progress.close()
 
         self.buffer.clear()
         return last_metrics

@@ -116,9 +116,9 @@ class SlowDeploymentPPOAgent:
             self.ppo.buffer.dones.append(bool(done or action_idx == missing - 1))
         self.pending_indices.clear()
 
-    def update(self) -> dict[str, float]:
+    def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         self.assign_pending_reward(0.0, True)
-        return self.ppo.update()
+        return self.ppo.update(progress_label=progress_label, progress_interval_seconds=progress_interval_seconds)
 
     def _build_state(
         self,
@@ -301,8 +301,8 @@ class FastSchedulingPPOAgent:
             self.ppo.buffer.rewards.append(float(reward))
             self.ppo.buffer.dones.append(bool(done or stage_idx == stage_count - 1))
 
-    def update(self) -> dict[str, float]:
-        return self.ppo.update()
+    def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
+        return self.ppo.update(progress_label=progress_label, progress_interval_seconds=progress_interval_seconds)
 
     def _build_state(
         self,
@@ -467,8 +467,14 @@ class HierarchicalPPOAgent:
         self.window_reward = 0.0
         self.window_steps = 0
 
-    def update(self) -> dict[str, dict[str, float]]:
+    def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, dict[str, float]]:
         return {
-            "slow": self.slow_agent.update(),
-            "fast": self.fast_agent.update(),
+            "slow": self.slow_agent.update(
+                progress_label=f"{progress_label} slow PPO",
+                progress_interval_seconds=progress_interval_seconds,
+            ),
+            "fast": self.fast_agent.update(
+                progress_label=f"{progress_label} fast PPO",
+                progress_interval_seconds=progress_interval_seconds,
+            ),
         }

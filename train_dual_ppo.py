@@ -185,7 +185,7 @@ class RolloutProgress:
                 unit="h" if self.rollout_unit == "episode" else "req",
                 dynamic_ncols=True,
                 mininterval=self.interval_seconds,
-                leave=False,
+                leave=True,
                 bar_format="{desc}: {percentage:5.1f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
                 file=sys.stdout,
             )
@@ -956,13 +956,19 @@ def main() -> None:
         if args.train_mode == "fast-only":
             losses = {
                 "slow": {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0},
-                "fast": agent.fast_agent.update(),
+                "fast": agent.fast_agent.update(
+                    progress_label=f"update={update + 1:03d}/{args.updates:03d} fast PPO",
+                    progress_interval_seconds=args.progress_interval_seconds,
+                ),
             }
             agent.slow_agent.ppo.buffer.clear()
             agent.window_reward = 0.0
             agent.window_steps = 0
         else:
-            losses = agent.update()
+            losses = agent.update(
+                progress_label=f"update={update + 1:03d}/{args.updates:03d}",
+                progress_interval_seconds=args.progress_interval_seconds,
+            )
         eval_stats = {}
         if args.eval_interval and (update + 1) % args.eval_interval == 0:
             eval_stats = evaluate_agent(
