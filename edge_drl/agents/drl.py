@@ -43,7 +43,7 @@ class SlowDeploymentPPOAgent:
     def __post_init__(self) -> None:
         self.ppo = PPOAgent(
             obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
-            action_dim=self.num_nodes,
+            action_dim=self.num_nodes + 1,
             hidden_dim=128,
             lr=self.lr,
             gamma=0.99,
@@ -64,26 +64,25 @@ class SlowDeploymentPPOAgent:
         remaining_storage = np.array([n.storage_gb for n in env.scenario.nodes], dtype=np.float64)
         demand = self._node_service_demand(env)
         self.pending_indices.clear()
+        stop_action = self.num_nodes
 
         for service in env.scenario.services:
             for stage in service.stages:
                 for replica_idx in range(self.replicas_per_stage):
                     state = self._build_state(env, demand, remaining_memory, remaining_storage, service.service_id, stage.stage_id, replica_idx)
-                    mask = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb)
+                    node_mask = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb)
                     already = deployment[service.service_id, stage.stage_id]
                     if already.any() and replica_idx > 0:
-                        mask &= ~already
-                    if not mask.any():
-                        mask = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb)
+                        node_mask &= ~already
+                    mask = np.zeros(self.num_nodes + 1, dtype=bool)
+                    mask[: self.num_nodes] = node_mask
+                    mask[stop_action] = already.any()
                     if not mask.any():
                         break
 
                     action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
                     if not mask[action]:
                         action = int(np.where(mask)[0][0])
-                    deployment[service.service_id, stage.stage_id, action] = True
-                    remaining_memory[action] -= stage.memory_gb
-                    remaining_storage[action] -= stage.storage_gb
 
                     if record:
                         self.ppo.buffer.states.append(state)
@@ -92,6 +91,13 @@ class SlowDeploymentPPOAgent:
                         self.ppo.buffer.logprobs.append(logprob)
                         self.ppo.buffer.values.append(value)
                         self.pending_indices.append(len(self.ppo.buffer.actions) - 1)
+
+                    if action == stop_action:
+                        break
+
+                    deployment[service.service_id, stage.stage_id, action] = True
+                    remaining_memory[action] -= stage.memory_gb
+                    remaining_storage[action] -= stage.storage_gb
 
         if self.coverage_repair:
             self._coverage_repair(env, deployment, remaining_memory, remaining_storage)
@@ -173,21 +179,22 @@ class SlowDeploymentPPOAgent:
         remaining_memory: np.ndarray,
         remaining_storage: np.ndarray,
     ) -> None:
-        """Add cheap local replicas where capacity permits to reduce invalid fast actions."""
+        """Repair uncovered service stages without overriding learned replica counts."""
 
         assert env.scenario is not None
         demand = self._node_service_demand(env)
         for service in env.scenario.services:
             node_order = np.argsort(-demand[:, service.service_id])
             for stage in service.stages:
+                if deployment[service.service_id, stage.stage_id].any():
+                    continue
                 for node_id in node_order:
-                    if deployment[service.service_id, stage.stage_id, node_id]:
-                        continue
                     if remaining_memory[node_id] < stage.memory_gb or remaining_storage[node_id] < stage.storage_gb:
                         continue
                     deployment[service.service_id, stage.stage_id, node_id] = True
                     remaining_memory[node_id] -= stage.memory_gb
                     remaining_storage[node_id] -= stage.storage_gb
+                    break
 
 
 @dataclass

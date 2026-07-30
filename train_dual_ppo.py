@@ -20,10 +20,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train hierarchical dual-agent PPO for edge services.")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--fixed-scenario", action="store_true")
+    parser.add_argument(
+        "--scenario-refresh-episodes",
+        type=int,
+        default=1,
+        help="Without --fixed-scenario, reuse one scenario instance for this many training episodes.",
+    )
     parser.add_argument("--num-users", type=int, default=10_000)
-    parser.add_argument("--num-edge-nodes", type=int, default=16)
-    parser.add_argument("--num-service-types", type=int, default=3)
-    parser.add_argument("--episode-hours", type=int, default=8)
+    parser.add_argument("--num-edge-nodes", type=int, default=32)
+    parser.add_argument("--num-service-types", type=int, default=10)
+    parser.add_argument("--episode-hours", type=int, default=24)
     parser.add_argument("--mean-requests-per-minute", type=float, default=None)
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
@@ -45,7 +51,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--mixed-latency-weight", type=float, default=0.1)
     parser.add_argument("--train-mode", choices=["joint", "fast-only"], default="joint")
-    parser.add_argument("--replicas-per-stage", type=int, default=5)
+    parser.add_argument(
+        "--replicas-per-stage",
+        "--max-replicas-per-stage",
+        dest="replicas_per_stage",
+        type=int,
+        default=5,
+        help="Maximum replicas the slow PPO may place per service stage; actual count is learned with a STOP action.",
+    )
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--slow-lr", type=float, default=3e-4)
     parser.add_argument("--fast-lr", type=float, default=3e-4)
@@ -85,11 +98,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_env(args: argparse.Namespace, seed_offset: int = 0) -> EdgeComputingEnv:
+def scenario_seed_for_offset(args: argparse.Namespace, seed_offset: int = 0, *, group_by_refresh: bool = False) -> int:
+    if getattr(args, "fixed_scenario", False):
+        return int(args.seed)
+    refresh = max(int(getattr(args, "scenario_refresh_episodes", 1)), 1)
+    scenario_offset = seed_offset // refresh if group_by_refresh else seed_offset
+    return int(args.seed + scenario_offset)
+
+
+def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_by_refresh: bool = False) -> EdgeComputingEnv:
     return EdgeComputingEnv(
         EdgeEnvConfig(
             seed=args.seed + seed_offset,
-            scenario_seed=args.seed if getattr(args, "fixed_scenario", False) else None,
+            scenario_seed=scenario_seed_for_offset(args, seed_offset, group_by_refresh=group_scenario_by_refresh),
             num_users=args.num_users,
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
@@ -517,7 +538,7 @@ def pretrain_fast_agent(
     collected_requests = 0
     episode_idx = 0
     while collected_requests < requests:
-        env = build_env(args, seed_offset=40_000 + episode_idx)
+        env = build_env(args, seed_offset=40_000 + episode_idx, group_scenario_by_refresh=True)
         env.reset()
         episode_idx += 1
         while not env.done and collected_requests < requests:
@@ -667,8 +688,10 @@ def main() -> None:
     print(f"  fast_policy_kind={args.fast_policy_kind}")
     print(f"  rollout_unit={args.rollout_unit}")
     print(f"  eval_rollout_unit={eval_rollout_unit}")
+    print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes}")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
+    print(f"  max_replicas_per_stage={args.replicas_per_stage} actual_replica_count=learned")
     print(
         "  ppo slow_lr={} fast_lr={} slow_entropy={} fast_entropy={}".format(
             args.slow_lr,
@@ -791,7 +814,7 @@ def main() -> None:
             )
 
     for update in range(args.updates):
-        env = build_env(args, seed_offset=update)
+        env = build_env(args, seed_offset=update, group_scenario_by_refresh=True)
         stats = rollout(
             env,
             agent,

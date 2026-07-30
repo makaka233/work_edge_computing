@@ -170,7 +170,14 @@ def generate_realistic_scenario(
                 propagation[i, j] = 0.0
             elif adjacency[i, j]:
                 distance = max(node_dist[i, j], 0.2)
-                bandwidth[i, j] = rng.uniform(180.0, 1200.0) / (1.0 + 0.05 * distance)
+                link_class = rng.choice(["bottleneck", "metro", "backbone"], p=[0.18, 0.62, 0.20])
+                if link_class == "bottleneck":
+                    raw_bandwidth = rng.uniform(25.0, 90.0)
+                elif link_class == "metro":
+                    raw_bandwidth = rng.uniform(120.0, 650.0)
+                else:
+                    raw_bandwidth = rng.uniform(750.0, 1800.0)
+                bandwidth[i, j] = raw_bandwidth / (1.0 + 0.06 * distance)
                 propagation[i, j] = 0.35 * distance + rng.uniform(0.2, 1.5)
 
     return EdgeScenario(
@@ -248,15 +255,6 @@ def _generate_services(
     num_service_types: int,
     max_service_stages: int,
 ) -> list[Service]:
-    names = [
-        "video-analytics",
-        "speech-recognition",
-        "ar-rendering",
-        "industrial-inspection",
-        "traffic-perception",
-        "smart-retail",
-        "robot-control",
-    ]
     services: list[Service] = []
     profiles = [
         {
@@ -307,6 +305,27 @@ def _generate_services(
             "stage_output": [0.025, 0.008],
             "input_mb": 0.08,
             "deadline_s": 0.08,
+        },
+        {
+            "name": "medical-vital-anomaly",
+            "stage_compute": [0.55, 0.85],
+            "stage_output": [0.030, 0.006],
+            "input_mb": 0.12,
+            "deadline_s": 0.10,
+        },
+        {
+            "name": "drone-inspection",
+            "stage_compute": [1.60, 2.50, 1.10],
+            "stage_output": [0.14, 0.05, 0.018],
+            "input_mb": 0.65,
+            "deadline_s": 0.24,
+        },
+        {
+            "name": "connected-vehicle-planning",
+            "stage_compute": [1.10, 1.45],
+            "stage_output": [0.070, 0.018],
+            "input_mb": 0.30,
+            "deadline_s": 0.13,
         },
     ]
     for service_id in range(num_service_types):

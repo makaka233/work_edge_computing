@@ -5,6 +5,7 @@ import numpy as np
 from edge_drl.agents.hierarchical import build_baseline_agent
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
+from edge_drl.env.scenario import generate_realistic_scenario
 
 
 def test_kkt_compute_sqrt_rule():
@@ -146,6 +147,38 @@ def test_default_traffic_is_city_scale_for_ten_thousand_users():
     assert min_requests_per_second > 1.0
 
 
+def test_ten_service_catalog_is_realistic_and_staged():
+    scenario = generate_realistic_scenario(
+        rng=np.random.default_rng(51),
+        num_users=10_000,
+        num_edge_nodes=32,
+        num_service_types=10,
+        max_service_stages=3,
+    )
+    names = {service.name for service in scenario.services}
+
+    assert len(scenario.services) == 10
+    assert "drone-inspection" in names
+    assert "connected-vehicle-planning" in names
+    assert "medical-vital-anomaly" in names
+    assert max(len(service.stages) for service in scenario.services) <= 3
+
+
+def test_city_links_include_heterogeneous_bottlenecks():
+    scenario = generate_realistic_scenario(
+        rng=np.random.default_rng(53),
+        num_users=10_000,
+        num_edge_nodes=32,
+        num_service_types=10,
+        max_service_stages=3,
+    )
+    finite_bandwidth = scenario.bandwidth_mb_s[np.isfinite(scenario.bandwidth_mb_s) & (scenario.bandwidth_mb_s > 0)]
+
+    assert finite_bandwidth.min() < 100.0
+    assert finite_bandwidth.max() > 700.0
+    assert finite_bandwidth.max() / finite_bandwidth.min() > 10.0
+
+
 def test_default_single_task_latency_is_mec_scale():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
@@ -184,7 +217,7 @@ def test_request_aggregation_counts_underlying_requests():
             num_edge_nodes=16,
             num_service_types=3,
             episode_hours=1,
-            mean_requests_per_minute=1_800.0,
+            mean_requests_per_minute=6_000.0,
             request_aggregation_window_seconds=1.0,
         )
     )

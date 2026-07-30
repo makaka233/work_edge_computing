@@ -460,9 +460,11 @@ class EdgeComputingEnv:
     def _arrival_rate_per_minute(self) -> float:
         minute_of_day = self.current_time_minute % (24 * 60)
         morning_peak = np.exp(-0.5 * ((minute_of_day - 9 * 60) / 105.0) ** 2)
+        lunch_peak = np.exp(-0.5 * ((minute_of_day - 13 * 60) / 90.0) ** 2)
         evening_peak = np.exp(-0.5 * ((minute_of_day - 19 * 60) / 135.0) ** 2)
-        night_factor = 0.50 if minute_of_day < 6 * 60 else 1.0
-        return self._base_arrival_rate_per_minute() * night_factor * (0.70 + 0.35 * morning_peak + 0.45 * evening_peak)
+        night_factor = 0.35 if minute_of_day < 6 * 60 else 1.0
+        daily_factor = 0.58 + 0.58 * morning_peak + 0.25 * lunch_peak + 0.82 * evening_peak
+        return self._base_arrival_rate_per_minute() * night_factor * daily_factor
 
     def _base_arrival_rate_per_minute(self) -> float:
         if self.config.mean_requests_per_minute is not None:

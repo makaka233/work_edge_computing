@@ -9,7 +9,11 @@ instances are generated reproducibly, and training/evaluation entrypoints are
 kept thin. The problem model is different, so the code is specialized for:
 
 - 10,000 to 15,000 users in a city-scale edge network.
+- 32 heterogeneous edge nodes for the main experiment setting.
 - Staged services with at most 3 stages.
+- 10 realistic service classes: speech, AR, video analytics, industrial
+  inspection, traffic perception, retail events, robot control, medical vital
+  anomaly detection, drone inspection, and connected-vehicle planning.
 - Slow service-stage deployment every 4 hours.
 - Fast request-level scheduling when each task request arrives.
 - KKT closed-form allocation for continuous compute and link bandwidth.
@@ -17,9 +21,11 @@ kept thin. The problem model is different, so the code is specialized for:
   single-digit Gcycle staged compute demand, 150 Mbps uplink, and 10 ms radio
   RTT so average single-task latency is expected to fall in the tens to hundreds
   of milliseconds range.
-- City-scale traffic derived from active users by default. For 10,000 users,
-  the default traffic model produces about 29 requests/s on average and about
-  43 requests/s at peak before optional CLI scaling.
+- City-scale traffic derived from active users by default, with a daily
+  morning/lunch/evening curve. Use `--traffic-scale` above 1.0 to create
+  heavier congestion.
+- Heterogeneous metro links mix bottleneck, ordinary metro, and backbone-like
+  bandwidth classes, so placement and scheduling have visible network tradeoffs.
 - Request aggregation is enabled by default. The environment groups arrivals
   within a short time window by `(home_node, service_id)` and stores the number
   of underlying requests in `request_count`. Per-task latency is evaluated with
@@ -47,8 +53,8 @@ kept thin. The problem model is different, so the code is specialized for:
 python train.py --max-requests 1000
 python train_dual_ppo.py --updates 2 --requests-per-update 64
 python train_dual_ppo.py --updates 20 --requests-per-update 48 --eval-interval 5 --eval-seeds 2 --reward-scale 10
-python train_dual_ppo.py --fixed-scenario --train-mode joint --rollout-unit episode --episode-hours 4 --updates 200 --eval-interval 10 --eval-rollout-unit episode --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-representative-groups-per-window 8 --run-name joint_gat_4h_episode_200_calibrated --save-best --progress-interval-seconds 30
-python scripts/run_full_training.py --fixed-scenario
+python train_dual_ppo.py --train-mode joint --rollout-unit episode --episode-hours 24 --updates 200 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --scenario-refresh-episodes 20 --traffic-scale 1.6 --eval-interval 20 --eval-rollout-unit episode --eval-seeds 5 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 5 --max-representative-groups-per-window 16 --run-name joint_gat_city32_svc10_day200 --save-best --progress-interval-seconds 30
+python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
 python -m pytest tests
@@ -69,5 +75,14 @@ Two agent families are available:
 - `HierarchicalPPOAgent`: trainable dual-agent DRL scaffold.
 
 The DRL version has a slow PPO agent for service-stage deployment and a fast PPO
-agent for request-level stage scheduling. Continuous compute and bandwidth
-allocation remains outside the neural policy and is solved by the KKT module.
+agent for request-level stage scheduling. The slow agent's
+`--max-replicas-per-stage` is only the action-space budget: at each replica slot
+the PPO policy can choose a node or STOP, so the actual replica count is learned
+from reward. Continuous compute and bandwidth allocation remains outside the
+neural policy and is solved by the KKT module.
+
+When `--fixed-scenario` is omitted, `--scenario-refresh-episodes N` reuses the
+same generated topology, user distribution, and service preference base for N
+training episodes while the request samples still change every episode. Eval
+seeds are independent scenario seeds, giving a basic scenario-generalization
+check instead of only reporting one fixed topology.

@@ -1,7 +1,19 @@
 import subprocess
 import sys
 import csv
+from argparse import Namespace
 from pathlib import Path
+
+from train_dual_ppo import scenario_seed_for_offset
+
+
+def test_scenario_refresh_groups_training_episodes():
+    args = Namespace(seed=2026, fixed_scenario=False, scenario_refresh_episodes=20)
+
+    assert scenario_seed_for_offset(args, 0, group_by_refresh=True) == 2026
+    assert scenario_seed_for_offset(args, 19, group_by_refresh=True) == 2026
+    assert scenario_seed_for_offset(args, 20, group_by_refresh=True) == 2027
+    assert scenario_seed_for_offset(args, 20, group_by_refresh=False) == 2046
 
 
 def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):

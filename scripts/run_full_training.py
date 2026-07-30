@@ -11,9 +11,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--run-root", type=str, default="runs")
     parser.add_argument("--num-users", type=int, default=10_000)
-    parser.add_argument("--num-edge-nodes", type=int, default=16)
-    parser.add_argument("--num-service-types", type=int, default=3)
+    parser.add_argument("--num-edge-nodes", type=int, default=32)
+    parser.add_argument("--num-service-types", type=int, default=10)
     parser.add_argument("--episode-hours", type=int, default=24)
+    parser.add_argument("--scenario-refresh-episodes", type=int, default=20)
     parser.add_argument("--mean-requests-per-minute", type=float, default=None)
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
@@ -35,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
+    parser.add_argument("--max-replicas-per-stage", dest="replicas_per_stage", type=int, default=5)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--progress-interval-seconds", type=float, default=10.0)
     parser.add_argument("--fixed-scenario", action="store_true")
@@ -60,6 +62,8 @@ def main() -> None:
         str(args.num_service_types),
         "--episode-hours",
         str(args.episode_hours),
+        "--scenario-refresh-episodes",
+        str(args.scenario_refresh_episodes),
         "--active-user-ratio",
         str(args.active_user_ratio),
         "--active-user-request-rate-per-minute",
@@ -88,6 +92,8 @@ def main() -> None:
         args.reward_mode,
         "--fast-policy-kind",
         args.fast_policy_kind,
+        "--max-replicas-per-stage",
+        str(args.replicas_per_stage),
         "--eval-seeds",
         str(args.eval_seeds),
         "--eval-requests",
