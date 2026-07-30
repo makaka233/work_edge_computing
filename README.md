@@ -13,6 +13,10 @@ kept thin. The problem model is different, so the code is specialized for:
 - Slow service-stage deployment every 4 hours.
 - Fast request-level scheduling when each task request arrives.
 - KKT closed-form allocation for continuous compute and link bandwidth.
+- MEC-scale task latency calibration: service requests use small input payloads,
+  single-digit Gcycle staged compute demand, 150 Mbps uplink, and 10 ms radio
+  RTT so average single-task latency is expected to fall in the tens to hundreds
+  of milliseconds range.
 - City-scale traffic derived from active users by default. For 10,000 users,
   the default traffic model produces about 29 requests/s on average and about
   43 requests/s at peak before optional CLI scaling.
@@ -42,8 +46,8 @@ kept thin. The problem model is different, so the code is specialized for:
 ```powershell
 python train.py --max-requests 1000
 python train_dual_ppo.py --updates 2 --requests-per-update 64
-python train_dual_ppo.py --updates 20 --requests-per-update 48 --eval-interval 5 --eval-seeds 2 --reward-scale 0.1
-python train_dual_ppo.py --fixed-scenario --train-mode joint --rollout-unit episode --episode-hours 8 --updates 20 --eval-interval 5 --eval-rollout-unit episode --eval-seeds 1 --reward-mode latency --fast-policy-kind gat_node_scorer --max-representative-groups-per-window 8 --run-name joint_gat_episode_aligned --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --updates 20 --requests-per-update 48 --eval-interval 5 --eval-seeds 2 --reward-scale 10
+python train_dual_ppo.py --fixed-scenario --train-mode joint --rollout-unit episode --episode-hours 4 --updates 200 --eval-interval 10 --eval-rollout-unit episode --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-representative-groups-per-window 8 --run-name joint_gat_4h_episode_200_calibrated --save-best --progress-interval-seconds 30
 python scripts/run_full_training.py --fixed-scenario
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv

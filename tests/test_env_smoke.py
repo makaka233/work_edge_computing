@@ -146,6 +146,36 @@ def test_default_traffic_is_city_scale_for_ten_thousand_users():
     assert min_requests_per_second > 1.0
 
 
+def test_default_single_task_latency_is_mec_scale():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=41,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            request_aggregation_window_seconds=10.0,
+            max_representative_groups_per_window=8,
+        )
+    )
+    agent = build_baseline_agent()
+    env.reset()
+    agent.maybe_update_deployment(env)
+    latencies = []
+    weights = []
+    while not env.done and env.metrics["requests"] < 20_000:
+        action = agent.act(env)
+        _, _, _, info = env.step(action)
+        latencies.append(float(info["latency_s"]))
+        weights.append(float(info["request_count"]))
+
+    avg_latency_s = float(np.average(np.asarray(latencies), weights=np.asarray(weights)))
+    p95_latency_s = float(np.percentile(latencies, 95))
+
+    assert 0.02 <= avg_latency_s <= 0.30
+    assert p95_latency_s <= 0.60
+
+
 def test_request_aggregation_counts_underlying_requests():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

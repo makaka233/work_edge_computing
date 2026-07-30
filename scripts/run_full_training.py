@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
     parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
+    parser.add_argument("--wireless-uplink-mbps", type=float, default=150.0)
+    parser.add_argument("--radio-rtt-ms", type=float, default=10.0)
     parser.add_argument("--eval-seeds", type=int, default=3)
     parser.add_argument("--eval-requests", type=int, default=256)
     parser.add_argument("--fast-bc-requests", type=int, default=2048)
@@ -30,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--requests-per-update", type=int, default=256)
     parser.add_argument("--rollout-unit", choices=["requests", "episode"], default="requests")
     parser.add_argument("--eval-rollout-unit", choices=["requests", "episode", "same"], default="requests")
-    parser.add_argument("--reward-scale", type=float, default=0.1)
+    parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--device", type=str, default="cpu")
@@ -70,6 +72,10 @@ def main() -> None:
         str(args.max_representative_groups_per_window),
         "--load-ewma-tau-minutes",
         str(args.load_ewma_tau_minutes),
+        "--wireless-uplink-mbps",
+        str(args.wireless_uplink_mbps),
+        "--radio-rtt-ms",
+        str(args.radio_rtt_ms),
         "--requests-per-update",
         str(args.requests_per_update),
         "--rollout-unit",

@@ -26,6 +26,8 @@ class EdgeEnvConfig:
     request_aggregation_window_seconds: float = 10.0
     max_representative_groups_per_window: int | None = 16
     load_ewma_tau_minutes: float = 1.0
+    wireless_uplink_mbps: float = 150.0
+    radio_rtt_ms: float = 10.0
     load_penalty_weight: float = 0.08
     migration_cost_weight: float = 0.02
     invalid_action_penalty: float = 10.0
@@ -51,6 +53,10 @@ class EdgeEnvConfig:
             raise ValueError("max_representative_groups_per_window must be positive or None.")
         if self.load_ewma_tau_minutes <= 0:
             raise ValueError("load_ewma_tau_minutes must be positive.")
+        if self.wireless_uplink_mbps <= 0:
+            raise ValueError("wireless_uplink_mbps must be positive.")
+        if self.radio_rtt_ms < 0:
+            raise ValueError("radio_rtt_ms must be non-negative.")
 
 
 class EdgeComputingEnv:
@@ -315,12 +321,14 @@ class EdgeComputingEnv:
             link_delays = {}
             link_delay = self.config.invalid_action_penalty
 
+        access_delay = self.config.radio_rtt_ms / 1000.0
+        access_delay += request.input_mb / max(self.config.wireless_uplink_mbps / 8.0, 1e-9)
         propagation_delay = 0.0
         for demand in link_demands:
             if self.scenario.adjacency[demand.src_node, demand.dst_node]:
                 propagation_delay += float(self.scenario.propagation_ms[demand.src_node, demand.dst_node]) / 1000.0
 
-        latency_s = compute_delay + link_delay + propagation_delay
+        latency_s = access_delay + compute_delay + link_delay + propagation_delay
         if not valid:
             latency_s += self.config.invalid_action_penalty
 
@@ -334,6 +342,7 @@ class EdgeComputingEnv:
             "stage_nodes": nodes,
             "compute_delay_s": compute_delay,
             "link_delay_s": link_delay,
+            "access_delay_s": access_delay,
             "propagation_delay_s": propagation_delay,
             "latency_s": latency_s,
             "compute_delays": compute_delays,

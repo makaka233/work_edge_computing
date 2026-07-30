@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
     parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
+    parser.add_argument("--wireless-uplink-mbps", type=float, default=150.0)
+    parser.add_argument("--radio-rtt-ms", type=float, default=10.0)
     parser.add_argument("--updates", type=int, default=20)
     parser.add_argument("--requests-per-update", type=int, default=4096)
     parser.add_argument(
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         default="requests",
         help="Collect each PPO update by request count or by one full environment episode.",
     )
-    parser.add_argument("--reward-scale", type=float, default=0.1)
+    parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--mixed-latency-weight", type=float, default=0.1)
     parser.add_argument("--train-mode", choices=["joint", "fast-only"], default="joint")
@@ -99,6 +101,8 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0) -> EdgeComputingEn
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             max_representative_groups_per_window=args.max_representative_groups_per_window,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
+            wireless_uplink_mbps=args.wireless_uplink_mbps,
+            radio_rtt_ms=args.radio_rtt_ms,
         )
     )
 

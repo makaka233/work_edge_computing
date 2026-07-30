@@ -32,6 +32,7 @@ class Service:
     name: str
     stages: tuple[ServiceStage, ...]
     input_mb_mean: float
+    deadline_s_mean: float
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,7 @@ def generate_realistic_scenario(
         tier = rng.choice([0, 1, 2], p=[0.50, 0.35, 0.15])
         memory_gb = [64, 128, 256][tier] * rng.uniform(0.85, 1.20)
         storage_gb = [512, 1024, 2048][tier] * rng.uniform(0.85, 1.25)
-        compute = [80, 160, 320][tier] * rng.uniform(0.80, 1.25)
+        compute = [96, 192, 384][tier] * rng.uniform(0.80, 1.25)
         nodes.append(
             EdgeNode(
                 node_id=node_id,
@@ -225,7 +226,8 @@ def generate_grouped_request(
         stage_compute.append(float(rng.lognormal(np.log(stage.compute_gcycles_mean), 0.30)))
         stage_output.append(float(rng.lognormal(np.log(stage.output_mb_mean), 0.35)))
 
-    deadline_s = 0.45 + 0.04 * input_mb + 0.012 * sum(stage_compute)
+    deadline_s = float(rng.lognormal(np.log(service.deadline_s_mean), 0.18))
+    deadline_s = float(np.clip(deadline_s, 0.05, 0.60))
     return TaskRequest(
         request_id=request_id,
         arrival_minute=arrival_minute,
@@ -256,11 +258,61 @@ def _generate_services(
         "robot-control",
     ]
     services: list[Service] = []
+    profiles = [
+        {
+            "name": "speech-recognition",
+            "stage_compute": [0.65, 0.95],
+            "stage_output": [0.035, 0.008],
+            "input_mb": 0.18,
+            "deadline_s": 0.12,
+        },
+        {
+            "name": "ar-overlay",
+            "stage_compute": [1.20, 1.65, 0.90],
+            "stage_output": [0.10, 0.06, 0.025],
+            "input_mb": 0.35,
+            "deadline_s": 0.15,
+        },
+        {
+            "name": "video-object-detection",
+            "stage_compute": [2.20, 3.20],
+            "stage_output": [0.18, 0.04],
+            "input_mb": 0.80,
+            "deadline_s": 0.28,
+        },
+        {
+            "name": "industrial-inspection",
+            "stage_compute": [1.80, 2.40, 1.20],
+            "stage_output": [0.12, 0.04, 0.015],
+            "input_mb": 0.55,
+            "deadline_s": 0.22,
+        },
+        {
+            "name": "traffic-perception",
+            "stage_compute": [1.40, 2.10],
+            "stage_output": [0.10, 0.025],
+            "input_mb": 0.45,
+            "deadline_s": 0.20,
+        },
+        {
+            "name": "smart-retail-event",
+            "stage_compute": [0.80, 1.10],
+            "stage_output": [0.06, 0.015],
+            "input_mb": 0.25,
+            "deadline_s": 0.16,
+        },
+        {
+            "name": "robot-control",
+            "stage_compute": [0.45, 0.70],
+            "stage_output": [0.025, 0.008],
+            "input_mb": 0.08,
+            "deadline_s": 0.08,
+        },
+    ]
     for service_id in range(num_service_types):
-        stage_count = int(rng.integers(1, max_service_stages + 1))
+        profile = profiles[service_id % len(profiles)]
+        stage_count = min(len(profile["stage_compute"]), max_service_stages)
         stages = []
-        base_compute = rng.uniform(18.0, 90.0)
-        base_data = rng.uniform(4.0, 35.0)
         for stage_id in range(stage_count):
             stages.append(
                 ServiceStage(
@@ -268,16 +320,17 @@ def _generate_services(
                     stage_id=stage_id,
                     memory_gb=float(rng.uniform(0.5, 4.0)),
                     storage_gb=float(rng.uniform(1.5, 12.0)),
-                    compute_gcycles_mean=float(base_compute * rng.uniform(0.55, 1.45)),
-                    output_mb_mean=float(base_data * rng.uniform(0.35, 1.10)),
+                    compute_gcycles_mean=float(profile["stage_compute"][stage_id] * rng.uniform(0.85, 1.15)),
+                    output_mb_mean=float(profile["stage_output"][stage_id] * rng.uniform(0.80, 1.20)),
                 )
             )
         services.append(
             Service(
                 service_id=service_id,
-                name=names[service_id % len(names)],
+                name=str(profile["name"]),
                 stages=tuple(stages),
-                input_mb_mean=float(base_data * rng.uniform(0.9, 1.6)),
+                input_mb_mean=float(profile["input_mb"] * rng.uniform(0.85, 1.15)),
+                deadline_s_mean=float(profile["deadline_s"] * rng.uniform(0.90, 1.10)),
             )
         )
     return services
