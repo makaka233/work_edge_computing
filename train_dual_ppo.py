@@ -3,13 +3,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - exercised only when tqdm is absent.
+    tqdm = None
 
 from edge_drl.agents.hierarchical import FastGreedyScheduler, SlowGreedyDeploymentPolicy, build_baseline_agent
 from edge_drl.agents.drl import HierarchicalPPOAgent
@@ -160,7 +163,7 @@ class RolloutProgress:
     ):
         self.label = label
         self.target_requests = target_requests
-        self.interval_seconds = max(interval_seconds, 0.0)
+        self.interval_seconds = max(interval_seconds, 0.0) if tqdm is not None else 0.0
         self.episode_hours = episode_hours
         self.rollout_unit = rollout_unit
         self.deployment_interval_minutes = deployment_interval_minutes
@@ -170,6 +173,18 @@ class RolloutProgress:
         self.started_at = time.monotonic()
         self.last_print_at = self.started_at
         self.printed = False
+        self.progress_units = 0.0
+        self.tqdm_bar = None
+        if self.interval_seconds > 0:
+            total_units = self._total_progress_units()
+            self.tqdm_bar = tqdm(
+                total=total_units,
+                desc=self.label,
+                unit="sim-min" if self.rollout_unit == "episode" else "req",
+                dynamic_ncols=True,
+                mininterval=self.interval_seconds,
+                leave=False,
+            )
 
     def should_print(self) -> bool:
         if self.interval_seconds <= 0:
@@ -186,7 +201,7 @@ class RolloutProgress:
         avg_latency_s: float | None = None,
     ) -> None:
         if self.should_print():
-            self._print(
+            self._print_tqdm(
                 env,
                 now=time.monotonic(),
                 avg_reward=avg_reward,
@@ -202,9 +217,9 @@ class RolloutProgress:
         avg_train_reward: float = float("nan"),
         avg_latency_s: float | None = None,
     ) -> None:
-        if self.interval_seconds <= 0:
+        if self.interval_seconds <= 0 or self.tqdm_bar is None:
             return
-        self._print(
+        self._print_tqdm(
             env,
             now=time.monotonic(),
             final=True,
@@ -213,7 +228,7 @@ class RolloutProgress:
             avg_latency_s=avg_latency_s,
         )
 
-    def _print(
+    def _print_tqdm(
         self,
         env: EdgeComputingEnv,
         *,
@@ -223,6 +238,7 @@ class RolloutProgress:
         avg_train_reward: float = float("nan"),
         avg_latency_s: float | None = None,
     ) -> None:
+        assert self.tqdm_bar is not None
         requests = float(env.metrics.get("requests", 0.0))
         aggregate_events = int(env.metrics.get("aggregate_events", 0.0))
         sim_hours = env.current_time_minute / 60.0
@@ -234,14 +250,24 @@ class RolloutProgress:
         if avg_latency_s is None:
             avg_latency_s = env.metrics["total_latency_s"] / max(requests, 1.0)
         elapsed = max(now - self.started_at, 1e-9)
-        eta = elapsed * (1.0 - progress) / max(progress, 1e-9) if progress > 0 else float("nan")
         total_windows = max(int(np.ceil(self.episode_hours * 60.0 / max(self.deployment_interval_minutes, 1))), 1)
         current_window = min(int(env.current_time_minute // max(self.deployment_interval_minutes, 1)) + 1, total_windows)
-        simulated_seconds = max(env.current_time_minute * 60.0, 1e-9)
-        sim_request_rate = requests / simulated_seconds
         wall_event_rate = aggregate_events / elapsed
-        request_target = str(self.target_requests) if self.target_requests is not None else "episode"
-        overall_text = ""
+        units = self._progress_units(env)
+        delta = max(units - self.progress_units, 0.0)
+        if delta > 0:
+            self.tqdm_bar.update(delta)
+            self.progress_units = units
+        postfix = {
+            "epR": _format_metric(avg_reward, 4),
+            "trainR": _format_metric(avg_train_reward, 4),
+            "Lat": f"{avg_latency_s * 1000:.1f}ms",
+            "win": f"{current_window}/{total_windows}",
+            "deploy": int(env.metrics.get("deployment_updates", 0.0)),
+            "sim": f"{sim_hours:.1f}/{self.episode_hours}h",
+            "req": f"{int(requests)}/{int(self.target_requests or requests or 1)}",
+            "ev/s": f"{wall_event_rate:.1f}",
+        }
         if self.overall_index is not None and self.overall_total:
             overall_progress = (self.overall_index + progress) / max(float(self.overall_total), 1.0)
             overall_progress = min(max(overall_progress, 0.0), 1.0)
@@ -250,29 +276,23 @@ class RolloutProgress:
             else:
                 total_elapsed = max(now - self.overall_started_at, 1e-9)
             total_eta = total_elapsed * (1.0 - overall_progress) / max(overall_progress, 1e-9)
-            overall_text = (
-                f" | all [{_progress_bar(overall_progress, width=12)}] "
-                f"{overall_progress * 100:4.1f}% ETA {_format_duration(total_eta)}"
-            )
-        line = (
-            f"\r{self.label} [{_progress_bar(progress, width=24)}] {progress * 100:5.1f}% "
-            f"| epR={_format_metric(avg_reward, 4)} "
-            f"trainR={_format_metric(avg_train_reward, 4)} "
-            f"Lat={avg_latency_s * 1000:6.1f}ms "
-            f"| win={current_window}/{total_windows} deploy={int(env.metrics.get('deployment_updates', 0.0)):>2} "
-            f"sim={sim_hours:4.1f}/{self.episode_hours}h "
-            f"req={int(requests)}/{request_target} "
-            f"ev={aggregate_events} "
-            f"spd={wall_event_rate:4.1f}ev/s "
-            f"ETA {_format_duration(eta)}"
-            f"{overall_text}"
-        )
-        sys.stdout.write(line[:240])
-        if final:
-            sys.stdout.write("\n")
-        sys.stdout.flush()
+            postfix["all"] = f"{overall_progress * 100:.1f}%"
+            postfix["totalETA"] = _format_duration(total_eta)
+        self.tqdm_bar.set_postfix(postfix, refresh=True)
         self.printed = True
         self.last_print_at = now
+        if final:
+            self.tqdm_bar.close()
+
+    def _total_progress_units(self) -> float:
+        if self.rollout_unit == "episode":
+            return max(float(self.episode_hours * 60), 1.0)
+        return max(float(self.target_requests or 1), 1.0)
+
+    def _progress_units(self, env: EdgeComputingEnv) -> float:
+        if self.rollout_unit == "episode":
+            return min(max(env.current_time_minute, 0.0), self._total_progress_units())
+        return min(float(env.metrics.get("requests", 0.0)), self._total_progress_units())
 
 
 def _format_duration(seconds: float) -> str:
@@ -284,12 +304,6 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
-
-
-def _progress_bar(progress: float, *, width: int) -> str:
-    progress = min(max(float(progress), 0.0), 1.0)
-    filled = int(round(progress * width))
-    return "#" * filled + "-" * (width - filled)
 
 
 def _format_metric(value: float, precision: int) -> str:
