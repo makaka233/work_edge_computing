@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import csv
 from pathlib import Path
 
 
@@ -101,6 +102,51 @@ def test_default_entrypoint_writes_under_runs(tmp_path):
     assert (tmp_path / "runs" / "organized_run" / "logs" / "training.csv").exists()
     assert (tmp_path / "runs" / "organized_run" / "checkpoints" / "last.pt").exists()
     assert (tmp_path / "runs" / "organized_run" / "metadata.json").exists()
+
+
+def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--rollout-unit",
+        "episode",
+        "--mean-requests-per-minute",
+        "2",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "8",
+        "--request-aggregation-window-seconds",
+        "60",
+        "--max-representative-groups-per-window",
+        "4",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "rollout_unit=episode" in result.stdout
+    assert "update=001 episode=001 complete=1" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    row = rows[-1]
+    assert row["update"] == "1"
+    assert row["episode"] == "1"
+    assert row["episode_complete"] == "1"
+    assert float(row["episode_fraction"]) >= 1.0
+    assert float(row["deployment_updates"]) >= 2.0
 
 
 def test_convergence_analyzer_reads_training_log(tmp_path):

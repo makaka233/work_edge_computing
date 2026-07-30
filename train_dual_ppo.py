@@ -33,6 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
     parser.add_argument("--updates", type=int, default=20)
     parser.add_argument("--requests-per-update", type=int, default=4096)
+    parser.add_argument(
+        "--rollout-unit",
+        choices=["requests", "episode"],
+        default="requests",
+        help="Collect each PPO update by request count or by one full environment episode.",
+    )
     parser.add_argument("--reward-scale", type=float, default=0.1)
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--mixed-latency-weight", type=float, default=0.1)
@@ -53,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-baseline", action="store_true")
     parser.add_argument("--eval-requests", type=int, default=128)
     parser.add_argument("--eval-interval", type=int, default=0)
+    parser.add_argument(
+        "--eval-rollout-unit",
+        choices=["requests", "episode", "same"],
+        default="requests",
+        help="Use request-count eval, full-episode eval, or the same unit as training.",
+    )
     parser.add_argument("--eval-seeds", type=int, default=3)
     parser.add_argument("--fast-bc-requests", type=int, default=0)
     parser.add_argument("--fast-bc-epochs", type=int, default=3)
@@ -108,11 +120,20 @@ def traffic_rate_summary(env: EdgeComputingEnv) -> dict[str, float]:
 
 
 class RolloutProgress:
-    def __init__(self, *, label: str, max_requests: int, interval_seconds: float, episode_hours: int):
+    def __init__(
+        self,
+        *,
+        label: str,
+        target_requests: int | None,
+        interval_seconds: float,
+        episode_hours: int,
+        rollout_unit: str,
+    ):
         self.label = label
-        self.max_requests = max_requests
+        self.target_requests = target_requests
         self.interval_seconds = max(interval_seconds, 0.0)
         self.episode_hours = episode_hours
+        self.rollout_unit = rollout_unit
         self.started_at = time.monotonic()
         self.last_print_at = self.started_at
         self.printed = False
@@ -132,15 +153,19 @@ class RolloutProgress:
     def _print(self, env: EdgeComputingEnv, *, now: float, final: bool = False) -> None:
         requests = float(env.metrics.get("requests", 0.0))
         aggregate_events = int(env.metrics.get("aggregate_events", 0.0))
-        progress = min(requests / max(float(self.max_requests), 1.0), 1.0)
+        sim_hours = env.current_time_minute / 60.0
+        episode_fraction = sim_hours / max(float(self.episode_hours), 1e-9)
+        if self.rollout_unit == "episode":
+            progress = min(episode_fraction, 1.0)
+        else:
+            progress = min(requests / max(float(self.target_requests or 1), 1.0), 1.0)
         avg_latency = env.metrics["total_latency_s"] / max(requests, 1.0)
         elapsed = max(now - self.started_at, 1e-9)
         eta = elapsed * (1.0 - progress) / max(progress, 1e-9) if progress > 0 else float("nan")
-        sim_hours = env.current_time_minute / 60.0
-        episode_fraction = sim_hours / max(float(self.episode_hours), 1e-9)
+        request_target = str(self.target_requests) if self.target_requests is not None else "episode"
         line = (
             f"\r{self.label} {progress * 100:6.2f}% "
-            f"req={int(requests):>7}/{self.max_requests:<7} "
+            f"req={int(requests):>7}/{request_target:<7} "
             f"events={aggregate_events:>5} "
             f"sim_h={sim_hours:5.2f}/{self.episode_hours:<2} "
             f"ep={episode_fraction * 100:5.1f}% "
@@ -168,6 +193,25 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def estimate_episode_requests(env: EdgeComputingEnv) -> int:
+    original_time = env.current_time_minute
+    expected = 0.0
+    total_minutes = int(env.config.episode_hours * 60)
+    for minute in range(total_minutes):
+        env.current_time_minute = float(minute)
+        expected += env._arrival_rate_per_minute()
+    env.current_time_minute = original_time
+    return max(int(round(expected)), 1)
+
+
+def _rollout_active(env: EdgeComputingEnv, *, max_requests: int, rollout_unit: str) -> bool:
+    if env.done:
+        return False
+    if rollout_unit == "episode":
+        return True
+    return env.metrics["requests"] < max_requests
+
+
 def rollout(
     env: EdgeComputingEnv,
     agent: HierarchicalPPOAgent,
@@ -180,6 +224,7 @@ def rollout(
     frozen_slow_policy: SlowGreedyDeploymentPolicy | None = None,
     progress_label: str = "",
     progress_interval_seconds: float = 0.0,
+    rollout_unit: str = "requests",
 ) -> dict[str, float]:
     if args is None:
         args = argparse.Namespace(reward_mode="latency", mixed_latency_weight=0.1)
@@ -194,13 +239,15 @@ def rollout(
     greedy_latencies: list[float] = []
     greedy_weights: list[float] = []
     window_latencies: dict[int, list[tuple[float, float]]] = {}
+    target_requests = max_requests if rollout_unit == "requests" else estimate_episode_requests(env)
     progress = RolloutProgress(
         label=progress_label,
-        max_requests=max_requests,
+        target_requests=target_requests,
         interval_seconds=progress_interval_seconds,
         episode_hours=env.config.episode_hours,
+        rollout_unit=rollout_unit,
     )
-    while not env.done and env.metrics["requests"] < max_requests:
+    while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit):
         request = env.current_request
         assert request is not None
         if train_mode == "fast-only":
@@ -242,6 +289,7 @@ def rollout(
         "aggregate_events": float(env.metrics["aggregate_events"]),
         "simulated_hours": float(env.current_time_minute / 60.0),
         "episode_fraction": float(env.current_time_minute / max(env.config.episode_hours * 60.0, 1e-9)),
+        "episode_complete": float(env.done),
         "avg_reward": _weighted_mean(rewards, weights),
         "avg_train_reward": _weighted_mean(train_rewards, weights),
         "avg_latency_s": _weighted_mean(latencies, weights),
@@ -317,6 +365,7 @@ def evaluate_agent(
     seed_base: int,
     max_requests: int,
     train_mode: str,
+    rollout_unit: str = "requests",
 ) -> dict[str, float]:
     runs = []
     for seed_idx in range(args.eval_seeds):
@@ -330,6 +379,7 @@ def evaluate_agent(
                 deterministic=True,
                 record=False,
                 train_mode=train_mode,
+                rollout_unit=rollout_unit,
             )
         )
     avg_latencies = np.array([r["avg_latency_s"] for r in runs], dtype=np.float64)
@@ -362,6 +412,7 @@ def evaluate_policy_diagnostics(
     max_requests: int,
     train_mode: str,
     previous_actions: list[int] | None,
+    rollout_unit: str = "requests",
 ) -> tuple[dict[str, float], list[int]]:
     deterministic_actions: list[int] = []
     entropies: list[float] = []
@@ -374,7 +425,7 @@ def evaluate_policy_diagnostics(
     for seed_idx in range(args.eval_seeds):
         env = build_env(args, seed_offset=seed_base + seed_idx)
         env.reset()
-        while not env.done and env.metrics["requests"] < max_requests:
+        while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit):
             request = env.current_request
             assert request is not None
             if train_mode == "fast-only":
@@ -399,6 +450,7 @@ def evaluate_policy_diagnostics(
             deterministic=False,
             record=False,
             train_mode=train_mode,
+            rollout_unit=rollout_unit,
         )
         stochastic_latencies.append(stochastic_stats["avg_latency_s"])
 
@@ -557,8 +609,15 @@ def write_metadata(path: Path, args: argparse.Namespace, bc_metrics: dict[str, f
     (path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
+def resolve_eval_rollout_unit(args: argparse.Namespace) -> str:
+    if args.eval_rollout_unit == "same":
+        return args.rollout_unit
+    return args.eval_rollout_unit
+
+
 def main() -> None:
     args = parse_args()
+    eval_rollout_unit = resolve_eval_rollout_unit(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -602,6 +661,8 @@ def main() -> None:
     )
     print(f"  train_mode={args.train_mode}")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
+    print(f"  rollout_unit={args.rollout_unit}")
+    print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
     print(
@@ -652,6 +713,7 @@ def main() -> None:
             seed_base=30_000,
             max_requests=args.eval_requests,
             train_mode=args.train_mode,
+            rollout_unit=eval_rollout_unit,
         )
         diagnostic_stats, previous_eval_actions = evaluate_policy_diagnostics(
             args,
@@ -660,13 +722,16 @@ def main() -> None:
             max_requests=args.eval_requests,
             train_mode=args.train_mode,
             previous_actions=None,
+            rollout_unit=eval_rollout_unit,
         )
         initial_row = {
             "update": 0,
+            "episode": 0,
             "requests": 0,
             "aggregate_events": 0,
             "simulated_hours": np.nan,
             "episode_fraction": np.nan,
+            "episode_complete": 0,
             "avg_reward": np.nan,
             "avg_train_reward": np.nan,
             "avg_latency_s": np.nan,
@@ -732,6 +797,7 @@ def main() -> None:
             train_mode=args.train_mode,
             progress_label=f"update={update + 1:03d}/{args.updates:03d}",
             progress_interval_seconds=args.progress_interval_seconds,
+            rollout_unit=args.rollout_unit,
         )
         if args.train_mode == "fast-only":
             losses = {
@@ -751,6 +817,7 @@ def main() -> None:
                 seed_base=30_000,
                 max_requests=args.eval_requests,
                 train_mode=args.train_mode,
+                rollout_unit=eval_rollout_unit,
             )
             diagnostic_stats, previous_eval_actions = evaluate_policy_diagnostics(
                 args,
@@ -759,15 +826,18 @@ def main() -> None:
                 max_requests=args.eval_requests,
                 train_mode=args.train_mode,
                 previous_actions=previous_eval_actions,
+                rollout_unit=eval_rollout_unit,
             )
         else:
             diagnostic_stats = {}
         log_row = {
             "update": update + 1,
+            "episode": update + 1,
             "requests": int(stats["requests"]),
             "aggregate_events": int(stats["aggregate_events"]),
             "simulated_hours": stats["simulated_hours"],
             "episode_fraction": stats["episode_fraction"],
+            "episode_complete": int(stats["episode_complete"]),
             "avg_reward": stats["avg_reward"],
             "avg_train_reward": stats["avg_train_reward"],
             "avg_latency_s": stats["avg_latency_s"],
@@ -806,10 +876,12 @@ def main() -> None:
         }
         append_log(log_path, log_row)
         print(
-            "update={:03d} requests={} aggregate_events={} sim_hours={:.2f} episode={:.1%} "
+            "update={:03d} episode={:03d} complete={} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s train_reward={:.4f} invalid={} deployments={} "
             "slow_loss={:.4f} fast_loss={:.4f}".format(
                 update + 1,
+                update + 1,
+                int(stats["episode_complete"]),
                 int(stats["requests"]),
                 int(stats["aggregate_events"]),
                 stats["simulated_hours"],
@@ -868,6 +940,7 @@ def main() -> None:
             seed_base=10_000,
             max_requests=args.eval_requests,
             train_mode=args.train_mode,
+            rollout_unit=eval_rollout_unit,
         )
         print(
             "eval seeds={} requests_per_seed={} avg_latency={:.4f}s std={:.4f}s p95_latency={:.4f}s invalid={:.2f} violation_rate={:.4f}".format(
