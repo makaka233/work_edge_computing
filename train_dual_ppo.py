@@ -153,12 +153,20 @@ class RolloutProgress:
         interval_seconds: float,
         episode_hours: int,
         rollout_unit: str,
+        deployment_interval_minutes: int,
+        overall_index: int | None = None,
+        overall_total: int | None = None,
+        overall_started_at: float | None = None,
     ):
         self.label = label
         self.target_requests = target_requests
         self.interval_seconds = max(interval_seconds, 0.0)
         self.episode_hours = episode_hours
         self.rollout_unit = rollout_unit
+        self.deployment_interval_minutes = deployment_interval_minutes
+        self.overall_index = overall_index
+        self.overall_total = overall_total
+        self.overall_started_at = overall_started_at
         self.started_at = time.monotonic()
         self.last_print_at = self.started_at
         self.printed = False
@@ -187,19 +195,37 @@ class RolloutProgress:
         avg_latency = env.metrics["total_latency_s"] / max(requests, 1.0)
         elapsed = max(now - self.started_at, 1e-9)
         eta = elapsed * (1.0 - progress) / max(progress, 1e-9) if progress > 0 else float("nan")
+        total_windows = max(int(np.ceil(self.episode_hours * 60.0 / max(self.deployment_interval_minutes, 1))), 1)
+        current_window = min(int(env.current_time_minute // max(self.deployment_interval_minutes, 1)) + 1, total_windows)
+        simulated_seconds = max(env.current_time_minute * 60.0, 1e-9)
+        sim_request_rate = requests / simulated_seconds
+        wall_event_rate = aggregate_events / elapsed
         request_target = str(self.target_requests) if self.target_requests is not None else "episode"
+        overall_text = ""
+        if self.overall_index is not None and self.overall_total:
+            overall_progress = (self.overall_index + progress) / max(float(self.overall_total), 1.0)
+            overall_progress = min(max(overall_progress, 0.0), 1.0)
+            if self.overall_started_at is None:
+                total_elapsed = elapsed
+            else:
+                total_elapsed = max(now - self.overall_started_at, 1e-9)
+            total_eta = total_elapsed * (1.0 - overall_progress) / max(overall_progress, 1e-9)
+            overall_text = f" all={overall_progress * 100:5.1f}% total_eta={_format_duration(total_eta)}"
         line = (
             f"\r{self.label} {progress * 100:6.2f}% "
             f"req={int(requests):>7}/{request_target:<7} "
             f"events={aggregate_events:>5} "
             f"sim_h={sim_hours:5.2f}/{self.episode_hours:<2} "
-            f"ep={episode_fraction * 100:5.1f}% "
+            f"win={current_window}/{total_windows} "
             f"deploy={int(env.metrics.get('deployment_updates', 0.0)):>2} "
-            f"avg_lat={avg_latency:7.3f}s "
+            f"lat={avg_latency * 1000:7.2f}ms "
+            f"sim_req/s={sim_request_rate:6.1f} "
+            f"wall_ev/s={wall_event_rate:5.1f} "
             f"elapsed={_format_duration(elapsed)} "
             f"eta={_format_duration(eta)}"
+            f"{overall_text}"
         )
-        sys.stdout.write(line[:180])
+        sys.stdout.write(line[:260])
         if final:
             sys.stdout.write("\n")
         sys.stdout.flush()
@@ -250,6 +276,9 @@ def rollout(
     progress_label: str = "",
     progress_interval_seconds: float = 0.0,
     rollout_unit: str = "requests",
+    overall_index: int | None = None,
+    overall_total: int | None = None,
+    overall_started_at: float | None = None,
 ) -> dict[str, float]:
     if args is None:
         args = argparse.Namespace(reward_mode="latency", mixed_latency_weight=0.1)
@@ -271,6 +300,10 @@ def rollout(
         interval_seconds=progress_interval_seconds,
         episode_hours=env.config.episode_hours,
         rollout_unit=rollout_unit,
+        deployment_interval_minutes=env.config.deployment_interval_minutes,
+        overall_index=overall_index,
+        overall_total=overall_total,
+        overall_started_at=overall_started_at,
     )
     while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit):
         request = env.current_request
@@ -404,6 +437,8 @@ def evaluate_agent(
                 deterministic=True,
                 record=False,
                 train_mode=train_mode,
+                progress_label=f"eval seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
+                progress_interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
                 rollout_unit=rollout_unit,
             )
         )
@@ -450,6 +485,15 @@ def evaluate_policy_diagnostics(
     for seed_idx in range(args.eval_seeds):
         env = build_env(args, seed_offset=seed_base + seed_idx)
         env.reset()
+        det_target_requests = max_requests if rollout_unit == "requests" else estimate_episode_requests(env)
+        det_progress = RolloutProgress(
+            label=f"diag-det seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
+            target_requests=det_target_requests,
+            interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
+            episode_hours=env.config.episode_hours,
+            rollout_unit=rollout_unit,
+            deployment_interval_minutes=env.config.deployment_interval_minutes,
+        )
         while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit):
             request = env.current_request
             assert request is not None
@@ -465,6 +509,8 @@ def evaluate_policy_diagnostics(
             entropies.extend(float(s["entropy"]) for s in stage_stats)
             top1_probs.extend(float(s["top1_prob"]) for s in stage_stats)
             top1_margins.extend(float(s["top1_margin"]) for s in stage_stats)
+            det_progress.maybe_print(env)
+        det_progress.finish(env)
 
         stochastic_env = build_env(args, seed_offset=seed_base + seed_idx)
         stochastic_stats = rollout(
@@ -475,6 +521,8 @@ def evaluate_policy_diagnostics(
             deterministic=False,
             record=False,
             train_mode=train_mode,
+            progress_label=f"diag-sto seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
+            progress_interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
             rollout_unit=rollout_unit,
         )
         stochastic_latencies.append(stochastic_stats["avg_latency_s"])
@@ -813,6 +861,7 @@ def main() -> None:
                 },
             )
 
+    training_started_at = time.monotonic()
     for update in range(args.updates):
         env = build_env(args, seed_offset=update, group_scenario_by_refresh=True)
         stats = rollout(
@@ -825,6 +874,9 @@ def main() -> None:
             progress_label=f"update={update + 1:03d}/{args.updates:03d}",
             progress_interval_seconds=args.progress_interval_seconds,
             rollout_unit=args.rollout_unit,
+            overall_index=update,
+            overall_total=args.updates,
+            overall_started_at=training_started_at,
         )
         if args.train_mode == "fast-only":
             losses = {
