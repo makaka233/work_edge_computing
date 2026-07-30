@@ -47,6 +47,7 @@ class User:
 class TaskRequest:
     request_id: int
     arrival_minute: float
+    request_count: int
     user_id: int
     home_node: int
     service_id: int
@@ -188,9 +189,33 @@ def generate_request(
     arrival_minute: float,
     users: Sequence[User],
     services: Sequence[Service],
+    request_count: int = 1,
 ) -> TaskRequest:
     user = users[int(rng.integers(0, len(users)))]
     service_id = int(rng.choice(len(services), p=np.array(user.service_weights)))
+    return generate_grouped_request(
+        rng=rng,
+        request_id=request_id,
+        arrival_minute=arrival_minute,
+        request_count=request_count,
+        user_id=user.user_id,
+        home_node=user.home_node,
+        service_id=service_id,
+        services=services,
+    )
+
+
+def generate_grouped_request(
+    *,
+    rng: np.random.Generator,
+    request_id: int,
+    arrival_minute: float,
+    request_count: int,
+    user_id: int,
+    home_node: int,
+    service_id: int,
+    services: Sequence[Service],
+) -> TaskRequest:
     service = services[service_id]
 
     input_mb = float(rng.lognormal(np.log(service.input_mb_mean), 0.35))
@@ -204,8 +229,9 @@ def generate_request(
     return TaskRequest(
         request_id=request_id,
         arrival_minute=arrival_minute,
-        user_id=user.user_id,
-        home_node=user.home_node,
+        request_count=int(request_count),
+        user_id=user_id,
+        home_node=home_node,
         service_id=service_id,
         input_mb=input_mb,
         stage_compute_gcycles=tuple(stage_compute),
@@ -260,4 +286,3 @@ def _generate_services(
 def _pairwise_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     delta = a[:, None, :] - b[None, :, :]
     return np.sqrt(np.sum(delta * delta, axis=-1))
-

@@ -35,6 +35,7 @@ def main() -> None:
 
     rewards = []
     latencies = []
+    weights = []
     start = datetime.now().replace(microsecond=0)
     print("Hierarchical edge scaffold")
     print(f"  users={config.num_users}, nodes={config.num_edge_nodes}, services={config.num_service_types}")
@@ -45,19 +46,29 @@ def main() -> None:
         obs, reward, done, info = env.step(action)
         rewards.append(reward)
         latencies.append(info["latency_s"])
+        weights.append(info.get("request_count", 1.0))
 
     requests = max(env.metrics["requests"], 1.0)
     print("Rollout complete")
     print(f"  requests={int(env.metrics['requests'])}")
+    print(f"  aggregate_events={int(env.metrics['aggregate_events'])}")
     print(f"  deployment_updates={int(env.metrics['deployment_updates'])}")
     print(f"  invalid_actions={int(env.metrics['invalid_actions'])}")
-    print(f"  avg_latency_s={float(np.mean(latencies)):.4f}")
-    print(f"  p95_latency_s={float(np.percentile(latencies, 95)):.4f}")
+    print(f"  avg_latency_s={float(env.metrics['total_latency_s'] / requests):.4f}")
+    print(f"  p95_latency_s={_weighted_percentile(latencies, weights, 95):.4f}")
     print(f"  deadline_violation_rate={env.metrics['deadline_violations'] / requests:.4f}")
-    print(f"  avg_reward={float(np.mean(rewards)):.4f}")
+    print(f"  avg_reward={float(np.average(rewards, weights=weights)):.4f}")
     print(f"  elapsed={datetime.now().replace(microsecond=0) - start}")
+
+
+def _weighted_percentile(values: list[float], weights: list[float], percentile: float) -> float:
+    values_np = np.asarray(values, dtype=np.float64)
+    weights_np = np.asarray(weights, dtype=np.float64)
+    order = np.argsort(values_np)
+    cumulative = np.cumsum(weights_np[order])
+    threshold = percentile / 100.0 * cumulative[-1]
+    return float(values_np[order][np.searchsorted(cumulative, threshold, side="left")])
 
 
 if __name__ == "__main__":
     main()
-

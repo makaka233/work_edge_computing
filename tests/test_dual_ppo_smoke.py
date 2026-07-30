@@ -7,7 +7,7 @@ from train_dual_ppo import rollout
 
 def test_observation_dimensions():
     assert slow_obs_dim(16, 3) == 6 + 16 * 5 + 16 * 3
-    assert fast_obs_dim(16) == 8 + 16 * 5
+    assert fast_obs_dim(16) == 9 + 16 * 5 + 16 * 16 * 3
 
 
 def test_dual_ppo_rollout_and_update():
@@ -19,6 +19,7 @@ def test_dual_ppo_rollout_and_update():
             num_service_types=3,
             episode_hours=1,
             mean_requests_per_minute=2.0,
+            request_aggregation_window_seconds=0.0,
         )
     )
     env.reset()
@@ -30,7 +31,7 @@ def test_dual_ppo_rollout_and_update():
         assert request is not None
         action = agent.act(env)
         _, reward, done, info = env.step(action)
-        agent.observe_step_reward(reward, len(request.stage_compute_gcycles), done)
+        agent.observe_step_reward(reward, len(request.stage_compute_gcycles), done, weight=request.request_count)
         assert len(action) == len(request.stage_compute_gcycles)
         assert np.isfinite(reward)
         assert info["latency_s"] >= 0
@@ -58,6 +59,7 @@ def test_deterministic_eval_does_not_write_rollout_buffers():
             num_service_types=3,
             episode_hours=1,
             mean_requests_per_minute=2.0,
+            request_aggregation_window_seconds=0.0,
         )
     )
     env.reset()
@@ -77,6 +79,7 @@ def test_fast_only_rollout_records_only_fast_buffer():
             num_service_types=3,
             episode_hours=1,
             mean_requests_per_minute=2.0,
+            request_aggregation_window_seconds=0.0,
         )
     )
     env.reset()
@@ -85,3 +88,22 @@ def test_fast_only_rollout_records_only_fast_buffer():
     assert stats["requests"] == 5
     assert len(agent.slow_agent.ppo.buffer) == 0
     assert len(agent.fast_agent.ppo.buffer) >= 5
+
+
+def test_fast_agent_supports_node_scorer_fallback():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=23,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=2.0,
+            request_aggregation_window_seconds=0.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4, fast_policy_kind="node_scorer")
+    stats = rollout(env, agent, max_requests=4, train_mode="fast-only", reward_scale=0.1)
+    assert stats["requests"] == 4
+    assert len(agent.fast_agent.ppo.buffer) >= 4

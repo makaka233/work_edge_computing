@@ -13,12 +13,16 @@ def slow_obs_dim(num_nodes: int, num_service_types: int) -> int:
     return 6 + num_nodes * 5 + num_nodes * num_service_types
 
 
-def fast_obs_dim(num_nodes: int) -> int:
-    return 8 + num_nodes * 5
+def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
+    dim = FAST_GLOBAL_DIM + num_nodes * FAST_NODE_FEATURE_DIM
+    if policy_kind == "gat_node_scorer":
+        dim += num_nodes * num_nodes * FAST_EDGE_FEATURE_DIM
+    return dim
 
 
-FAST_GLOBAL_DIM = 8
+FAST_GLOBAL_DIM = 9
 FAST_NODE_FEATURE_DIM = 5
+FAST_EDGE_FEATURE_DIM = 3
 
 
 @dataclass
@@ -190,6 +194,7 @@ class SlowDeploymentPPOAgent:
 class FastSchedulingPPOAgent:
     num_nodes: int
     max_service_stages: int
+    policy_kind: str = "gat_node_scorer"
     lr: float = 3e-4
     k_epochs: int = 4
     entropy_coef: float = 0.0
@@ -199,7 +204,7 @@ class FastSchedulingPPOAgent:
 
     def __post_init__(self) -> None:
         self.ppo = PPOAgent(
-            obs_dim=fast_obs_dim(self.num_nodes),
+            obs_dim=fast_obs_dim(self.num_nodes, self.policy_kind),
             action_dim=self.num_nodes,
             hidden_dim=128,
             lr=self.lr,
@@ -207,9 +212,10 @@ class FastSchedulingPPOAgent:
             k_epochs=self.k_epochs,
             entropy_coef=self.entropy_coef,
             target_kl=self.target_kl,
-            policy_kind="node_scorer",
+            policy_kind=self.policy_kind,
             global_dim=FAST_GLOBAL_DIM,
             node_feature_dim=FAST_NODE_FEATURE_DIM,
+            edge_feature_dim=FAST_EDGE_FEATURE_DIM,
             num_nodes=self.num_nodes,
             device=self.device,
         )
@@ -322,10 +328,35 @@ class FastSchedulingPPOAgent:
             request.input_mb / 100.0,
             request.stage_compute_gcycles[stage_id] / 200.0,
             request.deadline_s / 10.0,
+            request.request_count / 100.0,
             env.current_time_minute / max(env.config.episode_hours * 60, 1),
             len(request.stage_compute_gcycles) / self.max_service_stages,
         ]
+        if self.policy_kind == "gat_node_scorer":
+            node_features += self._build_edge_features(env)
         return np.asarray(scalars + node_features, dtype=np.float32)
+
+    def _build_edge_features(self, env: EdgeComputingEnv) -> list[float]:
+        assert env.scenario is not None
+        bandwidth = env.scenario.bandwidth_mb_s
+        propagation = env.scenario.propagation_ms
+        max_bandwidth = np.nanmax(np.where(np.isfinite(bandwidth), bandwidth, 0.0))
+        finite_propagation = np.where(np.isfinite(propagation), propagation, 0.0)
+        max_propagation = max(float(finite_propagation.max()), 1e-9)
+        features: list[float] = []
+        for src in range(self.num_nodes):
+            for dst in range(self.num_nodes):
+                connected = bool(env.scenario.adjacency[src, dst])
+                bw = bandwidth[src, dst] if np.isfinite(bandwidth[src, dst]) else max_bandwidth
+                prop = propagation[src, dst] if np.isfinite(propagation[src, dst]) else max_propagation
+                features.extend(
+                    [
+                        float(connected),
+                        float(bw / max(max_bandwidth, 1e-9)),
+                        float(prop / max_propagation),
+                    ]
+                )
+        return features
 
     def _build_mask(
         self,
@@ -352,7 +383,7 @@ class HierarchicalPPOAgent:
     slow_agent: SlowDeploymentPPOAgent
     fast_agent: FastSchedulingPPOAgent
     window_reward: float = 0.0
-    window_steps: int = 0
+    window_steps: float = 0.0
 
     @classmethod
     def from_env(
@@ -368,6 +399,7 @@ class HierarchicalPPOAgent:
         fast_entropy_coef: float = 0.0,
         slow_target_kl: float | None = 0.03,
         fast_target_kl: float | None = 0.03,
+        fast_policy_kind: str = "gat_node_scorer",
     ) -> "HierarchicalPPOAgent":
         return cls(
             slow_agent=SlowDeploymentPPOAgent(
@@ -384,6 +416,7 @@ class HierarchicalPPOAgent:
             fast_agent=FastSchedulingPPOAgent(
                 num_nodes=env.config.num_edge_nodes,
                 max_service_stages=env.config.max_service_stages,
+                policy_kind=fast_policy_kind,
                 lr=fast_lr,
                 k_epochs=fast_k_epochs,
                 entropy_coef=fast_entropy_coef,
@@ -404,10 +437,10 @@ class HierarchicalPPOAgent:
         self.maybe_update_deployment(env, deterministic=deterministic, record=record)
         return self.fast_agent.schedule(env, deterministic=deterministic, record=record)
 
-    def observe_step_reward(self, reward: float, stage_count: int, done: bool) -> None:
+    def observe_step_reward(self, reward: float, stage_count: int, done: bool, weight: float = 1.0) -> None:
         self.fast_agent.assign_last_schedule_reward(reward, stage_count, done)
-        self.window_reward += reward
-        self.window_steps += 1
+        self.window_reward += reward * weight
+        self.window_steps += weight
         if done:
             self.flush_slow_window_reward(done=True)
 

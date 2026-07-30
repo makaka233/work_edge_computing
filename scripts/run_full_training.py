@@ -18,6 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
     parser.add_argument("--traffic-scale", type=float, default=1.0)
+    parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
+    parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
     parser.add_argument("--eval-seeds", type=int, default=3)
     parser.add_argument("--eval-requests", type=int, default=256)
@@ -27,8 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-updates", type=int, default=120)
     parser.add_argument("--requests-per-update", type=int, default=256)
     parser.add_argument("--reward-scale", type=float, default=0.1)
-    parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="greedy-advantage")
+    parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
+    parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--progress-interval-seconds", type=float, default=10.0)
     parser.add_argument("--fixed-scenario", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -58,6 +62,10 @@ def main() -> None:
         str(args.active_user_request_rate_per_minute),
         "--traffic-scale",
         str(args.traffic_scale),
+        "--request-aggregation-window-seconds",
+        str(args.request_aggregation_window_seconds),
+        "--max-representative-groups-per-window",
+        str(args.max_representative_groups_per_window),
         "--load-ewma-tau-minutes",
         str(args.load_ewma_tau_minutes),
         "--requests-per-update",
@@ -66,12 +74,16 @@ def main() -> None:
         str(args.reward_scale),
         "--reward-mode",
         args.reward_mode,
+        "--fast-policy-kind",
+        args.fast_policy_kind,
         "--eval-seeds",
         str(args.eval_seeds),
         "--eval-requests",
         str(args.eval_requests),
         "--device",
         args.device,
+        "--progress-interval-seconds",
+        str(args.progress_interval_seconds),
         "--run-root",
         str(root),
         "--save-best",

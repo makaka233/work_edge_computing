@@ -16,6 +16,12 @@ kept thin. The problem model is different, so the code is specialized for:
 - City-scale traffic derived from active users by default. For 10,000 users,
   the default traffic model produces about 29 requests/s on average and about
   43 requests/s at peak before optional CLI scaling.
+- Request aggregation is enabled by default. The environment groups arrivals
+  within a short time window by `(home_node, service_id)` and stores the number
+  of underlying requests in `request_count`; latency metrics and load updates
+  are weighted by that count.
+- Representative group sampling caps the number of aggregate events per window
+  while rescaling selected groups so the underlying request count is preserved.
 
 ## Current Modules
 
@@ -36,11 +42,18 @@ kept thin. The problem model is different, so the code is specialized for:
 python train.py --max-requests 1000
 python train_dual_ppo.py --updates 2 --requests-per-update 64
 python train_dual_ppo.py --updates 20 --requests-per-update 48 --eval-interval 5 --eval-seeds 2 --reward-scale 0.1
+python train_dual_ppo.py --fixed-scenario --train-mode joint --updates 40 --requests-per-update 65536 --eval-interval 5 --eval-requests 32768 --eval-seeds 2 --reward-mode latency --fast-policy-kind gat_node_scorer --max-representative-groups-per-window 8 --run-name joint_gat_progress --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --fixed-scenario
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
 python -m pytest tests
 ```
+
+`train_dual_ppo.py` prints in-rollout terminal progress by default every 10
+seconds. The progress line reports update progress, real request count,
+aggregate event count, simulated hours, episode fraction, deployment updates,
+average latency, elapsed time, and ETA. Use `--progress-interval-seconds 0` to
+disable it or a smaller value for more frequent refreshes.
 
 Two agent families are available:
 

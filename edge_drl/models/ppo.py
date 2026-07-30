@@ -146,6 +146,110 @@ class NodeScoringActorCritic(nn.Module):
         return dist, values
 
 
+class GraphAttentionNodeScoringActorCritic(nn.Module):
+    """Topology-aware node scorer with masked graph attention.
+
+    State layout:
+    `[global_features, node_features, edge_features]`, where edge features are
+    flattened as `[src_node, dst_node, edge_feature]`.
+    """
+
+    def __init__(
+        self,
+        *,
+        global_dim: int,
+        node_feature_dim: int,
+        edge_feature_dim: int,
+        num_nodes: int,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.global_dim = global_dim
+        self.node_feature_dim = node_feature_dim
+        self.edge_feature_dim = edge_feature_dim
+        self.num_nodes = num_nodes
+        self.node_offset = global_dim
+        self.edge_offset = global_dim + num_nodes * node_feature_dim
+
+        self.global_encoder = nn.Sequential(
+            nn.Linear(global_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_feature_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.edge_bias = nn.Sequential(
+            nn.Linear(edge_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.attn_src = nn.Linear(hidden_dim, 1, bias=False)
+        self.attn_dst = nn.Linear(hidden_dim, 1, bias=False)
+        self.message = nn.Linear(hidden_dim, hidden_dim)
+        self.update = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+        )
+        self.scorer = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[Categorical, torch.Tensor]:
+        global_features = states[:, : self.global_dim]
+        node_features = states[:, self.node_offset : self.edge_offset].reshape(
+            -1,
+            self.num_nodes,
+            self.node_feature_dim,
+        )
+        edge_features = states[:, self.edge_offset :].reshape(
+            -1,
+            self.num_nodes,
+            self.num_nodes,
+            self.edge_feature_dim,
+        )
+
+        global_emb = self.global_encoder(global_features)
+        node_emb = self.node_encoder(node_features)
+        graph_emb = self._graph_attention(node_emb, edge_features)
+
+        expanded_global = global_emb.unsqueeze(1).expand(-1, self.num_nodes, -1)
+        pair_emb = torch.cat([expanded_global, graph_emb], dim=-1)
+        logits = self.scorer(pair_emb).squeeze(-1)
+
+        safe_masks = masks.bool()
+        fallback = torch.zeros_like(safe_masks)
+        fallback[:, 0] = True
+        safe_masks = torch.where(safe_masks.any(dim=1, keepdim=True), safe_masks, fallback)
+        logits = logits.masked_fill(~safe_masks, -1e9)
+        dist = Categorical(logits=logits)
+
+        mask_float = safe_masks.float().unsqueeze(-1)
+        pooled_nodes = (graph_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
+        values = self.critic(torch.cat([global_emb, pooled_nodes], dim=-1)).squeeze(-1)
+        return dist, values
+
+    def _graph_attention(self, node_emb: torch.Tensor, edge_features: torch.Tensor) -> torch.Tensor:
+        adjacency = edge_features[..., 0] > 0.5
+        eye = torch.eye(self.num_nodes, dtype=torch.bool, device=edge_features.device).unsqueeze(0)
+        adjacency = adjacency | eye
+
+        src_score = self.attn_src(node_emb).expand(-1, -1, self.num_nodes)
+        dst_score = self.attn_dst(node_emb).transpose(1, 2).expand(-1, self.num_nodes, -1)
+        scores = torch.nn.functional.leaky_relu(src_score + dst_score + self.edge_bias(edge_features).squeeze(-1), 0.2)
+        scores = scores.masked_fill(~adjacency, -1e9)
+        attention = torch.softmax(scores, dim=-1)
+        messages = torch.matmul(attention, self.message(node_emb))
+        return self.update(torch.cat([node_emb, messages], dim=-1))
+
+
 class PPOAgent:
     def __init__(
         self,
@@ -164,6 +268,7 @@ class PPOAgent:
         policy_kind: str = "flat",
         global_dim: int | None = None,
         node_feature_dim: int | None = None,
+        edge_feature_dim: int | None = None,
         num_nodes: int | None = None,
         device: str = "cpu",
     ):
@@ -183,6 +288,16 @@ class PPOAgent:
             self.policy = NodeScoringActorCritic(
                 global_dim=global_dim,
                 node_feature_dim=node_feature_dim,
+                num_nodes=num_nodes,
+                hidden_dim=hidden_dim,
+            ).to(self.device)
+        elif policy_kind == "gat_node_scorer":
+            if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:
+                raise ValueError("gat_node_scorer requires global_dim, node_feature_dim, edge_feature_dim, and num_nodes")
+            self.policy = GraphAttentionNodeScoringActorCritic(
+                global_dim=global_dim,
+                node_feature_dim=node_feature_dim,
+                edge_feature_dim=edge_feature_dim,
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
             ).to(self.device)

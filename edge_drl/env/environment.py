@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
-from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_realistic_scenario, generate_request
+from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_grouped_request, generate_realistic_scenario, generate_request
 
 
 @dataclass
@@ -23,6 +23,8 @@ class EdgeEnvConfig:
     active_user_ratio: float = 0.15
     active_user_request_rate_per_minute: float = 1.5
     traffic_scale: float = 1.0
+    request_aggregation_window_seconds: float = 10.0
+    max_representative_groups_per_window: int | None = 16
     load_ewma_tau_minutes: float = 1.0
     load_penalty_weight: float = 0.08
     migration_cost_weight: float = 0.02
@@ -43,6 +45,10 @@ class EdgeEnvConfig:
             raise ValueError("active_user_request_rate_per_minute must be positive.")
         if self.traffic_scale <= 0:
             raise ValueError("traffic_scale must be positive.")
+        if self.request_aggregation_window_seconds < 0:
+            raise ValueError("request_aggregation_window_seconds must be non-negative.")
+        if self.max_representative_groups_per_window is not None and self.max_representative_groups_per_window <= 0:
+            raise ValueError("max_representative_groups_per_window must be positive or None.")
         if self.load_ewma_tau_minutes <= 0:
             raise ValueError("load_ewma_tau_minutes must be positive.")
 
@@ -64,6 +70,8 @@ class EdgeComputingEnv:
         self.next_deployment_update_minute = 0.0
         self.request_counter = 0
         self.current_request: TaskRequest | None = None
+        self.pending_requests: list[TaskRequest] = []
+        self.request_group_probabilities: np.ndarray | None = None
         self.node_compute_load = np.zeros(self.config.num_edge_nodes, dtype=np.float64)
         self.link_load = np.zeros((self.config.num_edge_nodes, self.config.num_edge_nodes), dtype=np.float64)
         self.last_load_update_minute = 0.0
@@ -89,12 +97,15 @@ class EdgeComputingEnv:
         self.current_time_minute = 0.0
         self.next_deployment_update_minute = 0.0
         self.request_counter = 0
+        self.pending_requests = []
+        self.request_group_probabilities = self._build_request_group_probabilities()
         self.node_compute_load = np.zeros(self.config.num_edge_nodes, dtype=np.float64)
         self.link_load = np.zeros((self.config.num_edge_nodes, self.config.num_edge_nodes), dtype=np.float64)
         self.last_load_update_minute = 0.0
         self.last_migration_cost = 0.0
         self.metrics = {
             "requests": 0.0,
+            "aggregate_events": 0.0,
             "invalid_actions": 0.0,
             "total_latency_s": 0.0,
             "deadline_violations": 0.0,
@@ -137,6 +148,7 @@ class EdgeComputingEnv:
             [
                 request.home_node,
                 request.service_id,
+                request.request_count,
                 request.input_mb,
                 len(request.stage_compute_gcycles),
                 request.deadline_s,
@@ -181,6 +193,7 @@ class EdgeComputingEnv:
         assert self.current_request is not None
 
         info = self.evaluate_schedule(self.current_request, stage_nodes)
+        request_count = float(self.current_request.request_count)
         migration_cost = self.last_migration_cost
         migration_penalty = self.config.migration_cost_weight * migration_cost
         self.last_migration_cost = 0.0
@@ -190,16 +203,18 @@ class EdgeComputingEnv:
         reward -= migration_penalty
         if not info["valid"]:
             reward -= self.config.invalid_action_penalty
-            self.metrics["invalid_actions"] += 1.0
+            self.metrics["invalid_actions"] += request_count
 
-        self.metrics["requests"] += 1.0
-        self.metrics["total_latency_s"] += float(info["latency_s"])
+        self.metrics["requests"] += request_count
+        self.metrics["aggregate_events"] += 1.0
+        self.metrics["total_latency_s"] += float(info["latency_s"]) * request_count
         if info["latency_s"] > self.current_request.deadline_s:
-            self.metrics["deadline_violations"] += 1.0
+            self.metrics["deadline_violations"] += request_count
 
         self._update_dynamic_loads(info)
         info["migration_cost"] = migration_cost
         info["migration_penalty"] = migration_penalty
+        info["request_count"] = request_count
         self.current_request = self._next_request()
         return self.observe(), float(reward), self.done, info
 
@@ -259,7 +274,9 @@ class EdgeComputingEnv:
 
         link_demands: list[LinkDemand] = []
         if nodes[0] != request.home_node:
-            link_demands.append(LinkDemand("ingress", request.home_node, nodes[0], request.input_mb))
+            link_demands.append(
+                LinkDemand("ingress", request.home_node, nodes[0], request.input_mb * request.request_count)
+            )
         for stage_id in range(len(nodes) - 1):
             if nodes[stage_id] != nodes[stage_id + 1]:
                 link_demands.append(
@@ -267,7 +284,7 @@ class EdgeComputingEnv:
                         f"stage-{stage_id}",
                         nodes[stage_id],
                         nodes[stage_id + 1],
-                        request.stage_output_mb[stage_id],
+                        request.stage_output_mb[stage_id] * request.request_count,
                     )
                 )
 
@@ -277,7 +294,11 @@ class EdgeComputingEnv:
                 violations.append(f"link {demand.src_node}->{demand.dst_node} is unavailable")
 
         compute_demands = [
-            ComputeDemand(f"stage-{stage_id}", node_id, request.stage_compute_gcycles[stage_id])
+            ComputeDemand(
+                f"stage-{stage_id}",
+                node_id,
+                request.stage_compute_gcycles[stage_id] * request.request_count,
+            )
             for stage_id, node_id in enumerate(nodes)
         ]
         node_capacity = np.array([n.compute_gcycles_per_s for n in self.scenario.nodes], dtype=np.float64)
@@ -323,6 +344,23 @@ class EdgeComputingEnv:
         }
 
     def _next_request(self) -> TaskRequest:
+        if self.pending_requests:
+            return self.pending_requests.pop(0)
+
+        aggregation_window_minutes = self.config.request_aggregation_window_seconds / 60.0
+        if aggregation_window_minutes > 0.0:
+            while not self.done:
+                expected_requests = self._arrival_rate_per_minute() * aggregation_window_minutes
+                self.current_time_minute += aggregation_window_minutes
+                total_count = int(self.rng.poisson(expected_requests))
+                if total_count <= 0:
+                    continue
+                self.pending_requests = self._generate_aggregated_requests(total_count)
+                if self.pending_requests:
+                    return self.pending_requests.pop(0)
+            self.pending_requests = self._generate_aggregated_requests(1)
+            return self.pending_requests.pop(0)
+
         interarrival = self.rng.exponential(1.0 / max(self._arrival_rate_per_minute(), 1e-6))
         self.current_time_minute += interarrival
         request = generate_request(
@@ -334,6 +372,81 @@ class EdgeComputingEnv:
         )
         self.request_counter += 1
         return request
+
+    def _build_request_group_probabilities(self) -> np.ndarray:
+        assert self.scenario is not None
+        probabilities = np.zeros((self.config.num_edge_nodes, self.config.num_service_types), dtype=np.float64)
+        for user in self.scenario.users:
+            probabilities[user.home_node] += np.asarray(user.service_weights, dtype=np.float64)
+        probabilities /= probabilities.sum()
+        return probabilities.reshape(-1)
+
+    def _generate_aggregated_requests(self, total_count: int) -> list[TaskRequest]:
+        assert self.scenario is not None
+        assert self.request_group_probabilities is not None
+        group_counts = self.rng.multinomial(total_count, self.request_group_probabilities)
+        group_counts = self._sample_representative_group_counts(group_counts)
+        requests: list[TaskRequest] = []
+        for group_id, request_count in enumerate(group_counts):
+            if request_count <= 0:
+                continue
+            home_node = group_id // self.config.num_service_types
+            service_id = group_id % self.config.num_service_types
+            requests.append(
+                generate_grouped_request(
+                    rng=self.rng,
+                    request_id=self.request_counter,
+                    arrival_minute=self.current_time_minute,
+                    request_count=int(request_count),
+                    user_id=-1,
+                    home_node=int(home_node),
+                    service_id=int(service_id),
+                    services=self.scenario.services,
+                )
+            )
+            self.request_counter += 1
+        requests.sort(key=lambda request: (-request.request_count, request.home_node, request.service_id))
+        return requests
+
+    def _sample_representative_group_counts(self, group_counts: np.ndarray) -> np.ndarray:
+        cap = self.config.max_representative_groups_per_window
+        nonzero = np.flatnonzero(group_counts > 0)
+        if cap is None or len(nonzero) <= cap:
+            return group_counts
+
+        nonzero_counts = group_counts[nonzero].astype(np.float64)
+        order = np.argsort(-nonzero_counts)
+        top_k = max(1, min(cap // 2, cap, len(nonzero)))
+        top = nonzero[order[:top_k]]
+        remaining = nonzero[order[top_k:]]
+        remaining_slots = cap - len(top)
+
+        if remaining_slots > 0 and len(remaining) > 0:
+            remaining_counts = group_counts[remaining].astype(np.float64)
+            probabilities = remaining_counts / remaining_counts.sum()
+            sampled = self.rng.choice(
+                remaining,
+                size=min(remaining_slots, len(remaining)),
+                replace=False,
+                p=probabilities,
+            )
+            selected = np.concatenate([top, sampled])
+        else:
+            selected = top
+
+        original_total = int(group_counts.sum())
+        selected_total = float(group_counts[selected].sum())
+        scaled = group_counts[selected].astype(np.float64) * (original_total / max(selected_total, 1.0))
+        base = np.floor(scaled).astype(int)
+        remainder = original_total - int(base.sum())
+        if remainder > 0:
+            fractional_order = np.argsort(-(scaled - base))
+            for idx in fractional_order[:remainder]:
+                base[idx] += 1
+
+        sampled_counts = np.zeros_like(group_counts)
+        sampled_counts[selected] = base
+        return sampled_counts
 
     def _arrival_rate_per_minute(self) -> float:
         minute_of_day = self.current_time_minute % (24 * 60)

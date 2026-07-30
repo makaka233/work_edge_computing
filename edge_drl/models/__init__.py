@@ -1,4 +1,3 @@
-from edge_drl.models.ppo import MaskedActorCritic, PPOAgent, RolloutBuffer
+from edge_drl.models.ppo import GraphAttentionNodeScoringActorCritic, MaskedActorCritic, PPOAgent, RolloutBuffer
 
-__all__ = ["MaskedActorCritic", "PPOAgent", "RolloutBuffer"]
-
+__all__ = ["GraphAttentionNodeScoringActorCritic", "MaskedActorCritic", "PPOAgent", "RolloutBuffer"]

@@ -42,6 +42,7 @@ def test_environment_constraints_and_rollout():
             num_service_types=3,
             episode_hours=1,
             mean_requests_per_minute=2.0,
+            request_aggregation_window_seconds=0.0,
         )
     )
     agent = build_baseline_agent()
@@ -75,6 +76,7 @@ def test_migration_cost_is_charged_once():
             num_service_types=3,
             episode_hours=1,
             mean_requests_per_minute=2.0,
+            request_aggregation_window_seconds=0.0,
         )
     )
     agent = build_baseline_agent()
@@ -140,3 +142,51 @@ def test_default_traffic_is_city_scale_for_ten_thousand_users():
     assert avg_requests_per_second > 10.0
     assert peak_requests_per_second > avg_requests_per_second
     assert min_requests_per_second > 1.0
+
+
+def test_request_aggregation_counts_underlying_requests():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=43,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=1_800.0,
+            request_aggregation_window_seconds=1.0,
+        )
+    )
+    agent = build_baseline_agent()
+    env.reset()
+    agent.maybe_update_deployment(env)
+    request = env.current_request
+    assert request is not None
+    assert request.request_count > 1
+
+    action = agent.act(env)
+    _, _, _, info = env.step(action)
+
+    assert info["request_count"] == request.request_count
+    assert env.metrics["aggregate_events"] == 1
+    assert env.metrics["requests"] == request.request_count
+
+
+def test_representative_group_sampling_preserves_window_request_count():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=47,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=1_800.0,
+            request_aggregation_window_seconds=10.0,
+            max_representative_groups_per_window=4,
+        )
+    )
+    env.reset()
+    window_time = env.current_time_minute
+    requests = [env.current_request, *env.pending_requests]
+    assert len(requests) <= 4
+    assert all(request.arrival_minute == window_time for request in requests)
+    assert sum(request.request_count for request in requests) > 0
