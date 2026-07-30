@@ -211,7 +211,7 @@ class EdgeComputingEnv:
         if info["latency_s"] > self.current_request.deadline_s:
             self.metrics["deadline_violations"] += request_count
 
-        self._update_dynamic_loads(info)
+        self._update_dynamic_loads(info, request_count=request_count)
         info["migration_cost"] = migration_cost
         info["migration_penalty"] = migration_penalty
         info["request_count"] = request_count
@@ -275,7 +275,7 @@ class EdgeComputingEnv:
         link_demands: list[LinkDemand] = []
         if nodes[0] != request.home_node:
             link_demands.append(
-                LinkDemand("ingress", request.home_node, nodes[0], request.input_mb * request.request_count)
+                LinkDemand("ingress", request.home_node, nodes[0], request.input_mb)
             )
         for stage_id in range(len(nodes) - 1):
             if nodes[stage_id] != nodes[stage_id + 1]:
@@ -284,7 +284,7 @@ class EdgeComputingEnv:
                         f"stage-{stage_id}",
                         nodes[stage_id],
                         nodes[stage_id + 1],
-                        request.stage_output_mb[stage_id] * request.request_count,
+                        request.stage_output_mb[stage_id],
                     )
                 )
 
@@ -297,7 +297,7 @@ class EdgeComputingEnv:
             ComputeDemand(
                 f"stage-{stage_id}",
                 node_id,
-                request.stage_compute_gcycles[stage_id] * request.request_count,
+                request.stage_compute_gcycles[stage_id],
             )
             for stage_id, node_id in enumerate(nodes)
         ]
@@ -465,7 +465,7 @@ class EdgeComputingEnv:
             * self.config.traffic_scale
         )
 
-    def _update_dynamic_loads(self, info: dict[str, Any]) -> None:
+    def _update_dynamic_loads(self, info: dict[str, Any], *, request_count: float) -> None:
         elapsed_minutes = max(self.current_time_minute - self.last_load_update_minute, 0.0)
         decay = float(np.exp(-elapsed_minutes / self.config.load_ewma_tau_minutes))
         self.node_compute_load *= decay
@@ -474,14 +474,14 @@ class EdgeComputingEnv:
         ewma_window_s = self.config.load_ewma_tau_minutes * 60.0
         for demand in info["compute_demands"]:
             node_capacity = self.scenario.nodes[demand.node_id].compute_gcycles_per_s if self.scenario else 1.0
-            service_time_s = demand.compute_gcycles / max(node_capacity, 1e-9)
+            service_time_s = demand.compute_gcycles * request_count / max(node_capacity, 1e-9)
             increment = min(service_time_s / ewma_window_s, 1.0)
             self.node_compute_load[demand.node_id] = min(1.0, self.node_compute_load[demand.node_id] + increment)
         for demand in info["link_demands"]:
             if self.scenario is None or not self.scenario.adjacency[demand.src_node, demand.dst_node]:
                 continue
             capacity = self.scenario.bandwidth_mb_s[demand.src_node, demand.dst_node]
-            transfer_time_s = demand.data_mb / max(capacity, 1e-9)
+            transfer_time_s = demand.data_mb * request_count / max(capacity, 1e-9)
             increment = min(transfer_time_s / ewma_window_s, 1.0)
             self.link_load[demand.src_node, demand.dst_node] = min(1.0, self.link_load[demand.src_node, demand.dst_node] + increment)
 

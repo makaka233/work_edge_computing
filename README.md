@@ -18,8 +18,9 @@ kept thin. The problem model is different, so the code is specialized for:
   43 requests/s at peak before optional CLI scaling.
 - Request aggregation is enabled by default. The environment groups arrivals
   within a short time window by `(home_node, service_id)` and stores the number
-  of underlying requests in `request_count`; latency metrics and load updates
-  are weighted by that count.
+  of underlying requests in `request_count`. Per-task latency is evaluated with
+  one task's compute and data demand, while metrics and dynamic load updates are
+  weighted by `request_count`.
 - Representative group sampling caps the number of aggregate events per window
   while rescaling selected groups so the underlying request count is preserved.
 

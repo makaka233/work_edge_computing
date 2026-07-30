@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 
 from edge_drl.agents.hierarchical import build_baseline_agent
@@ -169,6 +171,35 @@ def test_request_aggregation_counts_underlying_requests():
     assert info["request_count"] == request.request_count
     assert env.metrics["aggregate_events"] == 1
     assert env.metrics["requests"] == request.request_count
+
+
+def test_aggregation_does_not_inflate_single_task_latency():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=45,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=1_800.0,
+            request_aggregation_window_seconds=1.0,
+        )
+    )
+    agent = build_baseline_agent()
+    env.reset()
+    agent.maybe_update_deployment(env)
+    request = env.current_request
+    assert request is not None
+
+    single_request = replace(request, request_count=1)
+    grouped_request = replace(request, request_count=100)
+    action = agent.act(env)
+
+    single_info = env.evaluate_schedule(single_request, action)
+    grouped_info = env.evaluate_schedule(grouped_request, action)
+
+    assert np.isclose(single_info["latency_s"], grouped_info["latency_s"])
+    assert single_info["compute_demands"][0].compute_gcycles == grouped_info["compute_demands"][0].compute_gcycles
 
 
 def test_representative_group_sampling_preserves_window_request_count():
