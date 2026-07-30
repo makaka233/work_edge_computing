@@ -161,6 +161,48 @@ def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
     assert float(row["deployment_updates"]) >= 2.0
 
 
+def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--requests-per-update",
+        "4",
+        "--eval-interval",
+        "1",
+        "--eval-requests",
+        "4",
+        "--eval-seeds",
+        "1",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "1",
+        "--request-aggregation-window-seconds",
+        "0",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "update=000" not in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["update"] for row in rows] == ["1"]
+    assert rows[0]["eval_avg_latency_s"] != "nan"
+
+
 def test_convergence_analyzer_reads_training_log(tmp_path):
     log_path = tmp_path / "training.csv"
     log_path.write_text(

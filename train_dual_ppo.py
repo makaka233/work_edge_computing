@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -75,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-checkpoint", type=str, default="")
     parser.add_argument("--deterministic-eval", action="store_true")
     parser.add_argument("--eval-baseline", action="store_true")
+    parser.add_argument(
+        "--eval-before-training",
+        action="store_true",
+        help="Run the eval sweep at update 0 before training starts. Disabled by default for long episode runs.",
+    )
     parser.add_argument("--eval-requests", type=int, default=128)
     parser.add_argument("--eval-interval", type=int, default=0)
     parser.add_argument(
@@ -157,9 +163,6 @@ class RolloutProgress:
         episode_hours: int,
         rollout_unit: str,
         deployment_interval_minutes: int,
-        overall_index: int | None = None,
-        overall_total: int | None = None,
-        overall_started_at: float | None = None,
     ):
         self.label = label
         self.target_requests = target_requests
@@ -167,9 +170,6 @@ class RolloutProgress:
         self.episode_hours = episode_hours
         self.rollout_unit = rollout_unit
         self.deployment_interval_minutes = deployment_interval_minutes
-        self.overall_index = overall_index
-        self.overall_total = overall_total
-        self.overall_started_at = overall_started_at
         self.started_at = time.monotonic()
         self.last_print_at = self.started_at
         self.printed = False
@@ -180,10 +180,12 @@ class RolloutProgress:
             self.tqdm_bar = tqdm(
                 total=total_units,
                 desc=self.label,
-                unit="sim-min" if self.rollout_unit == "episode" else "req",
+                unit="h" if self.rollout_unit == "episode" else "req",
                 dynamic_ncols=True,
                 mininterval=self.interval_seconds,
                 leave=False,
+                bar_format="{desc}: {percentage:5.1f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                file=sys.stdout,
             )
 
     def should_print(self) -> bool:
@@ -258,27 +260,17 @@ class RolloutProgress:
         if delta > 0:
             self.tqdm_bar.update(delta)
             self.progress_units = units
-        postfix = {
-            "epR": _format_metric(avg_reward, 4),
-            "trainR": _format_metric(avg_train_reward, 4),
-            "Lat": f"{avg_latency_s * 1000:.1f}ms",
-            "win": f"{current_window}/{total_windows}",
-            "deploy": int(env.metrics.get("deployment_updates", 0.0)),
-            "sim": f"{sim_hours:.1f}/{self.episode_hours}h",
-            "req": f"{int(requests)}/{int(self.target_requests or requests or 1)}",
-            "ev/s": f"{wall_event_rate:.1f}",
-        }
-        if self.overall_index is not None and self.overall_total:
-            overall_progress = (self.overall_index + progress) / max(float(self.overall_total), 1.0)
-            overall_progress = min(max(overall_progress, 0.0), 1.0)
-            if self.overall_started_at is None:
-                total_elapsed = elapsed
-            else:
-                total_elapsed = max(now - self.overall_started_at, 1e-9)
-            total_eta = total_elapsed * (1.0 - overall_progress) / max(overall_progress, 1e-9)
-            postfix["all"] = f"{overall_progress * 100:.1f}%"
-            postfix["totalETA"] = _format_duration(total_eta)
-        self.tqdm_bar.set_postfix(postfix, refresh=True)
+        request_target = self.target_requests or requests or 1
+        postfix = (
+            f"R={_format_metric(avg_reward, 4)} "
+            f"trainR={_format_metric(avg_train_reward, 4)} "
+            f"Lat={avg_latency_s * 1000:.1f}ms "
+            f"win={current_window}/{total_windows} "
+            f"t={sim_hours:.1f}/{self.episode_hours}h "
+            f"req={_format_count(requests)}/{_format_count(request_target)} "
+            f"speed={wall_event_rate:.1f}ev/s"
+        )
+        self.tqdm_bar.set_postfix_str(postfix, refresh=True)
         self.printed = True
         self.last_print_at = now
         if final:
@@ -286,12 +278,12 @@ class RolloutProgress:
 
     def _total_progress_units(self) -> float:
         if self.rollout_unit == "episode":
-            return max(float(self.episode_hours * 60), 1.0)
+            return max(float(self.episode_hours), 1.0)
         return max(float(self.target_requests or 1), 1.0)
 
     def _progress_units(self, env: EdgeComputingEnv) -> float:
         if self.rollout_unit == "episode":
-            return min(max(env.current_time_minute, 0.0), self._total_progress_units())
+            return min(max(env.current_time_minute / 60.0, 0.0), self._total_progress_units())
         return min(float(env.metrics.get("requests", 0.0)), self._total_progress_units())
 
 
@@ -310,6 +302,15 @@ def _format_metric(value: float, precision: int) -> str:
     if not np.isfinite(value):
         return "--"
     return f"{value:.{precision}f}"
+
+
+def _format_count(value: float) -> str:
+    value = float(value)
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if abs(value) >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(int(round(value)))
 
 
 def estimate_episode_requests(env: EdgeComputingEnv) -> int:
@@ -344,9 +345,6 @@ def rollout(
     progress_label: str = "",
     progress_interval_seconds: float = 0.0,
     rollout_unit: str = "requests",
-    overall_index: int | None = None,
-    overall_total: int | None = None,
-    overall_started_at: float | None = None,
 ) -> dict[str, float]:
     if args is None:
         args = argparse.Namespace(reward_mode="latency", mixed_latency_weight=0.1)
@@ -369,9 +367,6 @@ def rollout(
         episode_hours=env.config.episode_hours,
         rollout_unit=rollout_unit,
         deployment_interval_minutes=env.config.deployment_interval_minutes,
-        overall_index=overall_index,
-        overall_total=overall_total,
-        overall_started_at=overall_started_at,
     )
     while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit):
         request = env.current_request
@@ -860,7 +855,7 @@ def main() -> None:
             )
         )
 
-    if args.eval_interval:
+    if args.eval_before_training and args.eval_interval:
         eval_stats = evaluate_agent(
             args,
             agent,
@@ -940,7 +935,6 @@ def main() -> None:
                 },
             )
 
-    training_started_at = time.monotonic()
     for update in range(args.updates):
         env = build_env(args, seed_offset=update, group_scenario_by_refresh=True)
         stats = rollout(
@@ -953,9 +947,6 @@ def main() -> None:
             progress_label=f"update={update + 1:03d}/{args.updates:03d}",
             progress_interval_seconds=args.progress_interval_seconds,
             rollout_unit=args.rollout_unit,
-            overall_index=update,
-            overall_total=args.updates,
-            overall_started_at=training_started_at,
         )
         if args.train_mode == "fast-only":
             losses = {
