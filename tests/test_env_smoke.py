@@ -174,6 +174,9 @@ def test_city_links_include_heterogeneous_bottlenecks():
     )
     finite_bandwidth = scenario.bandwidth_mb_s[np.isfinite(scenario.bandwidth_mb_s) & (scenario.bandwidth_mb_s > 0)]
 
+    assert scenario.adjacency.all()
+    assert np.isfinite(scenario.bandwidth_mb_s[~np.eye(32, dtype=bool)]).all()
+    assert np.isfinite(scenario.propagation_ms[~np.eye(32, dtype=bool)]).all()
     assert finite_bandwidth.min() < 100.0
     assert finite_bandwidth.max() > 700.0
     assert finite_bandwidth.max() / finite_bandwidth.min() > 10.0

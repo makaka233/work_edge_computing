@@ -114,6 +114,9 @@ class EdgeComputingEnv:
             "aggregate_events": 0.0,
             "invalid_actions": 0.0,
             "total_latency_s": 0.0,
+            "valid_requests": 0.0,
+            "total_valid_latency_s": 0.0,
+            "total_penalty_latency_s": 0.0,
             "deadline_violations": 0.0,
             "deployment_updates": 0.0,
         }
@@ -214,6 +217,10 @@ class EdgeComputingEnv:
         self.metrics["requests"] += request_count
         self.metrics["aggregate_events"] += 1.0
         self.metrics["total_latency_s"] += float(info["latency_s"]) * request_count
+        self.metrics["total_penalty_latency_s"] += float(info["penalty_latency_s"]) * request_count
+        if info["valid"]:
+            self.metrics["valid_requests"] += request_count
+            self.metrics["total_valid_latency_s"] += float(info["physical_latency_s"]) * request_count
         if info["latency_s"] > self.current_request.deadline_s:
             self.metrics["deadline_violations"] += request_count
 
@@ -314,12 +321,14 @@ class EdgeComputingEnv:
         link_capacity[finite] *= np.clip(1.0 - 0.75 * self.link_load[finite], 0.10, 1.0)
 
         _, compute_delays, compute_delay = allocate_compute_kkt(compute_demands, node_capacity)
+        allocation_penalty_s = 0.0
         try:
             _, link_delays, link_delay = allocate_link_kkt(link_demands, link_capacity)
         except ValueError:
             valid = False
             link_delays = {}
-            link_delay = self.config.invalid_action_penalty
+            link_delay = 0.0
+            allocation_penalty_s = self.config.invalid_action_penalty
 
         access_delay = self.config.radio_rtt_ms / 1000.0
         access_delay += request.input_mb / max(self.config.wireless_uplink_mbps / 8.0, 1e-9)
@@ -328,9 +337,11 @@ class EdgeComputingEnv:
             if self.scenario.adjacency[demand.src_node, demand.dst_node]:
                 propagation_delay += float(self.scenario.propagation_ms[demand.src_node, demand.dst_node]) / 1000.0
 
-        latency_s = access_delay + compute_delay + link_delay + propagation_delay
+        physical_latency_s = access_delay + compute_delay + link_delay + propagation_delay
+        penalty_latency_s = allocation_penalty_s
         if not valid:
-            latency_s += self.config.invalid_action_penalty
+            penalty_latency_s += self.config.invalid_action_penalty
+        latency_s = physical_latency_s + penalty_latency_s
 
         load_penalty = float(
             sum(self.node_compute_load[node_id] for node_id in nodes)
@@ -344,6 +355,8 @@ class EdgeComputingEnv:
             "link_delay_s": link_delay,
             "access_delay_s": access_delay,
             "propagation_delay_s": propagation_delay,
+            "physical_latency_s": physical_latency_s,
+            "penalty_latency_s": penalty_latency_s,
             "latency_s": latency_s,
             "compute_delays": compute_delays,
             "link_delays": link_delays,

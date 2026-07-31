@@ -154,31 +154,28 @@ def generate_realistic_scenario(
         )
 
     node_dist = _pairwise_distance(node_xy, node_xy)
-    adjacency = np.zeros((num_edge_nodes, num_edge_nodes), dtype=bool)
-    for i in range(num_edge_nodes):
-        nearest = np.argsort(node_dist[i])[1:5]
-        adjacency[i, nearest] = True
-    adjacency = np.logical_or(adjacency, adjacency.T)
-    np.fill_diagonal(adjacency, True)
+    adjacency = np.ones((num_edge_nodes, num_edge_nodes), dtype=bool)
 
     bandwidth = np.zeros((num_edge_nodes, num_edge_nodes), dtype=np.float64)
     propagation = np.full((num_edge_nodes, num_edge_nodes), np.inf, dtype=np.float64)
+    np.fill_diagonal(bandwidth, np.inf)
+    np.fill_diagonal(propagation, 0.0)
     for i in range(num_edge_nodes):
-        for j in range(num_edge_nodes):
-            if i == j:
-                bandwidth[i, j] = np.inf
-                propagation[i, j] = 0.0
-            elif adjacency[i, j]:
-                distance = max(node_dist[i, j], 0.2)
-                link_class = rng.choice(["bottleneck", "metro", "backbone"], p=[0.18, 0.62, 0.20])
-                if link_class == "bottleneck":
-                    raw_bandwidth = rng.uniform(25.0, 90.0)
-                elif link_class == "metro":
-                    raw_bandwidth = rng.uniform(120.0, 650.0)
-                else:
-                    raw_bandwidth = rng.uniform(750.0, 1800.0)
-                bandwidth[i, j] = raw_bandwidth / (1.0 + 0.06 * distance)
-                propagation[i, j] = 0.35 * distance + rng.uniform(0.2, 1.5)
+        for j in range(i + 1, num_edge_nodes):
+            distance = max(node_dist[i, j], 0.2)
+            link_class = rng.choice(["bottleneck", "metro", "backbone"], p=[0.18, 0.62, 0.20])
+            if link_class == "bottleneck":
+                raw_bandwidth = rng.uniform(25.0, 90.0)
+            elif link_class == "metro":
+                raw_bandwidth = rng.uniform(120.0, 650.0)
+            else:
+                raw_bandwidth = rng.uniform(750.0, 1800.0)
+            link_bandwidth = raw_bandwidth / (1.0 + 0.06 * distance)
+            link_propagation = 0.35 * distance + rng.uniform(0.2, 1.5)
+            bandwidth[i, j] = link_bandwidth
+            bandwidth[j, i] = link_bandwidth
+            propagation[i, j] = link_propagation
+            propagation[j, i] = link_propagation
 
     return EdgeScenario(
         nodes=nodes,

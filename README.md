@@ -24,8 +24,9 @@ kept thin. The problem model is different, so the code is specialized for:
 - City-scale traffic derived from active users by default, with a daily
   morning/lunch/evening curve. Use `--traffic-scale` above 1.0 to create
   heavier congestion.
-- Heterogeneous metro links mix bottleneck, ordinary metro, and backbone-like
-  bandwidth classes, so placement and scheduling have visible network tradeoffs.
+- Fully connected wired metro links between edge nodes, with heterogeneous
+  bottleneck, ordinary metro, and backbone-like bandwidth classes so placement
+  and scheduling still have visible network tradeoffs.
 - Request aggregation is enabled by default. The environment groups arrivals
   within a short time window by `(home_node, service_id)` and stores the number
   of underlying requests in `request_count`. Per-task latency is evaluated with
@@ -77,9 +78,10 @@ Two agent families are available:
 The DRL version has a slow PPO agent for service-stage deployment and a fast PPO
 agent for request-level stage scheduling. The slow agent's
 `--max-replicas-per-stage` is only the action-space budget: at each replica slot
-the PPO policy can choose a node or STOP, so the actual replica count is learned
-from reward. Continuous compute and bandwidth allocation remains outside the
-neural policy and is solved by the KKT module.
+the PPO policy chooses a node. The first slot must place at least one replica;
+later slots may repeat an already selected node, which means keeping the current
+replica count instead of placing another copy. Continuous compute and bandwidth
+allocation remains outside the neural policy and is solved by the KKT module.
 
 When `--fixed-scenario` is omitted, `--scenario-refresh-episodes N` reuses the
 same generated topology, user distribution, and service preference base for N

@@ -44,7 +44,7 @@ class SlowDeploymentPPOAgent:
     def __post_init__(self) -> None:
         self.ppo = PPOAgent(
             obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
-            action_dim=self.num_nodes + 1,
+            action_dim=self.num_nodes,
             hidden_dim=128,
             lr=self.lr,
             gamma=0.99,
@@ -66,23 +66,24 @@ class SlowDeploymentPPOAgent:
         remaining_storage = np.array([n.storage_gb for n in env.scenario.nodes], dtype=np.float64)
         demand = self._node_service_demand(env)
         self.pending_indices.clear()
-        stop_action = self.num_nodes
 
         for service in env.scenario.services:
             for stage in service.stages:
                 for replica_idx in range(self.replicas_per_stage):
                     state = self._build_state(env, demand, remaining_memory, remaining_storage, service.service_id, stage.stage_id, replica_idx)
-                    node_mask = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb)
                     already = deployment[service.service_id, stage.stage_id]
+                    feasible_new = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb) & ~already
                     if already.any() and replica_idx > 0:
-                        node_mask &= ~already
-                    mask = np.zeros(self.num_nodes + 1, dtype=bool)
-                    mask[: self.num_nodes] = node_mask
-                    mask[stop_action] = already.any()
+                        mask = already | feasible_new
+                    else:
+                        mask = feasible_new
                     if not mask.any():
                         break
 
-                    action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
+                    if deterministic and already.any() and feasible_new.any():
+                        action, logprob, value = self._deterministic_replica_action(state, mask, already, feasible_new)
+                    else:
+                        action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
                     if not mask[action]:
                         action = int(np.where(mask)[0][0])
 
@@ -94,8 +95,8 @@ class SlowDeploymentPPOAgent:
                         self.ppo.buffer.values.append(value)
                         self.pending_indices.append(len(self.ppo.buffer.actions) - 1)
 
-                    if action == stop_action:
-                        break
+                    if already[action]:
+                        continue
 
                     deployment[service.service_id, stage.stage_id, action] = True
                     remaining_memory[action] -= stage.memory_gb
@@ -163,6 +164,25 @@ class SlowDeploymentPPOAgent:
             demand[user.home_node] += np.asarray(user.service_weights, dtype=np.float32)
         demand /= max(demand.max(), 1e-9)
         return demand
+
+    def _deterministic_replica_action(
+        self,
+        state: np.ndarray,
+        mask: np.ndarray,
+        already: np.ndarray,
+        feasible_new: np.ndarray,
+    ) -> tuple[int, float, float]:
+        probs, value = self.ppo.action_probabilities(state, mask)
+        masked_probs = np.where(mask, probs, 0.0)
+        existing_mass = float(masked_probs[already].sum())
+        new_mass = float(masked_probs[feasible_new].sum())
+        if new_mass > existing_mass:
+            candidate_scores = np.where(feasible_new, masked_probs, -1.0)
+        else:
+            candidate_scores = np.where(already & mask, masked_probs, -1.0)
+        action = int(np.argmax(candidate_scores))
+        logprob = float(np.log(max(masked_probs[action], 1e-12)))
+        return action, logprob, value
 
     def _repair_with_current_or_full(self, env: EdgeComputingEnv, deployment: np.ndarray) -> np.ndarray:
         feasible, _ = env.check_deployment_feasible(deployment)

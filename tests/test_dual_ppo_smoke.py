@@ -109,7 +109,7 @@ def test_fast_agent_supports_node_scorer_fallback():
     assert len(agent.fast_agent.ppo.buffer) >= 4
 
 
-def test_slow_agent_learns_variable_replica_count_with_stop_action():
+def test_slow_agent_learns_variable_replica_count_with_repeated_node_action():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=29,
@@ -123,18 +123,50 @@ def test_slow_agent_learns_variable_replica_count_with_stop_action():
     )
     env.reset()
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
-    stop_action = env.config.num_edge_nodes
+    assert agent.slow_agent.ppo.policy.actor.out_features == env.config.num_edge_nodes
 
     def scripted_act(state, mask, deterministic=False):
-        if mask[stop_action]:
-            return stop_action, 0.0, 0.0
         return int(np.where(mask)[0][0]), 0.0, 0.0
 
     agent.slow_agent.ppo.act = scripted_act
-    deployment = agent.slow_agent.plan_deployment(env, deterministic=True, record=False)
+    deployment = agent.slow_agent.plan_deployment(env, deterministic=False, record=False)
 
     for service in env.scenario.services:
         for stage in service.stages:
             assert deployment[service.service_id, stage.stage_id].sum() == 1
+    feasible, reason = env.check_deployment_feasible(deployment)
+    assert feasible, reason
+
+
+def test_deterministic_slow_deployment_uses_new_replica_probability_mass():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=31,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=2.0,
+            request_aggregation_window_seconds=0.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+
+    def scripted_act(state, mask, deterministic=False):
+        return int(np.where(mask)[0][0]), 0.0, 0.0
+
+    def uniform_probabilities(state, mask):
+        probs = mask.astype(np.float64)
+        probs /= probs.sum()
+        return probs, 0.0
+
+    agent.slow_agent.ppo.act = scripted_act
+    agent.slow_agent.ppo.action_probabilities = uniform_probabilities
+    deployment = agent.slow_agent.plan_deployment(env, deterministic=True, record=False)
+
+    for service in env.scenario.services:
+        for stage in service.stages:
+            assert deployment[service.service_id, stage.stage_id].sum() == 4
     feasible, reason = env.check_deployment_feasible(deployment)
     assert feasible, reason

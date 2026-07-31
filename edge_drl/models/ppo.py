@@ -341,6 +341,14 @@ class PPOAgent:
             "value": float(value.item()),
         }
 
+    def action_probabilities(self, state: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
+        state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            dist, value = self.policy(state_t, mask_t)
+            probs = dist.probs.squeeze(0).detach().cpu().numpy()
+        return probs, float(value.item())
+
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         if len(self.buffer) == 0:
             return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}

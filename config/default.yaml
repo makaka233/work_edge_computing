@@ -51,6 +51,6 @@ agent:
     slow_agent_update: every_240_minutes
     fast_agent_update: per_task_request
     max_replicas_per_stage: 5
-    actual_replica_count: learned_by_stop_action
+    actual_replica_count: learned_by_repeated_node
     masked_actions: true
     feasibility_repair: true

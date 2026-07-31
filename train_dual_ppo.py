@@ -47,9 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--requests-per-update", type=int, default=4096)
     parser.add_argument(
         "--rollout-unit",
-        choices=["requests", "episode"],
+        choices=["requests", "window", "episode"],
         default="requests",
-        help="Collect each PPO update by request count or by one full environment episode.",
+        help="Collect each PPO update by request count, one 4h slow-deployment window, or one full environment episode.",
     )
     parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         dest="replicas_per_stage",
         type=int,
         default=5,
-        help="Maximum replicas the slow PPO may place per service stage; actual count is learned with a STOP action.",
+        help="Maximum node-selection slots the slow PPO may use per service stage; repeated selected nodes keep the current replica count.",
     )
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--slow-lr", type=float, default=3e-4)
@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-interval", type=int, default=0)
     parser.add_argument(
         "--eval-rollout-unit",
-        choices=["requests", "episode", "same"],
+        choices=["requests", "window", "episode", "same"],
         default="requests",
         help="Use request-count eval, full-episode eval, or the same unit as training.",
     )
@@ -165,6 +165,9 @@ class RolloutProgress:
         episode_hours: int,
         rollout_unit: str,
         deployment_interval_minutes: int,
+        rollout_start_minute: float = 0.0,
+        start_requests: float = 0.0,
+        start_aggregate_events: float = 0.0,
     ):
         self.label = label
         self.target_requests = target_requests
@@ -172,6 +175,9 @@ class RolloutProgress:
         self.episode_hours = episode_hours
         self.rollout_unit = rollout_unit
         self.deployment_interval_minutes = deployment_interval_minutes
+        self.rollout_start_minute = rollout_start_minute
+        self.start_requests = start_requests
+        self.start_aggregate_events = start_aggregate_events
         self.started_at = time.monotonic()
         self.last_print_at = self.started_at
         self.printed = False
@@ -182,7 +188,7 @@ class RolloutProgress:
             self.tqdm_bar = tqdm(
                 total=total_units,
                 desc=self.label,
-                unit="h" if self.rollout_unit == "episode" else "req",
+                unit="h" if self.rollout_unit in {"episode", "window"} else "req",
                 dynamic_ncols=True,
                 mininterval=self.interval_seconds,
                 leave=True,
@@ -203,6 +209,8 @@ class RolloutProgress:
         avg_reward: float = float("nan"),
         avg_train_reward: float = float("nan"),
         avg_latency_s: float | None = None,
+        avg_valid_latency_s: float | None = None,
+        avg_penalty_latency_s: float | None = None,
     ) -> None:
         if self.should_print():
             self._print_tqdm(
@@ -211,6 +219,8 @@ class RolloutProgress:
                 avg_reward=avg_reward,
                 avg_train_reward=avg_train_reward,
                 avg_latency_s=avg_latency_s,
+                avg_valid_latency_s=avg_valid_latency_s,
+                avg_penalty_latency_s=avg_penalty_latency_s,
             )
 
     def finish(
@@ -220,6 +230,8 @@ class RolloutProgress:
         avg_reward: float = float("nan"),
         avg_train_reward: float = float("nan"),
         avg_latency_s: float | None = None,
+        avg_valid_latency_s: float | None = None,
+        avg_penalty_latency_s: float | None = None,
     ) -> None:
         if self.interval_seconds <= 0 or self.tqdm_bar is None:
             return
@@ -230,6 +242,8 @@ class RolloutProgress:
             avg_reward=avg_reward,
             avg_train_reward=avg_train_reward,
             avg_latency_s=avg_latency_s,
+            avg_valid_latency_s=avg_valid_latency_s,
+            avg_penalty_latency_s=avg_penalty_latency_s,
         )
 
     def _print_tqdm(
@@ -241,18 +255,27 @@ class RolloutProgress:
         avg_reward: float = float("nan"),
         avg_train_reward: float = float("nan"),
         avg_latency_s: float | None = None,
+        avg_valid_latency_s: float | None = None,
+        avg_penalty_latency_s: float | None = None,
     ) -> None:
         assert self.tqdm_bar is not None
-        requests = float(env.metrics.get("requests", 0.0))
-        aggregate_events = int(env.metrics.get("aggregate_events", 0.0))
+        requests = max(float(env.metrics.get("requests", 0.0)) - self.start_requests, 0.0)
+        aggregate_events = int(max(float(env.metrics.get("aggregate_events", 0.0)) - self.start_aggregate_events, 0.0))
         sim_hours = env.current_time_minute / 60.0
         episode_fraction = sim_hours / max(float(self.episode_hours), 1e-9)
         if self.rollout_unit == "episode":
             progress = min(episode_fraction, 1.0)
+        elif self.rollout_unit == "window":
+            elapsed_window_minutes = max(env.current_time_minute - self.rollout_start_minute, 0.0)
+            progress = min(elapsed_window_minutes / max(float(self.deployment_interval_minutes), 1e-9), 1.0)
         else:
             progress = min(requests / max(float(self.target_requests or 1), 1.0), 1.0)
         if avg_latency_s is None:
             avg_latency_s = env.metrics["total_latency_s"] / max(requests, 1.0)
+        if avg_valid_latency_s is None:
+            avg_valid_latency_s = env.metrics["total_valid_latency_s"] / max(env.metrics["valid_requests"], 1.0)
+        if avg_penalty_latency_s is None:
+            avg_penalty_latency_s = env.metrics["total_penalty_latency_s"] / max(requests, 1.0)
         elapsed = max(now - self.started_at, 1e-9)
         total_windows = max(int(np.ceil(self.episode_hours * 60.0 / max(self.deployment_interval_minutes, 1))), 1)
         current_window = min(int(env.current_time_minute // max(self.deployment_interval_minutes, 1)) + 1, total_windows)
@@ -267,6 +290,8 @@ class RolloutProgress:
             f"R={_format_metric(avg_reward, 4)} "
             f"trainR={_format_metric(avg_train_reward, 4)} "
             f"Lat={avg_latency_s * 1000:.1f}ms "
+            f"VLat={avg_valid_latency_s * 1000:.1f}ms "
+            f"Pen={avg_penalty_latency_s * 1000:.1f}ms "
             f"win={current_window}/{total_windows} "
             f"t={sim_hours:.1f}/{self.episode_hours}h "
             f"req={_format_count(requests)}/{_format_count(request_target)} "
@@ -281,11 +306,16 @@ class RolloutProgress:
     def _total_progress_units(self) -> float:
         if self.rollout_unit == "episode":
             return max(float(self.episode_hours), 1.0)
+        if self.rollout_unit == "window":
+            return max(float(self.deployment_interval_minutes) / 60.0, 1e-9)
         return max(float(self.target_requests or 1), 1.0)
 
     def _progress_units(self, env: EdgeComputingEnv) -> float:
         if self.rollout_unit == "episode":
             return min(max(env.current_time_minute / 60.0, 0.0), self._total_progress_units())
+        if self.rollout_unit == "window":
+            elapsed_window_hours = max(env.current_time_minute - self.rollout_start_minute, 0.0) / 60.0
+            return min(elapsed_window_hours, self._total_progress_units())
         return min(float(env.metrics.get("requests", 0.0)), self._total_progress_units())
 
 
@@ -326,10 +356,20 @@ def estimate_episode_requests(env: EdgeComputingEnv) -> int:
     return max(int(round(expected)), 1)
 
 
-def _rollout_active(env: EdgeComputingEnv, *, max_requests: int, rollout_unit: str) -> bool:
+def _rollout_active(
+    env: EdgeComputingEnv,
+    *,
+    max_requests: int,
+    rollout_unit: str,
+    stop_time_minute: float | None = None,
+) -> bool:
     if env.done:
         return False
+    if stop_time_minute is not None and env.current_time_minute >= stop_time_minute:
+        return False
     if rollout_unit == "episode":
+        return True
+    if rollout_unit == "window":
         return True
     return env.metrics["requests"] < max_requests
 
@@ -347,21 +387,42 @@ def rollout(
     progress_label: str = "",
     progress_interval_seconds: float = 0.0,
     rollout_unit: str = "requests",
+    reset_env: bool = True,
 ) -> dict[str, float]:
     if args is None:
         args = argparse.Namespace(reward_mode="latency", mixed_latency_weight=0.1)
-    env.reset()
+    if reset_env:
+        env.reset()
     if frozen_slow_policy is None:
         frozen_slow_policy = SlowGreedyDeploymentPolicy()
     greedy_scheduler = FastGreedyScheduler()
     rewards: list[float] = []
     train_rewards: list[float] = []
     latencies: list[float] = []
+    valid_latencies: list[float] = []
+    valid_weights: list[float] = []
+    penalty_latencies: list[float] = []
     weights: list[float] = []
     greedy_latencies: list[float] = []
     greedy_weights: list[float] = []
     window_latencies: dict[int, list[tuple[float, float]]] = {}
-    target_requests = max_requests if rollout_unit == "requests" else estimate_episode_requests(env)
+    start_metrics = dict(env.metrics)
+    rollout_start_minute = env.current_time_minute
+    stop_time_minute = None
+    if rollout_unit == "window":
+        stop_time_minute = min(
+            rollout_start_minute + float(env.config.deployment_interval_minutes),
+            float(env.config.episode_hours * 60),
+        )
+    if rollout_unit == "requests":
+        target_requests = max_requests
+    elif rollout_unit == "window":
+        target_requests = max(
+            int(round(estimate_episode_requests(env) * env.config.deployment_interval_minutes / max(env.config.episode_hours * 60.0, 1.0))),
+            1,
+        )
+    else:
+        target_requests = estimate_episode_requests(env)
     progress = RolloutProgress(
         label=progress_label,
         target_requests=target_requests,
@@ -369,8 +430,11 @@ def rollout(
         episode_hours=env.config.episode_hours,
         rollout_unit=rollout_unit,
         deployment_interval_minutes=env.config.deployment_interval_minutes,
+        rollout_start_minute=rollout_start_minute,
+        start_requests=float(start_metrics.get("requests", 0.0)),
+        start_aggregate_events=float(start_metrics.get("aggregate_events", 0.0)),
     )
-    while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit):
+    while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit, stop_time_minute=stop_time_minute):
         request = env.current_request
         assert request is not None
         if train_mode == "fast-only":
@@ -397,6 +461,10 @@ def rollout(
         rewards.append(float(reward))
         train_rewards.append(float(train_reward))
         latencies.append(float(info["latency_s"]))
+        penalty_latencies.append(float(info["penalty_latency_s"]))
+        if info["valid"]:
+            valid_latencies.append(float(info["physical_latency_s"]))
+            valid_weights.append(request_count)
         weights.append(request_count)
         window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
         if greedy_info is not None:
@@ -408,19 +476,30 @@ def rollout(
                 avg_reward=_weighted_mean(rewards, weights),
                 avg_train_reward=_weighted_mean(train_rewards, weights),
                 avg_latency_s=_weighted_mean(latencies, weights),
+                avg_valid_latency_s=_weighted_mean(valid_latencies, valid_weights),
+                avg_penalty_latency_s=_weighted_mean(penalty_latencies, weights),
             )
     progress.finish(
         env,
         avg_reward=_weighted_mean(rewards, weights),
         avg_train_reward=_weighted_mean(train_rewards, weights),
         avg_latency_s=_weighted_mean(latencies, weights),
+        avg_valid_latency_s=_weighted_mean(valid_latencies, valid_weights),
+        avg_penalty_latency_s=_weighted_mean(penalty_latencies, weights),
     )
     if record and env.metrics["requests"] > 0:
-        agent.flush_slow_window_reward(done=True)
+        agent.flush_slow_window_reward(done=env.done)
     window_stats = _deployment_window_latency_stats(window_latencies)
+    replica_stats = _deployment_replica_stats(env)
+    rollout_requests = float(env.metrics["requests"] - start_metrics.get("requests", 0.0))
+    rollout_aggregate_events = float(env.metrics["aggregate_events"] - start_metrics.get("aggregate_events", 0.0))
+    rollout_invalid_actions = float(env.metrics["invalid_actions"] - start_metrics.get("invalid_actions", 0.0))
+    rollout_valid_requests = float(env.metrics["valid_requests"] - start_metrics.get("valid_requests", 0.0))
+    rollout_deadline_violations = float(env.metrics["deadline_violations"] - start_metrics.get("deadline_violations", 0.0))
+    rollout_deployment_updates = float(env.metrics["deployment_updates"] - start_metrics.get("deployment_updates", 0.0))
     return {
-        "requests": float(env.metrics["requests"]),
-        "aggregate_events": float(env.metrics["aggregate_events"]),
+        "requests": rollout_requests,
+        "aggregate_events": rollout_aggregate_events,
         "simulated_hours": float(env.current_time_minute / 60.0),
         "episode_fraction": float(env.current_time_minute / max(env.config.episode_hours * 60.0, 1e-9)),
         "episode_complete": float(env.done),
@@ -428,11 +507,18 @@ def rollout(
         "avg_train_reward": _weighted_mean(train_rewards, weights),
         "avg_latency_s": _weighted_mean(latencies, weights),
         "p95_latency_s": _weighted_percentile(latencies, weights, 95.0),
+        "avg_valid_latency_s": _weighted_mean(valid_latencies, valid_weights),
+        "p95_valid_latency_s": _weighted_percentile(valid_latencies, valid_weights, 95.0),
+        "valid_requests": rollout_valid_requests,
+        "avg_penalty_latency_s": _weighted_mean(penalty_latencies, weights),
+        "penalty_latency_share": _weighted_mean(penalty_latencies, weights) / max(_weighted_mean(latencies, weights), 1e-9),
         "avg_greedy_latency_s": _weighted_mean(greedy_latencies, greedy_weights) if greedy_latencies else float("nan"),
-        "invalid_actions": float(env.metrics["invalid_actions"]),
-        "deadline_violation_rate": float(env.metrics["deadline_violations"] / max(env.metrics["requests"], 1.0)),
-        "deployment_updates": float(env.metrics["deployment_updates"]),
+        "invalid_actions": rollout_invalid_actions,
+        "invalid_action_rate": float(rollout_invalid_actions / max(rollout_requests, 1.0)),
+        "deadline_violation_rate": float(rollout_deadline_violations / max(rollout_requests, 1.0)),
+        "deployment_updates": rollout_deployment_updates,
         **window_stats,
+        **replica_stats,
     }
 
 
@@ -473,6 +559,37 @@ def _deployment_window_latency_stats(window_latencies: dict[int, list[tuple[floa
         "first_window_avg_latency_s": first_avg,
         "last_window_avg_latency_s": last_avg,
         "window_latency_delta_s": last_avg - first_avg,
+    }
+
+
+def _deployment_replica_stats(env: EdgeComputingEnv) -> dict[str, float]:
+    if env.deployment is None or env.scenario is None:
+        return {
+            "avg_replicas_per_stage": float("nan"),
+            "min_replicas_per_stage": float("nan"),
+            "max_replicas_per_stage": float("nan"),
+            "single_replica_stage_rate": float("nan"),
+            "total_deployed_replicas": float("nan"),
+        }
+    counts = []
+    for service in env.scenario.services:
+        for stage in service.stages:
+            counts.append(float(env.deployment[service.service_id, stage.stage_id].sum()))
+    if not counts:
+        return {
+            "avg_replicas_per_stage": float("nan"),
+            "min_replicas_per_stage": float("nan"),
+            "max_replicas_per_stage": float("nan"),
+            "single_replica_stage_rate": float("nan"),
+            "total_deployed_replicas": float("nan"),
+        }
+    counts_np = np.asarray(counts, dtype=np.float64)
+    return {
+        "avg_replicas_per_stage": float(counts_np.mean()),
+        "min_replicas_per_stage": float(counts_np.min()),
+        "max_replicas_per_stage": float(counts_np.max()),
+        "single_replica_stage_rate": float(np.mean(counts_np <= 1.0)),
+        "total_deployed_replicas": float(counts_np.sum()),
     }
 
 
@@ -520,20 +637,36 @@ def evaluate_agent(
         )
     avg_latencies = np.array([r["avg_latency_s"] for r in runs], dtype=np.float64)
     p95_latencies = np.array([r["p95_latency_s"] for r in runs], dtype=np.float64)
+    avg_valid_latencies = np.array([r["avg_valid_latency_s"] for r in runs], dtype=np.float64)
+    p95_valid_latencies = np.array([r["p95_valid_latency_s"] for r in runs], dtype=np.float64)
+    avg_penalty_latencies = np.array([r["avg_penalty_latency_s"] for r in runs], dtype=np.float64)
+    penalty_latency_shares = np.array([r["penalty_latency_share"] for r in runs], dtype=np.float64)
     invalid_actions = np.array([r["invalid_actions"] for r in runs], dtype=np.float64)
+    invalid_action_rates = np.array([r["invalid_action_rate"] for r in runs], dtype=np.float64)
     violation_rates = np.array([r["deadline_violation_rate"] for r in runs], dtype=np.float64)
     deployment_updates = np.array([r["deployment_updates"] for r in runs], dtype=np.float64)
     aggregate_events = np.array([r["aggregate_events"] for r in runs], dtype=np.float64)
+    avg_replicas = np.array([r["avg_replicas_per_stage"] for r in runs], dtype=np.float64)
+    single_replica_rates = np.array([r["single_replica_stage_rate"] for r in runs], dtype=np.float64)
+    total_replicas = np.array([r["total_deployed_replicas"] for r in runs], dtype=np.float64)
     first_window_latencies = np.array([r["first_window_avg_latency_s"] for r in runs], dtype=np.float64)
     last_window_latencies = np.array([r["last_window_avg_latency_s"] for r in runs], dtype=np.float64)
     return {
         "eval_avg_latency_s": float(avg_latencies.mean()),
         "eval_avg_latency_std": float(avg_latencies.std()),
         "eval_p95_latency_s": float(p95_latencies.mean()),
+        "eval_avg_valid_latency_s": float(avg_valid_latencies.mean()),
+        "eval_p95_valid_latency_s": float(p95_valid_latencies.mean()),
+        "eval_avg_penalty_latency_s": float(avg_penalty_latencies.mean()),
+        "eval_penalty_latency_share": float(penalty_latency_shares.mean()),
         "eval_invalid_actions": float(invalid_actions.mean()),
+        "eval_invalid_action_rate": float(invalid_action_rates.mean()),
         "eval_deadline_violation_rate": float(violation_rates.mean()),
         "eval_deployment_updates": float(deployment_updates.mean()),
         "eval_aggregate_events": float(aggregate_events.mean()),
+        "eval_avg_replicas_per_stage": float(avg_replicas.mean()),
+        "eval_single_replica_stage_rate": float(single_replica_rates.mean()),
+        "eval_total_deployed_replicas": float(total_replicas.mean()),
         "eval_first_window_avg_latency_s": float(np.nanmean(first_window_latencies)),
         "eval_last_window_avg_latency_s": float(np.nanmean(last_window_latencies)),
         "eval_window_latency_delta_s": float(np.nanmean(last_window_latencies - first_window_latencies)),
@@ -570,7 +703,18 @@ def evaluate_policy_diagnostics(
             rollout_unit=rollout_unit,
             deployment_interval_minutes=env.config.deployment_interval_minutes,
         )
-        while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit):
+        det_stop_time_minute = None
+        if rollout_unit == "window":
+            det_stop_time_minute = min(
+                env.current_time_minute + float(env.config.deployment_interval_minutes),
+                float(env.config.episode_hours * 60),
+            )
+        while _rollout_active(
+            env,
+            max_requests=max_requests,
+            rollout_unit=rollout_unit,
+            stop_time_minute=det_stop_time_minute,
+        ):
             request = env.current_request
             assert request is not None
             if train_mode == "fast-only":
@@ -817,7 +961,7 @@ def main() -> None:
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes}")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
-    print(f"  max_replicas_per_stage={args.replicas_per_stage} actual_replica_count=learned")
+    print(f"  max_replicas_per_stage={args.replicas_per_stage} actual_replica_count=learned_by_repeated_node")
     print(
         "  ppo slow_lr={} fast_lr={} slow_entropy={} fast_entropy={}".format(
             args.slow_lr,
@@ -881,6 +1025,7 @@ def main() -> None:
         initial_row = {
             "update": 0,
             "episode": 0,
+            "window_in_episode": 0,
             "requests": 0,
             "aggregate_events": 0,
             "simulated_hours": np.nan,
@@ -890,10 +1035,21 @@ def main() -> None:
             "avg_train_reward": np.nan,
             "avg_latency_s": np.nan,
             "p95_latency_s": np.nan,
+            "avg_valid_latency_s": np.nan,
+            "p95_valid_latency_s": np.nan,
+            "valid_requests": 0,
+            "avg_penalty_latency_s": np.nan,
+            "penalty_latency_share": np.nan,
             "avg_greedy_latency_s": np.nan,
             "invalid_actions": 0,
+            "invalid_action_rate": np.nan,
             "deadline_violation_rate": np.nan,
             "deployment_updates": 0,
+            "avg_replicas_per_stage": np.nan,
+            "min_replicas_per_stage": np.nan,
+            "max_replicas_per_stage": np.nan,
+            "single_replica_stage_rate": np.nan,
+            "total_deployed_replicas": np.nan,
             "first_window_avg_latency_s": np.nan,
             "last_window_avg_latency_s": np.nan,
             "window_latency_delta_s": np.nan,
@@ -908,10 +1064,18 @@ def main() -> None:
             "eval_avg_latency_s": eval_stats["eval_avg_latency_s"],
             "eval_avg_latency_std": eval_stats["eval_avg_latency_std"],
             "eval_p95_latency_s": eval_stats["eval_p95_latency_s"],
+            "eval_avg_valid_latency_s": eval_stats["eval_avg_valid_latency_s"],
+            "eval_p95_valid_latency_s": eval_stats["eval_p95_valid_latency_s"],
+            "eval_avg_penalty_latency_s": eval_stats["eval_avg_penalty_latency_s"],
+            "eval_penalty_latency_share": eval_stats["eval_penalty_latency_share"],
             "eval_invalid_actions": eval_stats["eval_invalid_actions"],
+            "eval_invalid_action_rate": eval_stats["eval_invalid_action_rate"],
             "eval_deadline_violation_rate": eval_stats["eval_deadline_violation_rate"],
             "eval_deployment_updates": eval_stats["eval_deployment_updates"],
             "eval_aggregate_events": eval_stats["eval_aggregate_events"],
+            "eval_avg_replicas_per_stage": eval_stats["eval_avg_replicas_per_stage"],
+            "eval_single_replica_stage_rate": eval_stats["eval_single_replica_stage_rate"],
+            "eval_total_deployed_replicas": eval_stats["eval_total_deployed_replicas"],
             "eval_first_window_avg_latency_s": eval_stats["eval_first_window_avg_latency_s"],
             "eval_last_window_avg_latency_s": eval_stats["eval_last_window_avg_latency_s"],
             "eval_window_latency_delta_s": eval_stats["eval_window_latency_delta_s"],
@@ -940,19 +1104,48 @@ def main() -> None:
                 },
             )
 
+    train_env: EdgeComputingEnv | None = None
+    train_episode_idx = 0
+    total_windows = max(int(np.ceil(args.episode_hours * 60.0 / 240.0)), 1)
     for update in range(args.updates):
-        env = build_env(args, seed_offset=update, group_scenario_by_refresh=True)
-        stats = rollout(
-            env,
-            agent,
-            args.requests_per_update,
-            args=args,
-            reward_scale=args.reward_scale,
-            train_mode=args.train_mode,
-            progress_label=f"update={update + 1:03d}/{args.updates:03d}",
-            progress_interval_seconds=args.progress_interval_seconds,
-            rollout_unit=args.rollout_unit,
-        )
+        if args.rollout_unit == "window":
+            if train_env is None or train_env.done:
+                train_env = build_env(args, seed_offset=train_episode_idx, group_scenario_by_refresh=True)
+                train_env.reset()
+            env = train_env
+            episode_number = train_episode_idx + 1
+            window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
+            progress_label = (
+                f"update={update + 1:03d}/{args.updates:03d} "
+                f"ep={episode_number:03d} win={window_in_episode:02d}/{total_windows:02d}"
+            )
+            stats = rollout(
+                env,
+                agent,
+                args.requests_per_update,
+                args=args,
+                reward_scale=args.reward_scale,
+                train_mode=args.train_mode,
+                progress_label=progress_label,
+                progress_interval_seconds=args.progress_interval_seconds,
+                rollout_unit=args.rollout_unit,
+                reset_env=False,
+            )
+        else:
+            env = build_env(args, seed_offset=update, group_scenario_by_refresh=True)
+            episode_number = update + 1
+            stats = rollout(
+                env,
+                agent,
+                args.requests_per_update,
+                args=args,
+                reward_scale=args.reward_scale,
+                train_mode=args.train_mode,
+                progress_label=f"update={update + 1:03d}/{args.updates:03d}",
+                progress_interval_seconds=args.progress_interval_seconds,
+                rollout_unit=args.rollout_unit,
+            )
+            window_in_episode = int(stats["deployment_updates"])
         if args.train_mode == "fast-only":
             losses = {
                 "slow": {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0},
@@ -992,7 +1185,8 @@ def main() -> None:
             diagnostic_stats = {}
         log_row = {
             "update": update + 1,
-            "episode": update + 1,
+            "episode": episode_number,
+            "window_in_episode": window_in_episode,
             "requests": int(stats["requests"]),
             "aggregate_events": int(stats["aggregate_events"]),
             "simulated_hours": stats["simulated_hours"],
@@ -1002,10 +1196,21 @@ def main() -> None:
             "avg_train_reward": stats["avg_train_reward"],
             "avg_latency_s": stats["avg_latency_s"],
             "p95_latency_s": stats["p95_latency_s"],
+            "avg_valid_latency_s": stats["avg_valid_latency_s"],
+            "p95_valid_latency_s": stats["p95_valid_latency_s"],
+            "valid_requests": int(stats["valid_requests"]),
+            "avg_penalty_latency_s": stats["avg_penalty_latency_s"],
+            "penalty_latency_share": stats["penalty_latency_share"],
             "avg_greedy_latency_s": stats["avg_greedy_latency_s"],
             "invalid_actions": int(stats["invalid_actions"]),
+            "invalid_action_rate": stats["invalid_action_rate"],
             "deadline_violation_rate": stats["deadline_violation_rate"],
             "deployment_updates": int(stats["deployment_updates"]),
+            "avg_replicas_per_stage": stats["avg_replicas_per_stage"],
+            "min_replicas_per_stage": stats["min_replicas_per_stage"],
+            "max_replicas_per_stage": stats["max_replicas_per_stage"],
+            "single_replica_stage_rate": stats["single_replica_stage_rate"],
+            "total_deployed_replicas": stats["total_deployed_replicas"],
             "first_window_avg_latency_s": stats["first_window_avg_latency_s"],
             "last_window_avg_latency_s": stats["last_window_avg_latency_s"],
             "window_latency_delta_s": stats["window_latency_delta_s"],
@@ -1020,10 +1225,18 @@ def main() -> None:
             "eval_avg_latency_s": eval_stats.get("eval_avg_latency_s", np.nan),
             "eval_avg_latency_std": eval_stats.get("eval_avg_latency_std", np.nan),
             "eval_p95_latency_s": eval_stats.get("eval_p95_latency_s", np.nan),
+            "eval_avg_valid_latency_s": eval_stats.get("eval_avg_valid_latency_s", np.nan),
+            "eval_p95_valid_latency_s": eval_stats.get("eval_p95_valid_latency_s", np.nan),
+            "eval_avg_penalty_latency_s": eval_stats.get("eval_avg_penalty_latency_s", np.nan),
+            "eval_penalty_latency_share": eval_stats.get("eval_penalty_latency_share", np.nan),
             "eval_invalid_actions": eval_stats.get("eval_invalid_actions", np.nan),
+            "eval_invalid_action_rate": eval_stats.get("eval_invalid_action_rate", np.nan),
             "eval_deadline_violation_rate": eval_stats.get("eval_deadline_violation_rate", np.nan),
             "eval_deployment_updates": eval_stats.get("eval_deployment_updates", np.nan),
             "eval_aggregate_events": eval_stats.get("eval_aggregate_events", np.nan),
+            "eval_avg_replicas_per_stage": eval_stats.get("eval_avg_replicas_per_stage", np.nan),
+            "eval_single_replica_stage_rate": eval_stats.get("eval_single_replica_stage_rate", np.nan),
+            "eval_total_deployed_replicas": eval_stats.get("eval_total_deployed_replicas", np.nan),
             "eval_first_window_avg_latency_s": eval_stats.get("eval_first_window_avg_latency_s", np.nan),
             "eval_last_window_avg_latency_s": eval_stats.get("eval_last_window_avg_latency_s", np.nan),
             "eval_window_latency_delta_s": eval_stats.get("eval_window_latency_delta_s", np.nan),
@@ -1036,36 +1249,50 @@ def main() -> None:
         }
         append_log(log_path, log_row)
         print(
-            "update={:03d} episode={:03d} complete={} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
-            "avg_reward={:.4f} avg_latency={:.4f}s train_reward={:.4f} invalid={} deployments={} "
-            "slow_loss={:.4f} fast_loss={:.4f}".format(
+            "update={:03d} episode={:03d} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
+            "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
+            "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} slow_loss={:.4f} fast_loss={:.4f}".format(
                 update + 1,
-                update + 1,
+                episode_number,
                 int(stats["episode_complete"]),
+                window_in_episode,
                 int(stats["requests"]),
                 int(stats["aggregate_events"]),
                 stats["simulated_hours"],
                 stats["episode_fraction"],
                 stats["avg_reward"],
                 stats["avg_latency_s"],
+                stats["avg_valid_latency_s"],
+                stats["avg_penalty_latency_s"],
                 stats["avg_train_reward"],
                 int(stats["invalid_actions"]),
+                stats["invalid_action_rate"],
                 int(stats["deployment_updates"]),
+                stats["avg_replicas_per_stage"],
+                stats["min_replicas_per_stage"],
+                stats["max_replicas_per_stage"],
+                stats["single_replica_stage_rate"],
                 losses["slow"]["loss"],
                 losses["fast"]["loss"],
             )
         )
         if eval_stats:
             print(
-                "  eval_mean_latency={:.4f}s eval_std={:.4f}s eval_p95={:.4f}s invalid={:.2f} entropy={:.4f} action_change={:.4f}".format(
+                "  eval_mean_latency={:.4f}s eval_valid_latency={:.4f}s eval_penalty_latency={:.4f}s eval_std={:.4f}s eval_p95={:.4f}s invalid={:.2f} eval_replicas={:.2f} single={:.1%} entropy={:.4f} action_change={:.4f}".format(
                     eval_stats["eval_avg_latency_s"],
+                    eval_stats["eval_avg_valid_latency_s"],
+                    eval_stats["eval_avg_penalty_latency_s"],
                     eval_stats["eval_avg_latency_std"],
                     eval_stats["eval_p95_latency_s"],
                     eval_stats["eval_invalid_actions"],
+                    eval_stats["eval_avg_replicas_per_stage"],
+                    eval_stats["eval_single_replica_stage_rate"],
                     diagnostic_stats.get("eval_policy_entropy", np.nan),
                     diagnostic_stats.get("eval_action_change_rate", np.nan),
                 )
             )
+        if args.rollout_unit == "window" and stats["episode_complete"]:
+            train_episode_idx += 1
         selection_latency = eval_stats.get("eval_avg_latency_s", stats["avg_latency_s"])
         if args.save_best and selection_latency < best_latency:
             best_latency = selection_latency
@@ -1103,14 +1330,18 @@ def main() -> None:
             rollout_unit=eval_rollout_unit,
         )
         print(
-            "eval seeds={} requests_per_seed={} avg_latency={:.4f}s std={:.4f}s p95_latency={:.4f}s invalid={:.2f} violation_rate={:.4f}".format(
+            "eval seeds={} requests_per_seed={} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s std={:.4f}s p95_latency={:.4f}s invalid={:.2f} violation_rate={:.4f} replicas={:.2f} single={:.1%}".format(
                 args.eval_seeds,
                 args.eval_requests,
                 stats["eval_avg_latency_s"],
+                stats["eval_avg_valid_latency_s"],
+                stats["eval_avg_penalty_latency_s"],
                 stats["eval_avg_latency_std"],
                 stats["eval_p95_latency_s"],
                 stats["eval_invalid_actions"],
                 stats["eval_deadline_violation_rate"],
+                stats["eval_avg_replicas_per_stage"],
+                stats["eval_single_replica_stage_rate"],
             )
         )
 

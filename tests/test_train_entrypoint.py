@@ -161,6 +161,54 @@ def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
     assert float(row["deployment_updates"]) >= 2.0
 
 
+def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "2",
+        "--rollout-unit",
+        "window",
+        "--mean-requests-per-minute",
+        "2",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "8",
+        "--request-aggregation-window-seconds",
+        "60",
+        "--max-representative-groups-per-window",
+        "4",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "rollout_unit=window" in result.stdout
+    assert "update=001 episode=001 complete=0 window=01" in result.stdout
+    assert "update=002 episode=001 complete=1 window=02" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["update"] for row in rows] == ["1", "2"]
+    assert [row["episode"] for row in rows] == ["1", "1"]
+    assert [row["window_in_episode"] for row in rows] == ["1", "2"]
+    assert rows[0]["episode_complete"] == "0"
+    assert rows[1]["episode_complete"] == "1"
+    assert "avg_valid_latency_s" in rows[0]
+    assert "avg_penalty_latency_s" in rows[0]
+    assert "invalid_action_rate" in rows[0]
+
+
 def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
     log_dir = tmp_path / "logs"
     save_dir = tmp_path / "savedModels"
