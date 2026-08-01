@@ -38,11 +38,26 @@ class SlowDeploymentPPOAgent:
     target_kl: float | None = 0.03
     minibatch_size: int = 2048
     device: str = "cpu"
+    count_ppo: PPOAgent = field(init=False)
+    placement_ppo: PPOAgent = field(init=False)
     ppo: PPOAgent = field(init=False)
-    pending_indices: list[int] = field(default_factory=list)
+    pending_count_indices: list[int] = field(default_factory=list)
+    pending_placement_indices: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.ppo = PPOAgent(
+        self.count_ppo = PPOAgent(
+            obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
+            action_dim=self.replicas_per_stage,
+            hidden_dim=128,
+            lr=self.lr,
+            gamma=0.99,
+            k_epochs=self.k_epochs,
+            entropy_coef=self.entropy_coef,
+            target_kl=self.target_kl,
+            minibatch_size=self.minibatch_size,
+            device=self.device,
+        )
+        self.placement_ppo = PPOAgent(
             obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
             action_dim=self.num_nodes,
             hidden_dim=128,
@@ -54,6 +69,7 @@ class SlowDeploymentPPOAgent:
             minibatch_size=self.minibatch_size,
             device=self.device,
         )
+        self.ppo = self.placement_ppo
 
     def plan_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> np.ndarray:
         env._require_ready()
@@ -65,38 +81,46 @@ class SlowDeploymentPPOAgent:
         remaining_memory = np.array([n.memory_gb for n in env.scenario.nodes], dtype=np.float64)
         remaining_storage = np.array([n.storage_gb for n in env.scenario.nodes], dtype=np.float64)
         demand = self._node_service_demand(env)
-        self.pending_indices.clear()
+        self.pending_count_indices.clear()
+        self.pending_placement_indices.clear()
 
         for service in env.scenario.services:
             for stage in service.stages:
-                for replica_idx in range(self.replicas_per_stage):
+                count_state = self._build_state(env, demand, remaining_memory, remaining_storage, service.service_id, stage.stage_id, 0)
+                count_mask = self._build_count_mask(stage, remaining_memory, remaining_storage)
+                if not count_mask.any():
+                    continue
+                count_action, count_logprob, count_value = self.count_ppo.act(count_state, count_mask, deterministic=deterministic)
+                if not count_mask[count_action]:
+                    count_action = int(np.where(count_mask)[0][0])
+                target_replicas = count_action + 1
+                if record:
+                    self.count_ppo.buffer.states.append(count_state)
+                    self.count_ppo.buffer.masks.append(count_mask.astype(bool))
+                    self.count_ppo.buffer.actions.append(count_action)
+                    self.count_ppo.buffer.logprobs.append(count_logprob)
+                    self.count_ppo.buffer.values.append(count_value)
+                    self.pending_count_indices.append(len(self.count_ppo.buffer.actions) - 1)
+
+                for replica_idx in range(target_replicas):
                     state = self._build_state(env, demand, remaining_memory, remaining_storage, service.service_id, stage.stage_id, replica_idx)
                     already = deployment[service.service_id, stage.stage_id]
                     feasible_new = (remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb) & ~already
-                    if already.any() and replica_idx > 0:
-                        mask = already | feasible_new
-                    else:
-                        mask = feasible_new
+                    mask = feasible_new
                     if not mask.any():
                         break
 
-                    if deterministic and already.any() and feasible_new.any():
-                        action, logprob, value = self._deterministic_replica_action(state, mask, already, feasible_new)
-                    else:
-                        action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
+                    action, logprob, value = self.placement_ppo.act(state, mask, deterministic=deterministic)
                     if not mask[action]:
                         action = int(np.where(mask)[0][0])
 
                     if record:
-                        self.ppo.buffer.states.append(state)
-                        self.ppo.buffer.masks.append(mask.astype(bool))
-                        self.ppo.buffer.actions.append(action)
-                        self.ppo.buffer.logprobs.append(logprob)
-                        self.ppo.buffer.values.append(value)
-                        self.pending_indices.append(len(self.ppo.buffer.actions) - 1)
-
-                    if already[action]:
-                        continue
+                        self.placement_ppo.buffer.states.append(state)
+                        self.placement_ppo.buffer.masks.append(mask.astype(bool))
+                        self.placement_ppo.buffer.actions.append(action)
+                        self.placement_ppo.buffer.logprobs.append(logprob)
+                        self.placement_ppo.buffer.values.append(value)
+                        self.pending_placement_indices.append(len(self.placement_ppo.buffer.actions) - 1)
 
                     deployment[service.service_id, stage.stage_id, action] = True
                     remaining_memory[action] -= stage.memory_gb
@@ -111,15 +135,44 @@ class SlowDeploymentPPOAgent:
         return deployment
 
     def assign_pending_reward(self, reward: float, done: bool) -> None:
-        missing = len(self.ppo.buffer.actions) - len(self.ppo.buffer.rewards)
-        for action_idx in range(missing):
-            self.ppo.buffer.rewards.append(float(reward))
-            self.ppo.buffer.dones.append(bool(done or action_idx == missing - 1))
-        self.pending_indices.clear()
+        self._assign_pending_reward(self.count_ppo, reward, done)
+        self._assign_pending_reward(self.placement_ppo, reward, done)
+        self.pending_count_indices.clear()
+        self.pending_placement_indices.clear()
 
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         self.assign_pending_reward(0.0, True)
-        return self.ppo.update(progress_label=progress_label, progress_interval_seconds=progress_interval_seconds)
+        count_metrics = self.count_ppo.update(
+            progress_label=f"{progress_label} count",
+            progress_interval_seconds=progress_interval_seconds,
+        )
+        placement_metrics = self.placement_ppo.update(
+            progress_label=f"{progress_label} placement",
+            progress_interval_seconds=progress_interval_seconds,
+        )
+        return {
+            "loss": count_metrics["loss"] + placement_metrics["loss"],
+            "policy_loss": count_metrics["policy_loss"] + placement_metrics["policy_loss"],
+            "value_loss": count_metrics["value_loss"] + placement_metrics["value_loss"],
+            "entropy": count_metrics["entropy"] + placement_metrics["entropy"],
+            "approx_kl": max(count_metrics.get("approx_kl", 0.0), placement_metrics.get("approx_kl", 0.0)),
+            "count_loss": count_metrics["loss"],
+            "count_policy_loss": count_metrics["policy_loss"],
+            "count_value_loss": count_metrics["value_loss"],
+            "count_entropy": count_metrics["entropy"],
+            "count_approx_kl": count_metrics.get("approx_kl", 0.0),
+            "placement_loss": placement_metrics["loss"],
+            "placement_policy_loss": placement_metrics["policy_loss"],
+            "placement_value_loss": placement_metrics["value_loss"],
+            "placement_entropy": placement_metrics["entropy"],
+            "placement_approx_kl": placement_metrics.get("approx_kl", 0.0),
+        }
+
+    def _assign_pending_reward(self, ppo: PPOAgent, reward: float, done: bool) -> None:
+        missing = len(ppo.buffer.actions) - len(ppo.buffer.rewards)
+        for action_idx in range(missing):
+            ppo.buffer.rewards.append(float(reward))
+            ppo.buffer.dones.append(bool(done or action_idx == missing - 1))
 
     def _build_state(
         self,
@@ -165,24 +218,18 @@ class SlowDeploymentPPOAgent:
         demand /= max(demand.max(), 1e-9)
         return demand
 
-    def _deterministic_replica_action(
+    def _build_count_mask(
         self,
-        state: np.ndarray,
-        mask: np.ndarray,
-        already: np.ndarray,
-        feasible_new: np.ndarray,
-    ) -> tuple[int, float, float]:
-        probs, value = self.ppo.action_probabilities(state, mask)
-        masked_probs = np.where(mask, probs, 0.0)
-        existing_mass = float(masked_probs[already].sum())
-        new_mass = float(masked_probs[feasible_new].sum())
-        if new_mass > existing_mass:
-            candidate_scores = np.where(feasible_new, masked_probs, -1.0)
-        else:
-            candidate_scores = np.where(already & mask, masked_probs, -1.0)
-        action = int(np.argmax(candidate_scores))
-        logprob = float(np.log(max(masked_probs[action], 1e-12)))
-        return action, logprob, value
+        stage,
+        remaining_memory: np.ndarray,
+        remaining_storage: np.ndarray,
+    ) -> np.ndarray:
+        feasible_slots = int(np.count_nonzero((remaining_memory >= stage.memory_gb) & (remaining_storage >= stage.storage_gb)))
+        max_count = min(self.replicas_per_stage, feasible_slots)
+        mask = np.zeros(self.replicas_per_stage, dtype=bool)
+        if max_count > 0:
+            mask[:max_count] = True
+        return mask
 
     def _repair_with_current_or_full(self, env: EdgeComputingEnv, deployment: np.ndarray) -> np.ndarray:
         feasible, _ = env.check_deployment_feasible(deployment)

@@ -38,15 +38,19 @@ def test_dual_ppo_rollout_and_update():
         request_count += 1
 
     agent.flush_slow_window_reward(done=True)
-    assert len(agent.slow_agent.ppo.buffer) > 0
+    assert len(agent.slow_agent.count_ppo.buffer) > 0
+    assert len(agent.slow_agent.placement_ppo.buffer) > 0
     assert len(agent.fast_agent.ppo.buffer) >= request_count
 
     losses = agent.update()
     assert "slow" in losses
     assert "fast" in losses
     assert np.isfinite(losses["slow"]["loss"])
+    assert np.isfinite(losses["slow"]["count_loss"])
+    assert np.isfinite(losses["slow"]["placement_loss"])
     assert np.isfinite(losses["fast"]["loss"])
-    assert len(agent.slow_agent.ppo.buffer) == 0
+    assert len(agent.slow_agent.count_ppo.buffer) == 0
+    assert len(agent.slow_agent.placement_ppo.buffer) == 0
     assert len(agent.fast_agent.ppo.buffer) == 0
 
 
@@ -66,7 +70,8 @@ def test_deterministic_eval_does_not_write_rollout_buffers():
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
     stats = rollout(env, agent, max_requests=4, deterministic=True, record=False)
     assert stats["requests"] == 4
-    assert len(agent.slow_agent.ppo.buffer) == 0
+    assert len(agent.slow_agent.count_ppo.buffer) == 0
+    assert len(agent.slow_agent.placement_ppo.buffer) == 0
     assert len(agent.fast_agent.ppo.buffer) == 0
 
 
@@ -86,7 +91,8 @@ def test_fast_only_rollout_records_only_fast_buffer():
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
     stats = rollout(env, agent, max_requests=5, train_mode="fast-only", reward_scale=0.1)
     assert stats["requests"] == 5
-    assert len(agent.slow_agent.ppo.buffer) == 0
+    assert len(agent.slow_agent.count_ppo.buffer) == 0
+    assert len(agent.slow_agent.placement_ppo.buffer) == 0
     assert len(agent.fast_agent.ppo.buffer) >= 5
 
 
@@ -109,7 +115,7 @@ def test_fast_agent_supports_node_scorer_fallback():
     assert len(agent.fast_agent.ppo.buffer) >= 4
 
 
-def test_slow_agent_learns_variable_replica_count_with_repeated_node_action():
+def test_slow_agent_uses_explicit_count_and_unique_placements():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=29,
@@ -123,22 +129,28 @@ def test_slow_agent_learns_variable_replica_count_with_repeated_node_action():
     )
     env.reset()
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
-    assert agent.slow_agent.ppo.policy.actor.out_features == env.config.num_edge_nodes
+    assert agent.slow_agent.count_ppo.policy.actor.out_features == 4
+    assert agent.slow_agent.placement_ppo.policy.actor.out_features == env.config.num_edge_nodes
 
-    def scripted_act(state, mask, deterministic=False):
+    def count_two(state, mask, deterministic=False):
+        assert mask[1]
+        return 1, 0.0, 0.0
+
+    def first_available_node(state, mask, deterministic=False):
         return int(np.where(mask)[0][0]), 0.0, 0.0
 
-    agent.slow_agent.ppo.act = scripted_act
+    agent.slow_agent.count_ppo.act = count_two
+    agent.slow_agent.placement_ppo.act = first_available_node
     deployment = agent.slow_agent.plan_deployment(env, deterministic=False, record=False)
 
     for service in env.scenario.services:
         for stage in service.stages:
-            assert deployment[service.service_id, stage.stage_id].sum() == 1
+            assert deployment[service.service_id, stage.stage_id].sum() == 2
     feasible, reason = env.check_deployment_feasible(deployment)
     assert feasible, reason
 
 
-def test_deterministic_slow_deployment_uses_new_replica_probability_mass():
+def test_deterministic_slow_deployment_respects_count_policy():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=31,
@@ -153,20 +165,19 @@ def test_deterministic_slow_deployment_uses_new_replica_probability_mass():
     env.reset()
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
 
-    def scripted_act(state, mask, deterministic=False):
+    def count_three(state, mask, deterministic=False):
+        assert mask[2]
+        return 2, 0.0, 0.0
+
+    def first_available_node(state, mask, deterministic=False):
         return int(np.where(mask)[0][0]), 0.0, 0.0
 
-    def uniform_probabilities(state, mask):
-        probs = mask.astype(np.float64)
-        probs /= probs.sum()
-        return probs, 0.0
-
-    agent.slow_agent.ppo.act = scripted_act
-    agent.slow_agent.ppo.action_probabilities = uniform_probabilities
+    agent.slow_agent.count_ppo.act = count_three
+    agent.slow_agent.placement_ppo.act = first_available_node
     deployment = agent.slow_agent.plan_deployment(env, deterministic=True, record=False)
 
     for service in env.scenario.services:
         for stage in service.stages:
-            assert deployment[service.service_id, stage.stage_id].sum() == 4
+            assert deployment[service.service_id, stage.stage_id].sum() == 3
     feasible, reason = env.check_deployment_feasible(deployment)
     assert feasible, reason

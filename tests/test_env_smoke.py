@@ -97,10 +97,11 @@ def test_migration_cost_is_charged_once():
     assert second_info["migration_cost"] == 0
 
 
-def test_scenario_seed_keeps_topology_fixed():
+def test_physical_seed_keeps_topology_fixed():
     config_a = EdgeEnvConfig(
         seed=101,
-        scenario_seed=7,
+        physical_seed=7,
+        scenario_seed=101,
         num_users=10_000,
         num_edge_nodes=16,
         num_service_types=3,
@@ -108,7 +109,8 @@ def test_scenario_seed_keeps_topology_fixed():
     )
     config_b = EdgeEnvConfig(
         seed=202,
-        scenario_seed=7,
+        physical_seed=7,
+        scenario_seed=202,
         num_users=10_000,
         num_edge_nodes=16,
         num_service_types=3,
@@ -121,6 +123,58 @@ def test_scenario_seed_keeps_topology_fixed():
     xy_a = [(node.x_km, node.y_km) for node in env_a.scenario.nodes]
     xy_b = [(node.x_km, node.y_km) for node in env_b.scenario.nodes]
     assert xy_a == xy_b
+
+
+def test_demand_refresh_does_not_change_physical_network():
+    base = dict(
+        seed=101,
+        physical_seed=2026,
+        num_users=10_000,
+        num_edge_nodes=16,
+        num_service_types=3,
+        episode_hours=1,
+    )
+    env_a = EdgeComputingEnv(EdgeEnvConfig(**base, scenario_seed=7))
+    env_b = EdgeComputingEnv(EdgeEnvConfig(**base, scenario_seed=8))
+    env_a.reset()
+    env_b.reset()
+
+    nodes_a = [
+        (n.x_km, n.y_km, n.memory_gb, n.storage_gb, n.compute_gcycles_per_s)
+        for n in env_a.scenario.nodes
+    ]
+    nodes_b = [
+        (n.x_km, n.y_km, n.memory_gb, n.storage_gb, n.compute_gcycles_per_s)
+        for n in env_b.scenario.nodes
+    ]
+    services_a = [
+        (
+            service.name,
+            service.input_mb_mean,
+            service.deadline_s_mean,
+            tuple((s.memory_gb, s.storage_gb, s.compute_gcycles_mean, s.output_mb_mean) for s in service.stages),
+        )
+        for service in env_a.scenario.services
+    ]
+    services_b = [
+        (
+            service.name,
+            service.input_mb_mean,
+            service.deadline_s_mean,
+            tuple((s.memory_gb, s.storage_gb, s.compute_gcycles_mean, s.output_mb_mean) for s in service.stages),
+        )
+        for service in env_b.scenario.services
+    ]
+
+    assert nodes_a == nodes_b
+    assert services_a == services_b
+    np.testing.assert_array_equal(env_a.scenario.adjacency, env_b.scenario.adjacency)
+    np.testing.assert_allclose(env_a.scenario.bandwidth_mb_s, env_b.scenario.bandwidth_mb_s)
+    np.testing.assert_allclose(env_a.scenario.propagation_ms, env_b.scenario.propagation_ms)
+
+    home_a = np.bincount([u.home_node for u in env_a.scenario.users], minlength=16)
+    home_b = np.bincount([u.home_node for u in env_b.scenario.users], minlength=16)
+    assert not np.array_equal(home_a, home_b)
 
 
 def test_default_traffic_is_city_scale_for_ten_thousand_users():

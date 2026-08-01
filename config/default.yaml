@@ -4,12 +4,14 @@
 
 scenario:
   seed: 2026
+  physical_seed: 2026
   num_users: 12000
   num_edge_nodes: 32
   num_service_types: 10
   max_service_stages: 3
   episode_hours: 24
   scenario_refresh_episodes: 20
+  scenario_refresh_scope: demand_only
 
 time_scales:
   slow_deployment_interval_minutes: 240
@@ -51,6 +53,6 @@ agent:
     slow_agent_update: every_240_minutes
     fast_agent_update: per_task_request
     max_replicas_per_stage: 5
-    actual_replica_count: learned_by_repeated_node
+    actual_replica_count: learned_by_count_ppo
     masked_actions: true
     feasibility_repair: true

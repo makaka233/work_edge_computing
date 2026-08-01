@@ -12,6 +12,7 @@ from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_grouped_re
 @dataclass
 class EdgeEnvConfig:
     seed: int = 2026
+    physical_seed: int | None = None
     scenario_seed: int | None = None
     num_users: int = 12_000
     num_edge_nodes: int = 48
@@ -86,11 +87,15 @@ class EdgeComputingEnv:
 
     def reset(self) -> dict[str, Any]:
         self.rng = np.random.default_rng(self.config.seed)
-        scenario_rng = np.random.default_rng(
+        physical_rng = np.random.default_rng(
+            self.config.seed if self.config.physical_seed is None else self.config.physical_seed
+        )
+        demand_rng = np.random.default_rng(
             self.config.seed if self.config.scenario_seed is None else self.config.scenario_seed
         )
         self.scenario = generate_realistic_scenario(
-            rng=scenario_rng,
+            rng=physical_rng,
+            demand_rng=demand_rng,
             num_users=self.config.num_users,
             num_edge_nodes=self.config.num_edge_nodes,
             num_service_types=self.config.num_service_types,

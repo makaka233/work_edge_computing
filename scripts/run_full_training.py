@@ -9,6 +9,7 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the staged full-training pipeline.")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--physical-seed", type=int, default=None)
     parser.add_argument("--run-root", type=str, default="runs")
     parser.add_argument("--num-users", type=int, default=10_000)
     parser.add_argument("--num-edge-nodes", type=int, default=32)
@@ -31,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-updates", type=int, default=80)
     parser.add_argument("--joint-updates", type=int, default=120)
     parser.add_argument("--requests-per-update", type=int, default=256)
-    parser.add_argument("--rollout-unit", choices=["requests", "episode"], default="requests")
-    parser.add_argument("--eval-rollout-unit", choices=["requests", "episode", "same"], default="requests")
+    parser.add_argument("--rollout-unit", choices=["requests", "window", "episode"], default="requests")
+    parser.add_argument("--eval-rollout-unit", choices=["requests", "window", "episode", "same"], default="requests")
     parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
@@ -56,6 +57,8 @@ def main() -> None:
         "train_dual_ppo.py",
         "--seed",
         str(args.seed),
+        "--physical-seed",
+        str(args.seed if args.physical_seed is None else args.physical_seed),
         "--num-users",
         str(args.num_users),
         "--num-edge-nodes",

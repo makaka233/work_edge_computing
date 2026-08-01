@@ -71,6 +71,7 @@ class EdgeScenario:
 def generate_realistic_scenario(
     *,
     rng: np.random.Generator,
+    demand_rng: np.random.Generator | None = None,
     num_users: int,
     num_edge_nodes: int,
     num_service_types: int,
@@ -102,6 +103,8 @@ def generate_realistic_scenario(
     )
     center_weights = np.array([0.30, 0.24, 0.18, 0.16, 0.12], dtype=np.float64)
 
+    demand_rng = rng if demand_rng is None else demand_rng
+
     node_centers = rng.choice(len(centers), size=num_edge_nodes, p=center_weights)
     node_xy = centers[node_centers] + rng.normal(0.0, [3.2, 2.4], size=(num_edge_nodes, 2))
     node_xy[:, 0] = np.clip(node_xy[:, 0], 0.5, city_width_km - 0.5)
@@ -124,8 +127,8 @@ def generate_realistic_scenario(
             )
         )
 
-    user_centers = rng.choice(len(centers), size=num_users, p=center_weights)
-    user_xy = centers[user_centers] + rng.normal(0.0, [4.0, 3.0], size=(num_users, 2))
+    user_centers = demand_rng.choice(len(centers), size=num_users, p=center_weights)
+    user_xy = centers[user_centers] + demand_rng.normal(0.0, [4.0, 3.0], size=(num_users, 2))
     user_xy[:, 0] = np.clip(user_xy[:, 0], 0.0, city_width_km)
     user_xy[:, 1] = np.clip(user_xy[:, 1], 0.0, city_height_km)
     distances = _pairwise_distance(user_xy, node_xy)
@@ -137,10 +140,10 @@ def generate_realistic_scenario(
         max_service_stages=max_service_stages,
     )
 
-    base_service_popularity = rng.dirichlet(np.linspace(2.2, 0.8, num_service_types))
+    base_service_popularity = demand_rng.dirichlet(np.linspace(2.2, 0.8, num_service_types))
     users: list[User] = []
     for user_id, (x_km, y_km) in enumerate(user_xy):
-        local_bias = rng.dirichlet(np.ones(num_service_types) * 4.0)
+        local_bias = demand_rng.dirichlet(np.ones(num_service_types) * 4.0)
         weights = 0.70 * base_service_popularity + 0.30 * local_bias
         weights = weights / weights.sum()
         users.append(

@@ -27,6 +27,9 @@ kept thin. The problem model is different, so the code is specialized for:
 - Fully connected wired metro links between edge nodes, with heterogeneous
   bottleneck, ordinary metro, and backbone-like bandwidth classes so placement
   and scheduling still have visible network tradeoffs.
+- The physical edge infrastructure is fixed by `--physical-seed`: edge-node
+  positions, compute capacity, memory, storage, service catalogue, and wired
+  link bandwidth/propagation do not change during scenario refresh.
 - Request aggregation is enabled by default. The environment groups arrivals
   within a short time window by `(home_node, service_id)` and stores the number
   of underlying requests in `request_count`. Per-task latency is evaluated with
@@ -75,16 +78,16 @@ Two agent families are available:
 - `HierarchicalBaselineAgent`: deterministic baseline for sanity checks.
 - `HierarchicalPPOAgent`: trainable dual-agent DRL scaffold.
 
-The DRL version has a slow PPO agent for service-stage deployment and a fast PPO
-agent for request-level stage scheduling. The slow agent's
-`--max-replicas-per-stage` is only the action-space budget: at each replica slot
-the PPO policy chooses a node. The first slot must place at least one replica;
-later slots may repeat an already selected node, which means keeping the current
-replica count instead of placing another copy. Continuous compute and bandwidth
-allocation remains outside the neural policy and is solved by the KKT module.
+The DRL version has a slow deployment agent for service-stage deployment and a
+fast PPO agent for request-level stage scheduling. The slow deployment agent
+contains two PPO policies: `count_ppo` first chooses the replica count
+`k in [1, --max-replicas-per-stage]`, then `placement_ppo` chooses `k` distinct
+nodes under memory/storage masks. Continuous compute and bandwidth allocation
+remains outside the neural policy and is solved by the KKT module.
 
-When `--fixed-scenario` is omitted, `--scenario-refresh-episodes N` reuses the
-same generated topology, user distribution, and service preference base for N
-training episodes while the request samples still change every episode. Eval
-seeds are independent scenario seeds, giving a basic scenario-generalization
-check instead of only reporting one fixed topology.
+When `--fixed-scenario` is omitted, `--scenario-refresh-episodes N` refreshes
+only demand-side variation after N training episodes: user locations, home-node
+assignment, and service preferences may change, while the physical edge network
+remains fixed by `--physical-seed`. Request samples still change every episode.
+Eval seeds therefore check demand generalization on the same edge
+infrastructure, not a different physical network.

@@ -23,6 +23,12 @@ from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train hierarchical dual-agent PPO for edge services.")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--physical-seed",
+        type=int,
+        default=None,
+        help="Seed for fixed physical edge infrastructure: nodes, capacities, service catalogue, and wired links.",
+    )
     parser.add_argument("--fixed-scenario", action="store_true")
     parser.add_argument(
         "--scenario-refresh-episodes",
@@ -61,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         dest="replicas_per_stage",
         type=int,
         default=5,
-        help="Maximum node-selection slots the slow PPO may use per service stage; repeated selected nodes keep the current replica count.",
+        help="Maximum replicas the slow count PPO may choose per service stage.",
     )
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--slow-lr", type=float, default=3e-4)
@@ -121,6 +127,7 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
     return EdgeComputingEnv(
         EdgeEnvConfig(
             seed=args.seed + seed_offset,
+            physical_seed=args.seed if args.physical_seed is None else args.physical_seed,
             scenario_seed=scenario_seed_for_offset(args, seed_offset, group_by_refresh=group_scenario_by_refresh),
             num_users=args.num_users,
             num_edge_nodes=args.num_edge_nodes,
@@ -843,7 +850,8 @@ def save_checkpoint(agent: HierarchicalPPOAgent, path: Path, metadata: dict[str,
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "slow_agent": agent.slow_agent.ppo.policy.state_dict(),
+            "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
+            "slow_placement_agent": agent.slow_agent.placement_ppo.policy.state_dict(),
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
             "metadata": metadata,
         },
@@ -853,8 +861,12 @@ def save_checkpoint(agent: HierarchicalPPOAgent, path: Path, metadata: dict[str,
 
 def load_checkpoint(agent: HierarchicalPPOAgent, path: Path) -> dict[str, object]:
     checkpoint = torch.load(path, map_location=agent.fast_agent.ppo.device)
-    if "slow_agent" in checkpoint:
-        agent.slow_agent.ppo.policy.load_state_dict(checkpoint["slow_agent"])
+    if "slow_count_agent" in checkpoint:
+        agent.slow_agent.count_ppo.policy.load_state_dict(checkpoint["slow_count_agent"])
+    if "slow_placement_agent" in checkpoint:
+        agent.slow_agent.placement_ppo.policy.load_state_dict(checkpoint["slow_placement_agent"])
+    elif "slow_agent" in checkpoint:
+        agent.slow_agent.placement_ppo.policy.load_state_dict(checkpoint["slow_agent"])
     if "fast_agent" in checkpoint:
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
     return checkpoint.get("metadata", {})
@@ -958,10 +970,11 @@ def main() -> None:
     print(f"  fast_policy_kind={args.fast_policy_kind}")
     print(f"  rollout_unit={args.rollout_unit}")
     print(f"  eval_rollout_unit={eval_rollout_unit}")
-    print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes}")
+    print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
+    print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
-    print(f"  max_replicas_per_stage={args.replicas_per_stage} actual_replica_count=learned_by_repeated_node")
+    print(f"  max_replicas_per_stage={args.replicas_per_stage} actual_replica_count=learned_by_count_ppo")
     print(
         "  ppo slow_lr={} fast_lr={} slow_entropy={} fast_entropy={}".format(
             args.slow_lr,
@@ -1057,6 +1070,12 @@ def main() -> None:
             "slow_policy_loss": 0.0,
             "slow_value_loss": 0.0,
             "slow_approx_kl": 0.0,
+            "slow_count_loss": 0.0,
+            "slow_count_entropy": 0.0,
+            "slow_count_approx_kl": 0.0,
+            "slow_placement_loss": 0.0,
+            "slow_placement_entropy": 0.0,
+            "slow_placement_approx_kl": 0.0,
             "fast_loss": 0.0,
             "fast_policy_loss": 0.0,
             "fast_value_loss": 0.0,
@@ -1154,7 +1173,8 @@ def main() -> None:
                     progress_interval_seconds=args.progress_interval_seconds,
                 ),
             }
-            agent.slow_agent.ppo.buffer.clear()
+            agent.slow_agent.count_ppo.buffer.clear()
+            agent.slow_agent.placement_ppo.buffer.clear()
             agent.window_reward = 0.0
             agent.window_steps = 0
         else:
@@ -1218,6 +1238,12 @@ def main() -> None:
             "slow_policy_loss": losses["slow"]["policy_loss"],
             "slow_value_loss": losses["slow"]["value_loss"],
             "slow_approx_kl": losses["slow"].get("approx_kl", 0.0),
+            "slow_count_loss": losses["slow"].get("count_loss", np.nan),
+            "slow_count_entropy": losses["slow"].get("count_entropy", np.nan),
+            "slow_count_approx_kl": losses["slow"].get("count_approx_kl", np.nan),
+            "slow_placement_loss": losses["slow"].get("placement_loss", np.nan),
+            "slow_placement_entropy": losses["slow"].get("placement_entropy", np.nan),
+            "slow_placement_approx_kl": losses["slow"].get("placement_approx_kl", np.nan),
             "fast_loss": losses["fast"]["loss"],
             "fast_policy_loss": losses["fast"]["policy_loss"],
             "fast_value_loss": losses["fast"]["value_loss"],
