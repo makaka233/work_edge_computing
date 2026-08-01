@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-service-types", type=int, default=10)
     parser.add_argument("--episode-hours", type=int, default=24)
     parser.add_argument("--scenario-refresh-episodes", type=int, default=20)
+    parser.add_argument("--demand-sampling-mode", choices=["episode", "rollout"], default="episode")
     parser.add_argument("--mean-requests-per-minute", type=float, default=None)
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
@@ -69,6 +70,8 @@ def main() -> None:
         str(args.episode_hours),
         "--scenario-refresh-episodes",
         str(args.scenario_refresh_episodes),
+        "--demand-sampling-mode",
+        args.demand_sampling_mode,
         "--active-user-ratio",
         str(args.active_user_ratio),
         "--active-user-request-rate-per-minute",

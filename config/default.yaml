@@ -12,6 +12,7 @@ scenario:
   episode_hours: 24
   scenario_refresh_episodes: 20
   scenario_refresh_scope: demand_only
+  demand_sampling_mode: episode
 
 time_scales:
   slow_deployment_interval_minutes: 240

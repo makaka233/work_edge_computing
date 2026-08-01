@@ -85,9 +85,18 @@ contains two PPO policies: `count_ppo` first chooses the replica count
 nodes under memory/storage masks. Continuous compute and bandwidth allocation
 remains outside the neural policy and is solved by the KKT module.
 
-When `--fixed-scenario` is omitted, `--scenario-refresh-episodes N` refreshes
-only demand-side variation after N training episodes: user locations, home-node
-assignment, and service preferences may change, while the physical edge network
-remains fixed by `--physical-seed`. Request samples still change every episode.
-Eval seeds therefore check demand generalization on the same edge
-infrastructure, not a different physical network.
+When `--fixed-scenario` is omitted, demand-side variation can be sampled in two
+ways while the physical edge network remains fixed by `--physical-seed`.
+`--demand-sampling-mode episode` reuses one demand scenario for
+`--scenario-refresh-episodes N` training episodes. `--demand-sampling-mode
+rollout` samples a new demand scenario for every PPO rollout/update, which is
+useful for convergence checks that intentionally ignore within-day temporal
+structure. In both modes, only user locations, home-node assignment, and service
+preferences may change; nodes, capacities, service catalogue, and wired links do
+not change. Request samples still change every rollout. Eval seeds therefore
+check demand generalization on the same edge infrastructure, not a different
+physical network.
+
+Training logs include deployment size and resource diagnostics: node compute
+EWMA load, wired-link EWMA load, memory/storage deployment utilization, and the
+fraction of nodes with at least one deployed stage.

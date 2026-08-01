@@ -4,7 +4,7 @@ import csv
 from argparse import Namespace
 from pathlib import Path
 
-from train_dual_ppo import scenario_seed_for_offset
+from train_dual_ppo import demand_seed_for_training_rollout, scenario_seed_for_offset
 
 
 def test_scenario_refresh_groups_training_episodes():
@@ -14,6 +14,16 @@ def test_scenario_refresh_groups_training_episodes():
     assert scenario_seed_for_offset(args, 19, group_by_refresh=True) == 2026
     assert scenario_seed_for_offset(args, 20, group_by_refresh=True) == 2027
     assert scenario_seed_for_offset(args, 20, group_by_refresh=False) == 2046
+
+
+def test_demand_sampling_mode_controls_training_demand_seed():
+    episode_args = Namespace(seed=2026, fixed_scenario=False, scenario_refresh_episodes=20, demand_sampling_mode="episode")
+    rollout_args = Namespace(seed=2026, fixed_scenario=False, scenario_refresh_episodes=20, demand_sampling_mode="rollout")
+
+    assert demand_seed_for_training_rollout(episode_args, rollout_idx=19, episode_idx=0) == 2026
+    assert demand_seed_for_training_rollout(episode_args, rollout_idx=20, episode_idx=1) == 2026
+    assert demand_seed_for_training_rollout(rollout_args, rollout_idx=19, episode_idx=0) == 2045
+    assert demand_seed_for_training_rollout(rollout_args, rollout_idx=20, episode_idx=1) == 2046
 
 
 def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
@@ -149,7 +159,7 @@ def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollout_unit=episode" in result.stdout
-    assert "update=001 episode=001 complete=1" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026 complete=1" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -194,8 +204,8 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollout_unit=window" in result.stdout
-    assert "update=001 episode=001 complete=0 window=01" in result.stdout
-    assert "update=002 episode=001 complete=1 window=02" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026 complete=0 window=01" in result.stdout
+    assert "update=002 episode=001 demand_seed=2026 complete=1 window=02" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -207,6 +217,53 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
     assert "avg_valid_latency_s" in rows[0]
     assert "avg_penalty_latency_s" in rows[0]
     assert "invalid_action_rate" in rows[0]
+    assert "avg_node_compute_load" in rows[0]
+    assert "max_node_memory_util" in rows[0]
+
+
+def test_window_rollout_demand_sampling_resets_each_update(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "2",
+        "--rollout-unit",
+        "window",
+        "--demand-sampling-mode",
+        "rollout",
+        "--mean-requests-per-minute",
+        "2",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "8",
+        "--request-aggregation-window-seconds",
+        "60",
+        "--max-representative-groups-per-window",
+        "4",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "demand_sampling_mode=rollout" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026 complete=0 window=01" in result.stdout
+    assert "update=002 episode=002 demand_seed=2027 complete=0 window=01" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["episode"] for row in rows] == ["1", "2"]
+    assert [row["demand_seed"] for row in rows] == ["2026", "2027"]
+    assert [row["window_in_episode"] for row in rows] == ["1", "1"]
 
 
 def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):

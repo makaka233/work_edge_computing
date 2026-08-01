@@ -36,6 +36,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Without --fixed-scenario, reuse one scenario instance for this many training episodes.",
     )
+    parser.add_argument(
+        "--demand-sampling-mode",
+        choices=["episode", "rollout"],
+        default="episode",
+        help=(
+            "episode keeps the demand scenario for --scenario-refresh-episodes training episodes; "
+            "rollout samples a new demand scenario for every PPO rollout/update while keeping physical_seed fixed."
+        ),
+    )
     parser.add_argument("--num-users", type=int, default=10_000)
     parser.add_argument("--num-edge-nodes", type=int, default=32)
     parser.add_argument("--num-service-types", type=int, default=10)
@@ -123,12 +132,42 @@ def scenario_seed_for_offset(args: argparse.Namespace, seed_offset: int = 0, *, 
     return int(args.seed + scenario_offset)
 
 
+def demand_seed_for_training_rollout(args: argparse.Namespace, rollout_idx: int, episode_idx: int) -> int:
+    if getattr(args, "demand_sampling_mode", "episode") == "rollout":
+        return scenario_seed_for_offset(args, rollout_idx, group_by_refresh=False)
+    return scenario_seed_for_offset(args, episode_idx, group_by_refresh=True)
+
+
 def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_by_refresh: bool = False) -> EdgeComputingEnv:
     return EdgeComputingEnv(
         EdgeEnvConfig(
             seed=args.seed + seed_offset,
             physical_seed=args.seed if args.physical_seed is None else args.physical_seed,
             scenario_seed=scenario_seed_for_offset(args, seed_offset, group_by_refresh=group_scenario_by_refresh),
+            num_users=args.num_users,
+            num_edge_nodes=args.num_edge_nodes,
+            num_service_types=args.num_service_types,
+            episode_hours=args.episode_hours,
+            mean_requests_per_minute=args.mean_requests_per_minute,
+            active_user_ratio=args.active_user_ratio,
+            active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
+            traffic_scale=args.traffic_scale,
+            request_aggregation_window_seconds=args.request_aggregation_window_seconds,
+            max_representative_groups_per_window=args.max_representative_groups_per_window,
+            load_ewma_tau_minutes=args.load_ewma_tau_minutes,
+            wireless_uplink_mbps=args.wireless_uplink_mbps,
+            radio_rtt_ms=args.radio_rtt_ms,
+        )
+    )
+
+
+def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_idx: int) -> EdgeComputingEnv:
+    demand_seed = demand_seed_for_training_rollout(args, rollout_idx, episode_idx)
+    return EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=args.seed + rollout_idx,
+            physical_seed=args.seed if args.physical_seed is None else args.physical_seed,
+            scenario_seed=demand_seed,
             num_users=args.num_users,
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
@@ -498,6 +537,7 @@ def rollout(
         agent.flush_slow_window_reward(done=env.done)
     window_stats = _deployment_window_latency_stats(window_latencies)
     replica_stats = _deployment_replica_stats(env)
+    resource_stats = _resource_usage_stats(env)
     rollout_requests = float(env.metrics["requests"] - start_metrics.get("requests", 0.0))
     rollout_aggregate_events = float(env.metrics["aggregate_events"] - start_metrics.get("aggregate_events", 0.0))
     rollout_invalid_actions = float(env.metrics["invalid_actions"] - start_metrics.get("invalid_actions", 0.0))
@@ -526,6 +566,7 @@ def rollout(
         "deployment_updates": rollout_deployment_updates,
         **window_stats,
         **replica_stats,
+        **resource_stats,
     }
 
 
@@ -600,6 +641,59 @@ def _deployment_replica_stats(env: EdgeComputingEnv) -> dict[str, float]:
     }
 
 
+def _resource_usage_stats(env: EdgeComputingEnv) -> dict[str, float]:
+    if env.scenario is None or env.deployment is None:
+        return {
+            "avg_node_compute_load": float("nan"),
+            "max_node_compute_load": float("nan"),
+            "p95_node_compute_load": float("nan"),
+            "avg_link_load": float("nan"),
+            "max_link_load": float("nan"),
+            "p95_link_load": float("nan"),
+            "avg_node_memory_util": float("nan"),
+            "max_node_memory_util": float("nan"),
+            "avg_node_storage_util": float("nan"),
+            "max_node_storage_util": float("nan"),
+            "deployed_node_rate": float("nan"),
+        }
+
+    compute_load = np.asarray(env.node_compute_load, dtype=np.float64)
+    finite_links = np.isfinite(env.scenario.bandwidth_mb_s) & env.scenario.adjacency
+    np.fill_diagonal(finite_links, False)
+    link_load = np.asarray(env.link_load[finite_links], dtype=np.float64)
+
+    memory_used = np.zeros(env.config.num_edge_nodes, dtype=np.float64)
+    storage_used = np.zeros(env.config.num_edge_nodes, dtype=np.float64)
+    for service in env.scenario.services:
+        for stage in service.stages:
+            placed = env.deployment[service.service_id, stage.stage_id]
+            memory_used += placed * stage.memory_gb
+            storage_used += placed * stage.storage_gb
+
+    memory_capacity = np.asarray([node.memory_gb for node in env.scenario.nodes], dtype=np.float64)
+    storage_capacity = np.asarray([node.storage_gb for node in env.scenario.nodes], dtype=np.float64)
+    memory_util = memory_used / np.maximum(memory_capacity, 1e-9)
+    storage_util = storage_used / np.maximum(storage_capacity, 1e-9)
+    deployed_nodes = np.logical_or(memory_used > 0.0, storage_used > 0.0)
+
+    if link_load.size == 0:
+        link_load = np.asarray([float("nan")], dtype=np.float64)
+
+    return {
+        "avg_node_compute_load": float(np.mean(compute_load)),
+        "max_node_compute_load": float(np.max(compute_load)),
+        "p95_node_compute_load": float(np.percentile(compute_load, 95)),
+        "avg_link_load": float(np.nanmean(link_load)),
+        "max_link_load": float(np.nanmax(link_load)),
+        "p95_link_load": float(np.nanpercentile(link_load, 95)),
+        "avg_node_memory_util": float(np.mean(memory_util)),
+        "max_node_memory_util": float(np.max(memory_util)),
+        "avg_node_storage_util": float(np.mean(storage_util)),
+        "max_node_storage_util": float(np.max(storage_util)),
+        "deployed_node_rate": float(np.mean(deployed_nodes)),
+    }
+
+
 def _training_reward(
     args: argparse.Namespace,
     *,
@@ -658,6 +752,17 @@ def evaluate_agent(
     total_replicas = np.array([r["total_deployed_replicas"] for r in runs], dtype=np.float64)
     first_window_latencies = np.array([r["first_window_avg_latency_s"] for r in runs], dtype=np.float64)
     last_window_latencies = np.array([r["last_window_avg_latency_s"] for r in runs], dtype=np.float64)
+    avg_node_compute_load = np.array([r["avg_node_compute_load"] for r in runs], dtype=np.float64)
+    max_node_compute_load = np.array([r["max_node_compute_load"] for r in runs], dtype=np.float64)
+    p95_node_compute_load = np.array([r["p95_node_compute_load"] for r in runs], dtype=np.float64)
+    avg_link_load = np.array([r["avg_link_load"] for r in runs], dtype=np.float64)
+    max_link_load = np.array([r["max_link_load"] for r in runs], dtype=np.float64)
+    p95_link_load = np.array([r["p95_link_load"] for r in runs], dtype=np.float64)
+    avg_node_memory_util = np.array([r["avg_node_memory_util"] for r in runs], dtype=np.float64)
+    max_node_memory_util = np.array([r["max_node_memory_util"] for r in runs], dtype=np.float64)
+    avg_node_storage_util = np.array([r["avg_node_storage_util"] for r in runs], dtype=np.float64)
+    max_node_storage_util = np.array([r["max_node_storage_util"] for r in runs], dtype=np.float64)
+    deployed_node_rate = np.array([r["deployed_node_rate"] for r in runs], dtype=np.float64)
     return {
         "eval_avg_latency_s": float(avg_latencies.mean()),
         "eval_avg_latency_std": float(avg_latencies.std()),
@@ -677,6 +782,17 @@ def evaluate_agent(
         "eval_first_window_avg_latency_s": float(np.nanmean(first_window_latencies)),
         "eval_last_window_avg_latency_s": float(np.nanmean(last_window_latencies)),
         "eval_window_latency_delta_s": float(np.nanmean(last_window_latencies - first_window_latencies)),
+        "eval_avg_node_compute_load": float(np.nanmean(avg_node_compute_load)),
+        "eval_max_node_compute_load": float(np.nanmean(max_node_compute_load)),
+        "eval_p95_node_compute_load": float(np.nanmean(p95_node_compute_load)),
+        "eval_avg_link_load": float(np.nanmean(avg_link_load)),
+        "eval_max_link_load": float(np.nanmean(max_link_load)),
+        "eval_p95_link_load": float(np.nanmean(p95_link_load)),
+        "eval_avg_node_memory_util": float(np.nanmean(avg_node_memory_util)),
+        "eval_max_node_memory_util": float(np.nanmean(max_node_memory_util)),
+        "eval_avg_node_storage_util": float(np.nanmean(avg_node_storage_util)),
+        "eval_max_node_storage_util": float(np.nanmean(max_node_storage_util)),
+        "eval_deployed_node_rate": float(np.nanmean(deployed_node_rate)),
     }
 
 
@@ -971,6 +1087,7 @@ def main() -> None:
     print(f"  rollout_unit={args.rollout_unit}")
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
+    print(f"  demand_sampling_mode={args.demand_sampling_mode}")
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
@@ -1038,6 +1155,7 @@ def main() -> None:
         initial_row = {
             "update": 0,
             "episode": 0,
+            "demand_seed": scenario_seed_for_offset(args, 0),
             "window_in_episode": 0,
             "requests": 0,
             "aggregate_events": 0,
@@ -1063,6 +1181,17 @@ def main() -> None:
             "max_replicas_per_stage": np.nan,
             "single_replica_stage_rate": np.nan,
             "total_deployed_replicas": np.nan,
+            "avg_node_compute_load": np.nan,
+            "max_node_compute_load": np.nan,
+            "p95_node_compute_load": np.nan,
+            "avg_link_load": np.nan,
+            "max_link_load": np.nan,
+            "p95_link_load": np.nan,
+            "avg_node_memory_util": np.nan,
+            "max_node_memory_util": np.nan,
+            "avg_node_storage_util": np.nan,
+            "max_node_storage_util": np.nan,
+            "deployed_node_rate": np.nan,
             "first_window_avg_latency_s": np.nan,
             "last_window_avg_latency_s": np.nan,
             "window_latency_delta_s": np.nan,
@@ -1095,6 +1224,17 @@ def main() -> None:
             "eval_avg_replicas_per_stage": eval_stats["eval_avg_replicas_per_stage"],
             "eval_single_replica_stage_rate": eval_stats["eval_single_replica_stage_rate"],
             "eval_total_deployed_replicas": eval_stats["eval_total_deployed_replicas"],
+            "eval_avg_node_compute_load": eval_stats["eval_avg_node_compute_load"],
+            "eval_max_node_compute_load": eval_stats["eval_max_node_compute_load"],
+            "eval_p95_node_compute_load": eval_stats["eval_p95_node_compute_load"],
+            "eval_avg_link_load": eval_stats["eval_avg_link_load"],
+            "eval_max_link_load": eval_stats["eval_max_link_load"],
+            "eval_p95_link_load": eval_stats["eval_p95_link_load"],
+            "eval_avg_node_memory_util": eval_stats["eval_avg_node_memory_util"],
+            "eval_max_node_memory_util": eval_stats["eval_max_node_memory_util"],
+            "eval_avg_node_storage_util": eval_stats["eval_avg_node_storage_util"],
+            "eval_max_node_storage_util": eval_stats["eval_max_node_storage_util"],
+            "eval_deployed_node_rate": eval_stats["eval_deployed_node_rate"],
             "eval_first_window_avg_latency_s": eval_stats["eval_first_window_avg_latency_s"],
             "eval_last_window_avg_latency_s": eval_stats["eval_last_window_avg_latency_s"],
             "eval_window_latency_delta_s": eval_stats["eval_window_latency_delta_s"],
@@ -1128,12 +1268,18 @@ def main() -> None:
     total_windows = max(int(np.ceil(args.episode_hours * 60.0 / 240.0)), 1)
     for update in range(args.updates):
         if args.rollout_unit == "window":
-            if train_env is None or train_env.done:
-                train_env = build_env(args, seed_offset=train_episode_idx, group_scenario_by_refresh=True)
+            if args.demand_sampling_mode == "rollout":
+                train_env = build_training_env(args, rollout_idx=update, episode_idx=update)
                 train_env.reset()
+                episode_number = update + 1
+            else:
+                if train_env is None or train_env.done:
+                    train_env = build_training_env(args, rollout_idx=update, episode_idx=train_episode_idx)
+                    train_env.reset()
+                episode_number = train_episode_idx + 1
             env = train_env
-            episode_number = train_episode_idx + 1
             window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
+            demand_seed = demand_seed_for_training_rollout(args, update, train_episode_idx if args.demand_sampling_mode == "episode" else update)
             progress_label = (
                 f"update={update + 1:03d}/{args.updates:03d} "
                 f"ep={episode_number:03d} win={window_in_episode:02d}/{total_windows:02d}"
@@ -1151,8 +1297,9 @@ def main() -> None:
                 reset_env=False,
             )
         else:
-            env = build_env(args, seed_offset=update, group_scenario_by_refresh=True)
+            env = build_training_env(args, rollout_idx=update, episode_idx=update)
             episode_number = update + 1
+            demand_seed = demand_seed_for_training_rollout(args, update, update)
             stats = rollout(
                 env,
                 agent,
@@ -1206,6 +1353,7 @@ def main() -> None:
         log_row = {
             "update": update + 1,
             "episode": episode_number,
+            "demand_seed": demand_seed,
             "window_in_episode": window_in_episode,
             "requests": int(stats["requests"]),
             "aggregate_events": int(stats["aggregate_events"]),
@@ -1231,6 +1379,17 @@ def main() -> None:
             "max_replicas_per_stage": stats["max_replicas_per_stage"],
             "single_replica_stage_rate": stats["single_replica_stage_rate"],
             "total_deployed_replicas": stats["total_deployed_replicas"],
+            "avg_node_compute_load": stats["avg_node_compute_load"],
+            "max_node_compute_load": stats["max_node_compute_load"],
+            "p95_node_compute_load": stats["p95_node_compute_load"],
+            "avg_link_load": stats["avg_link_load"],
+            "max_link_load": stats["max_link_load"],
+            "p95_link_load": stats["p95_link_load"],
+            "avg_node_memory_util": stats["avg_node_memory_util"],
+            "max_node_memory_util": stats["max_node_memory_util"],
+            "avg_node_storage_util": stats["avg_node_storage_util"],
+            "max_node_storage_util": stats["max_node_storage_util"],
+            "deployed_node_rate": stats["deployed_node_rate"],
             "first_window_avg_latency_s": stats["first_window_avg_latency_s"],
             "last_window_avg_latency_s": stats["last_window_avg_latency_s"],
             "window_latency_delta_s": stats["window_latency_delta_s"],
@@ -1263,6 +1422,17 @@ def main() -> None:
             "eval_avg_replicas_per_stage": eval_stats.get("eval_avg_replicas_per_stage", np.nan),
             "eval_single_replica_stage_rate": eval_stats.get("eval_single_replica_stage_rate", np.nan),
             "eval_total_deployed_replicas": eval_stats.get("eval_total_deployed_replicas", np.nan),
+            "eval_avg_node_compute_load": eval_stats.get("eval_avg_node_compute_load", np.nan),
+            "eval_max_node_compute_load": eval_stats.get("eval_max_node_compute_load", np.nan),
+            "eval_p95_node_compute_load": eval_stats.get("eval_p95_node_compute_load", np.nan),
+            "eval_avg_link_load": eval_stats.get("eval_avg_link_load", np.nan),
+            "eval_max_link_load": eval_stats.get("eval_max_link_load", np.nan),
+            "eval_p95_link_load": eval_stats.get("eval_p95_link_load", np.nan),
+            "eval_avg_node_memory_util": eval_stats.get("eval_avg_node_memory_util", np.nan),
+            "eval_max_node_memory_util": eval_stats.get("eval_max_node_memory_util", np.nan),
+            "eval_avg_node_storage_util": eval_stats.get("eval_avg_node_storage_util", np.nan),
+            "eval_max_node_storage_util": eval_stats.get("eval_max_node_storage_util", np.nan),
+            "eval_deployed_node_rate": eval_stats.get("eval_deployed_node_rate", np.nan),
             "eval_first_window_avg_latency_s": eval_stats.get("eval_first_window_avg_latency_s", np.nan),
             "eval_last_window_avg_latency_s": eval_stats.get("eval_last_window_avg_latency_s", np.nan),
             "eval_window_latency_delta_s": eval_stats.get("eval_window_latency_delta_s", np.nan),
@@ -1275,11 +1445,14 @@ def main() -> None:
         }
         append_log(log_path, log_row)
         print(
-            "update={:03d} episode={:03d} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} episode={:03d} demand_seed={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
-            "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} slow_loss={:.4f} fast_loss={:.4f}".format(
+            "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
+            "node_load={:.1%}/{:.1%} link_load={:.1%}/{:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} "
+            "slow_loss={:.4f} fast_loss={:.4f}".format(
                 update + 1,
                 episode_number,
+                demand_seed,
                 int(stats["episode_complete"]),
                 window_in_episode,
                 int(stats["requests"]),
@@ -1298,13 +1471,22 @@ def main() -> None:
                 stats["min_replicas_per_stage"],
                 stats["max_replicas_per_stage"],
                 stats["single_replica_stage_rate"],
+                stats["avg_node_compute_load"],
+                stats["max_node_compute_load"],
+                stats["avg_link_load"],
+                stats["max_link_load"],
+                stats["avg_node_memory_util"],
+                stats["max_node_memory_util"],
+                stats["avg_node_storage_util"],
+                stats["max_node_storage_util"],
                 losses["slow"]["loss"],
                 losses["fast"]["loss"],
             )
         )
         if eval_stats:
             print(
-                "  eval_mean_latency={:.4f}s eval_valid_latency={:.4f}s eval_penalty_latency={:.4f}s eval_std={:.4f}s eval_p95={:.4f}s invalid={:.2f} eval_replicas={:.2f} single={:.1%} entropy={:.4f} action_change={:.4f}".format(
+                "  eval_mean_latency={:.4f}s eval_valid_latency={:.4f}s eval_penalty_latency={:.4f}s eval_std={:.4f}s eval_p95={:.4f}s invalid={:.2f} "
+                "eval_replicas={:.2f} single={:.1%} node_load={:.1%}/{:.1%} link_load={:.1%}/{:.1%} entropy={:.4f} action_change={:.4f}".format(
                     eval_stats["eval_avg_latency_s"],
                     eval_stats["eval_avg_valid_latency_s"],
                     eval_stats["eval_avg_penalty_latency_s"],
@@ -1313,6 +1495,10 @@ def main() -> None:
                     eval_stats["eval_invalid_actions"],
                     eval_stats["eval_avg_replicas_per_stage"],
                     eval_stats["eval_single_replica_stage_rate"],
+                    eval_stats["eval_avg_node_compute_load"],
+                    eval_stats["eval_max_node_compute_load"],
+                    eval_stats["eval_avg_link_load"],
+                    eval_stats["eval_max_link_load"],
                     diagnostic_stats.get("eval_policy_entropy", np.nan),
                     diagnostic_stats.get("eval_action_change_rate", np.nan),
                 )
