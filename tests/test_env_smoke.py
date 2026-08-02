@@ -322,6 +322,43 @@ def test_aggregation_does_not_inflate_single_task_latency():
     assert single_info["compute_demands"][0].compute_gcycles == grouped_info["compute_demands"][0].compute_gcycles
 
 
+def test_task_load_scales_request_compute_and_data():
+    base_env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=46,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            request_aggregation_window_seconds=0.0,
+        )
+    )
+    heavy_env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=46,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            request_aggregation_window_seconds=0.0,
+            task_compute_scale=2.0,
+            task_data_scale=3.0,
+        )
+    )
+    base_env.reset()
+    heavy_env.reset()
+    base_request = base_env.current_request
+    heavy_request = heavy_env.current_request
+    assert base_request is not None
+    assert heavy_request is not None
+
+    assert heavy_request.service_id == base_request.service_id
+    assert heavy_request.home_node == base_request.home_node
+    assert heavy_request.input_mb > base_request.input_mb
+    assert sum(heavy_request.stage_compute_gcycles) > sum(base_request.stage_compute_gcycles)
+    assert sum(heavy_request.stage_output_mb) > sum(base_request.stage_output_mb)
+
+
 def test_representative_group_sampling_preserves_window_request_count():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

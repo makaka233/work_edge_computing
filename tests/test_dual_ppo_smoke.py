@@ -6,7 +6,7 @@ from train_dual_ppo import rollout
 
 
 def test_observation_dimensions():
-    assert slow_obs_dim(16, 3) == 6 + 16 * 5 + 16 * 3
+    assert slow_obs_dim(16, 3) == 8 + 16 * 5 + 16 * 3
     assert fast_obs_dim(16) == 9 + 16 * 5 + 16 * 16 * 3
 
 

@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
     parser.add_argument("--traffic-scale", type=float, default=1.0)
+    parser.add_argument("--task-compute-scale", type=float, default=1.0)
+    parser.add_argument("--task-data-scale", type=float, default=1.0)
     parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
     parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
@@ -165,6 +167,8 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             active_user_ratio=args.active_user_ratio,
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
             traffic_scale=args.traffic_scale,
+            task_compute_scale=args.task_compute_scale,
+            task_data_scale=args.task_data_scale,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             max_representative_groups_per_window=args.max_representative_groups_per_window,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
@@ -189,6 +193,8 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             active_user_ratio=args.active_user_ratio,
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
             traffic_scale=args.traffic_scale,
+            task_compute_scale=args.task_compute_scale,
+            task_data_scale=args.task_data_scale,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             max_representative_groups_per_window=args.max_representative_groups_per_window,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
@@ -878,6 +884,46 @@ def evaluate_agent(
     }
 
 
+EVAL_STAT_KEYS = [
+    "eval_avg_latency_s",
+    "eval_avg_latency_std",
+    "eval_p95_latency_s",
+    "eval_avg_valid_latency_s",
+    "eval_p95_valid_latency_s",
+    "eval_avg_penalty_latency_s",
+    "eval_penalty_latency_share",
+    "eval_invalid_actions",
+    "eval_invalid_action_rate",
+    "eval_deadline_violation_rate",
+    "eval_deployment_updates",
+    "eval_aggregate_events",
+    "eval_avg_replicas_per_stage",
+    "eval_single_replica_stage_rate",
+    "eval_total_deployed_replicas",
+    "eval_first_window_avg_latency_s",
+    "eval_last_window_avg_latency_s",
+    "eval_window_latency_delta_s",
+    "eval_avg_node_compute_load",
+    "eval_max_node_compute_load",
+    "eval_p95_node_compute_load",
+    "eval_avg_link_load",
+    "eval_max_link_load",
+    "eval_p95_link_load",
+    "eval_avg_node_memory_util",
+    "eval_max_node_memory_util",
+    "eval_avg_node_storage_util",
+    "eval_max_node_storage_util",
+    "eval_deployed_node_rate",
+]
+
+
+def prefix_eval_stats(stats: dict[str, float], prefix: str) -> dict[str, float]:
+    return {
+        f"{prefix}{key.removeprefix('eval_')}": value
+        for key, value in ((key, stats.get(key, float("nan"))) for key in EVAL_STAT_KEYS)
+    }
+
+
 def evaluate_policy_diagnostics(
     args: argparse.Namespace,
     agent: HierarchicalPPOAgent,
@@ -1225,6 +1271,14 @@ def main() -> None:
         )
 
     if args.eval_before_training and args.eval_interval:
+        seen_eval_stats = evaluate_agent(
+            args,
+            agent,
+            seed_base=0,
+            max_requests=args.eval_requests,
+            train_mode=args.train_mode,
+            rollout_unit=eval_rollout_unit,
+        )
         eval_stats = evaluate_agent(
             args,
             agent,
@@ -1330,6 +1384,7 @@ def main() -> None:
             "eval_first_window_avg_latency_s": eval_stats["eval_first_window_avg_latency_s"],
             "eval_last_window_avg_latency_s": eval_stats["eval_last_window_avg_latency_s"],
             "eval_window_latency_delta_s": eval_stats["eval_window_latency_delta_s"],
+            **prefix_eval_stats(seen_eval_stats, "seen_eval_"),
             **diagnostic_stats,
         }
         append_log(log_path, initial_row)
@@ -1445,7 +1500,16 @@ def main() -> None:
                 progress_interval_seconds=args.progress_interval_seconds,
             )
         eval_stats = {}
+        seen_eval_stats = {}
         if args.eval_interval and (update + 1) % args.eval_interval == 0:
+            seen_eval_stats = evaluate_agent(
+                args,
+                agent,
+                seed_base=0,
+                max_requests=args.eval_requests,
+                train_mode=args.train_mode,
+                rollout_unit=eval_rollout_unit,
+            )
             eval_stats = evaluate_agent(
                 args,
                 agent,
@@ -1559,6 +1623,7 @@ def main() -> None:
             "eval_action_change_rate": diagnostic_stats.get("eval_action_change_rate", np.nan),
             "eval_stochastic_avg_latency_s": diagnostic_stats.get("eval_stochastic_avg_latency_s", np.nan),
             "eval_deterministic_avg_latency_s": diagnostic_stats.get("eval_deterministic_avg_latency_s", np.nan),
+            **prefix_eval_stats(seen_eval_stats, "seen_eval_"),
         }
         append_log(log_path, log_row)
         print(
@@ -1620,6 +1685,15 @@ def main() -> None:
                     eval_stats["eval_max_link_load"],
                     diagnostic_stats.get("eval_policy_entropy", np.nan),
                     diagnostic_stats.get("eval_action_change_rate", np.nan),
+                )
+            )
+            print(
+                "  seen_eval_mean_latency={:.4f}s seen_eval_p95={:.4f}s seen_eval_replicas={:.2f} seen_eval_node_load={:.1%}/{:.1%}".format(
+                    seen_eval_stats["eval_avg_latency_s"],
+                    seen_eval_stats["eval_p95_latency_s"],
+                    seen_eval_stats["eval_avg_replicas_per_stage"],
+                    seen_eval_stats["eval_avg_node_compute_load"],
+                    seen_eval_stats["eval_max_node_compute_load"],
                 )
             )
         selection_latency = eval_stats.get("eval_avg_latency_s", stats["avg_latency_s"])

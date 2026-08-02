@@ -24,6 +24,8 @@ class EdgeEnvConfig:
     active_user_ratio: float = 0.15
     active_user_request_rate_per_minute: float = 1.5
     traffic_scale: float = 1.0
+    task_compute_scale: float = 1.0
+    task_data_scale: float = 1.0
     request_aggregation_window_seconds: float = 10.0
     max_representative_groups_per_window: int | None = 16
     load_ewma_tau_minutes: float = 1.0
@@ -48,6 +50,10 @@ class EdgeEnvConfig:
             raise ValueError("active_user_request_rate_per_minute must be positive.")
         if self.traffic_scale <= 0:
             raise ValueError("traffic_scale must be positive.")
+        if self.task_compute_scale <= 0:
+            raise ValueError("task_compute_scale must be positive.")
+        if self.task_data_scale <= 0:
+            raise ValueError("task_data_scale must be positive.")
         if self.request_aggregation_window_seconds < 0:
             raise ValueError("request_aggregation_window_seconds must be non-negative.")
         if self.max_representative_groups_per_window is not None and self.max_representative_groups_per_window <= 0:
@@ -396,6 +402,8 @@ class EdgeComputingEnv:
             arrival_minute=self.current_time_minute,
             users=self.scenario.users if self.scenario else [],
             services=self.scenario.services if self.scenario else [],
+            task_compute_scale=self.config.task_compute_scale,
+            task_data_scale=self.config.task_data_scale,
         )
         self.request_counter += 1
         return request
@@ -429,6 +437,8 @@ class EdgeComputingEnv:
                     home_node=int(home_node),
                     service_id=int(service_id),
                     services=self.scenario.services,
+                    task_compute_scale=self.config.task_compute_scale,
+                    task_data_scale=self.config.task_data_scale,
                 )
             )
             self.request_counter += 1

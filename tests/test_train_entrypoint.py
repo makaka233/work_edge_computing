@@ -354,6 +354,7 @@ def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
         rows = list(csv.DictReader(handle))
     assert [row["update"] for row in rows] == ["1"]
     assert rows[0]["eval_avg_latency_s"] != "nan"
+    assert rows[0]["seen_eval_avg_latency_s"] != "nan"
 
 
 def test_convergence_analyzer_reads_training_log(tmp_path):

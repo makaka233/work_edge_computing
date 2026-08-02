@@ -198,6 +198,8 @@ def generate_request(
     users: Sequence[User],
     services: Sequence[Service],
     request_count: int = 1,
+    task_compute_scale: float = 1.0,
+    task_data_scale: float = 1.0,
 ) -> TaskRequest:
     user = users[int(rng.integers(0, len(users)))]
     service_id = int(rng.choice(len(services), p=np.array(user.service_weights)))
@@ -210,6 +212,8 @@ def generate_request(
         home_node=user.home_node,
         service_id=service_id,
         services=services,
+        task_compute_scale=task_compute_scale,
+        task_data_scale=task_data_scale,
     )
 
 
@@ -223,15 +227,17 @@ def generate_grouped_request(
     home_node: int,
     service_id: int,
     services: Sequence[Service],
+    task_compute_scale: float = 1.0,
+    task_data_scale: float = 1.0,
 ) -> TaskRequest:
     service = services[service_id]
 
-    input_mb = float(rng.lognormal(np.log(service.input_mb_mean), 0.35))
+    input_mb = float(rng.lognormal(np.log(service.input_mb_mean * task_data_scale), 0.35))
     stage_compute = []
     stage_output = []
     for stage in service.stages:
-        stage_compute.append(float(rng.lognormal(np.log(stage.compute_gcycles_mean), 0.30)))
-        stage_output.append(float(rng.lognormal(np.log(stage.output_mb_mean), 0.35)))
+        stage_compute.append(float(rng.lognormal(np.log(stage.compute_gcycles_mean * task_compute_scale), 0.30)))
+        stage_output.append(float(rng.lognormal(np.log(stage.output_mb_mean * task_data_scale), 0.35)))
 
     deadline_s = float(rng.lognormal(np.log(service.deadline_s_mean), 0.18))
     deadline_s = float(np.clip(deadline_s, 0.05, 0.60))

@@ -21,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
     parser.add_argument("--traffic-scale", type=float, default=1.0)
+    parser.add_argument("--task-compute-scale", type=float, default=1.0)
+    parser.add_argument("--task-data-scale", type=float, default=1.0)
     parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
     parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
@@ -83,6 +85,10 @@ def main() -> None:
         str(args.active_user_request_rate_per_minute),
         "--traffic-scale",
         str(args.traffic_scale),
+        "--task-compute-scale",
+        str(args.task_compute_scale),
+        "--task-data-scale",
+        str(args.task_data_scale),
         "--request-aggregation-window-seconds",
         str(args.request_aggregation_window_seconds),
         "--max-representative-groups-per-window",

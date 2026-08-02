@@ -101,6 +101,19 @@ Training logs include deployment size and resource diagnostics: node compute
 EWMA load, wired-link EWMA load, memory/storage deployment utilization, and the
 fraction of nodes with at least one deployed stage.
 
+Demand-side load can be raised without changing physical infrastructure. Use
+`--traffic-scale`, `--active-user-ratio`, and
+`--active-user-request-rate-per-minute` to increase arrival volume. Use
+`--task-compute-scale` and `--task-data-scale` to make each sampled task heavier
+in CPU cycles or transferred data. These parameters affect request demand only;
+node locations, node capacities, service catalogue, and wired links remain fixed
+by `--physical-seed`.
+
+At each eval interval, `eval_*` fields report held-out demand seeds, while
+`seen_eval_*` fields report fixed demand seeds from the training distribution.
+This separates optimization on familiar demand profiles from demand
+generalization on unseen profiles.
+
 For high-variance demand-randomized PPO, `--rollouts-per-update K` can collect
 multiple independent 4h rollout windows before one optimizer update. This is
 closer to batched PPO sampling than updating after a single demand seed, and it

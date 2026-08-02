@@ -10,7 +10,7 @@ from edge_drl.models.ppo import PPOAgent
 
 
 def slow_obs_dim(num_nodes: int, num_service_types: int) -> int:
-    return 6 + num_nodes * 5 + num_nodes * num_service_types
+    return 8 + num_nodes * 5 + num_nodes * num_service_types
 
 
 def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
@@ -211,6 +211,9 @@ class SlowDeploymentPPOAgent:
             replica_idx / max(self.replicas_per_stage - 1, 1),
             env.current_time_minute / max(env.config.episode_hours * 60, 1),
             len(env.scenario.services[service_id].stages) / self.max_service_stages,
+            np.log1p(env._arrival_rate_per_minute()) / np.log1p(20_000.0),
+            np.log1p(env._arrival_rate_per_minute() * env.config.deployment_interval_minutes)
+            / np.log1p(5_000_000.0),
             1.0,
         ]
         return np.asarray(scalars + node_features + demand.reshape(-1).tolist(), dtype=np.float32)
@@ -220,8 +223,9 @@ class SlowDeploymentPPOAgent:
         demand = np.zeros((self.num_nodes, self.num_service_types), dtype=np.float32)
         for user in env.scenario.users:
             demand[user.home_node] += np.asarray(user.service_weights, dtype=np.float32)
-        demand /= max(demand.max(), 1e-9)
-        return demand
+        demand /= max(float(len(env.scenario.users)), 1.0)
+        demand *= float(env._arrival_rate_per_minute())
+        return np.log1p(demand) / np.log1p(500.0)
 
     def _build_count_mask(
         self,

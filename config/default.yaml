@@ -27,6 +27,8 @@ traffic:
   active_user_ratio: 0.15
   active_user_request_rate_per_minute: 1.5
   traffic_scale: 1.0
+  task_compute_scale: 1.0
+  task_data_scale: 1.0
   request_aggregation_window_seconds: 10.0
   max_representative_groups_per_window: 16
   load_ewma_tau_minutes: 1.0
