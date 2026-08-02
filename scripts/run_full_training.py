@@ -21,6 +21,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
     parser.add_argument("--traffic-scale", type=float, default=1.0)
+    parser.add_argument("--load-multipliers", type=str, default="1.0")
+    parser.add_argument("--rollout-start-mode", choices=["beginning", "cycle-window", "random-window"], default="beginning")
+    parser.add_argument(
+        "--eval-rollout-start-mode",
+        choices=["same", "beginning", "cycle-window", "random-window"],
+        default="same",
+    )
     parser.add_argument("--task-compute-scale", type=float, default=1.0)
     parser.add_argument("--task-data-scale", type=float, default=1.0)
     parser.add_argument("--node-compute-capacity-scale", type=float, default=1.0)
@@ -95,6 +102,12 @@ def main() -> None:
         str(args.active_user_request_rate_per_minute),
         "--traffic-scale",
         str(args.traffic_scale),
+        "--load-multipliers",
+        args.load_multipliers,
+        "--rollout-start-mode",
+        args.rollout_start_mode,
+        "--eval-rollout-start-mode",
+        args.eval_rollout_start_mode,
         "--task-compute-scale",
         str(args.task_compute_scale),
         "--task-data-scale",

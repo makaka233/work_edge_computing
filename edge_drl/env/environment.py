@@ -24,6 +24,7 @@ class EdgeEnvConfig:
     active_user_ratio: float = 0.15
     active_user_request_rate_per_minute: float = 1.5
     traffic_scale: float = 1.0
+    demand_load_multiplier: float = 1.0
     task_compute_scale: float = 1.0
     task_data_scale: float = 1.0
     node_compute_capacity_scale: float = 1.0
@@ -52,6 +53,8 @@ class EdgeEnvConfig:
             raise ValueError("active_user_request_rate_per_minute must be positive.")
         if self.traffic_scale <= 0:
             raise ValueError("traffic_scale must be positive.")
+        if self.demand_load_multiplier <= 0:
+            raise ValueError("demand_load_multiplier must be positive.")
         if self.task_compute_scale <= 0:
             raise ValueError("task_compute_scale must be positive.")
         if self.task_data_scale <= 0:
@@ -504,12 +507,13 @@ class EdgeComputingEnv:
 
     def _base_arrival_rate_per_minute(self) -> float:
         if self.config.mean_requests_per_minute is not None:
-            return self.config.mean_requests_per_minute
+            return self.config.mean_requests_per_minute * self.config.demand_load_multiplier
         return (
             self.config.num_users
             * self.config.active_user_ratio
             * self.config.active_user_request_rate_per_minute
             * self.config.traffic_scale
+            * self.config.demand_load_multiplier
         )
 
     def _update_dynamic_loads(self, info: dict[str, Any], *, request_count: float) -> None:

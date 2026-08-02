@@ -24,6 +24,9 @@ kept thin. The problem model is different, so the code is specialized for:
 - City-scale traffic derived from active users by default, with a daily
   morning/lunch/evening curve. Use `--traffic-scale` above 1.0 to create
   heavier congestion.
+- Demand pressure can be deliberately batched across PPO rollouts with
+  `--load-multipliers` and `--rollout-start-mode cycle-window`, so one update
+  can cover multiple traffic levels and 4-hour deployment windows.
 - Fully connected wired metro links between edge nodes, with heterogeneous
   bottleneck, ordinary metro, and backbone-like bandwidth classes so placement
   and scheduling still have visible network tradeoffs.
@@ -57,7 +60,7 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --demand-sampling-mode rollout --rollouts-per-update 8 --updates 120 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 3.5 --task-compute-scale 2.0 --task-data-scale 3.0 --node-compute-capacity-scale 0.65 --wired-link-bandwidth-scale 0.25 --eval-interval 10 --eval-seeds 5 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --max-representative-groups-per-window 8 --compute-hotspot-coef 0.08 --link-hotspot-coef 0.04 --compute-imbalance-coef 0.02 --link-imbalance-coef 0.01 --idle-deployed-node-coef 0.01 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --run-name joint_gat_city32_svc10_resource_efficiency --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode joint --rollout-unit window --demand-sampling-mode rollout --rollouts-per-update 4 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 4.0 --load-multipliers 1.0,1.35,1.7,2.1 --rollout-start-mode cycle-window --eval-rollout-unit window --eval-rollout-start-mode same --task-compute-scale 2.8 --task-data-scale 5.0 --node-compute-capacity-scale 0.45 --wired-link-bandwidth-scale 0.10 --eval-interval 10 --eval-seeds 4 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --max-representative-groups-per-window 8 --compute-hotspot-threshold 0.45 --link-hotspot-threshold 0.35 --compute-hotspot-coef 0.12 --link-hotspot-coef 0.08 --compute-imbalance-coef 0.04 --link-imbalance-coef 0.03 --idle-deployed-node-coef 0.04 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --fast-minibatch-size 1024 --device cuda --run-name joint_gat_city32_svc10_strong_pressure --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
@@ -115,6 +118,10 @@ in CPU cycles or transferred data. Use `--node-compute-capacity-scale` and
 `--wired-link-bandwidth-scale` below 1.0 when the fixed physical environment is
 too over-provisioned for the desired experiment. These capacity scales are part
 of the fixed physical scenario for a run and remain tied to `--physical-seed`.
+For convergence experiments, prefer `--rollout-start-mode cycle-window` with a
+four-value `--load-multipliers` list when `--rollouts-per-update 4`; this makes
+each PPO update see several pressure levels instead of repeatedly sampling the
+same low-load 0:00-4:00 window.
 
 The optimizer reward remains latency-centered by default:
 `train_reward = -latency_s`. Resource-efficiency shaping can be enabled with

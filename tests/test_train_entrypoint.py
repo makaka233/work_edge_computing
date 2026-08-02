@@ -4,7 +4,13 @@ import csv
 from argparse import Namespace
 from pathlib import Path
 
-from train_dual_ppo import demand_seed_for_training_rollout, effective_replicas_per_stage, scenario_seed_for_offset
+from train_dual_ppo import (
+    demand_seed_for_training_rollout,
+    effective_replicas_per_stage,
+    load_multiplier_for_rollout,
+    rollout_start_minute,
+    scenario_seed_for_offset,
+)
 
 
 def test_scenario_refresh_groups_training_episodes():
@@ -32,6 +38,19 @@ def test_zero_replica_cap_uses_node_count():
 
     explicit_args = Namespace(replicas_per_stage=5, num_edge_nodes=32)
     assert effective_replicas_per_stage(explicit_args) == 5
+
+
+def test_rollout_load_and_start_modes_cycle():
+    args = Namespace(
+        seed=2026,
+        load_multipliers="1.0,1.5,2.0",
+        rollout_start_mode="cycle-window",
+        eval_rollout_start_mode="same",
+        episode_hours=24,
+    )
+
+    assert [load_multiplier_for_rollout(args, idx) for idx in range(5)] == [1.0, 1.5, 2.0, 1.0, 1.5]
+    assert [rollout_start_minute(args, idx) for idx in range(7)] == [0.0, 240.0, 480.0, 720.0, 960.0, 1200.0, 0.0]
 
 
 def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
@@ -179,7 +198,7 @@ def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollout_unit=episode" in result.stdout
-    assert "update=001 episode=001 demand_seed=2026-2026 rollouts=1 complete=1" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026-2026 load=1.00-1.00 start_min=0-0 rollouts=1 complete=1" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -224,8 +243,8 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollout_unit=window" in result.stdout
-    assert "update=001 episode=001 demand_seed=2026-2026 rollouts=1 complete=0 window=01" in result.stdout
-    assert "update=002 episode=001 demand_seed=2026-2026 rollouts=1 complete=1 window=02" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026-2026 load=1.00-1.00 start_min=0-0 rollouts=1 complete=0 window=01" in result.stdout
+    assert "update=002 episode=001 demand_seed=2026-2026 load=1.00-1.00 start_min=0-0 rollouts=1 complete=1 window=02" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -239,6 +258,8 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
     assert "avg_penalty_latency_s" in rows[0]
     assert "invalid_action_rate" in rows[0]
     assert "avg_node_compute_load" in rows[0]
+    assert "load_multiplier" in rows[0]
+    assert "start_minute" in rows[0]
     assert "max_node_memory_util" in rows[0]
 
 
@@ -277,8 +298,8 @@ def test_window_rollout_demand_sampling_resets_each_update(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "demand_sampling_mode=rollout" in result.stdout
-    assert "update=001 episode=001 demand_seed=2026-2026 rollouts=1 complete=0 window=01" in result.stdout
-    assert "update=002 episode=002 demand_seed=2027-2027 rollouts=1 complete=0 window=01" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026-2026 load=1.00-1.00 start_min=0-0 rollouts=1 complete=0 window=01" in result.stdout
+    assert "update=002 episode=002 demand_seed=2027-2027 load=1.00-1.00 start_min=0-0 rollouts=1 complete=0 window=01" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -325,13 +346,65 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollouts_per_update=2" in result.stdout
-    assert "update=001 episode=002 demand_seed=2026-2027 rollouts=2 complete=0 window=01" in result.stdout
+    assert "update=001 episode=002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=0 window=01" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[-1]["rollouts_collected"] == "2"
     assert rows[-1]["demand_seed"] == "2026"
     assert rows[-1]["demand_seed_end"] == "2027"
+
+
+def test_rollouts_per_update_batches_pressure_levels_and_start_windows(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--rollout-unit",
+        "window",
+        "--demand-sampling-mode",
+        "rollout",
+        "--rollouts-per-update",
+        "2",
+        "--load-multipliers",
+        "1.0,1.5",
+        "--rollout-start-mode",
+        "cycle-window",
+        "--mean-requests-per-minute",
+        "2",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "8",
+        "--request-aggregation-window-seconds",
+        "60",
+        "--max-representative-groups-per-window",
+        "4",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "load_multipliers=1.0,1.5" in result.stdout
+    assert "rollout_start_mode=cycle-window" in result.stdout
+    assert "load=1.00-1.50 start_min=0-240" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[-1]["load_multiplier"] == "1.0"
+    assert rows[-1]["load_multiplier_end"] == "1.5"
+    assert rows[-1]["start_minute"] == "0.0"
+    assert rows[-1]["start_minute_end"] == "240.0"
 
 
 def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):

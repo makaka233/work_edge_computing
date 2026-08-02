@@ -27,6 +27,9 @@ traffic:
   active_user_ratio: 0.15
   active_user_request_rate_per_minute: 1.5
   traffic_scale: 1.0
+  load_multipliers: [1.0]
+  rollout_start_mode: beginning
+  eval_rollout_start_mode: same
   task_compute_scale: 1.0
   task_data_scale: 1.0
   node_compute_capacity_scale: 1.0

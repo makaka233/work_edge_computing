@@ -53,6 +53,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
     parser.add_argument("--traffic-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--load-multipliers",
+        type=str,
+        default="1.0",
+        help="Comma-separated demand load multipliers cycled across rollout seeds, e.g. 1.0,1.4,1.8,2.2.",
+    )
+    parser.add_argument(
+        "--rollout-start-mode",
+        choices=["beginning", "cycle-window", "random-window"],
+        default="beginning",
+        help="Initial time for each training rollout. cycle/random-window covers different 4h deployment windows.",
+    )
+    parser.add_argument(
+        "--eval-rollout-start-mode",
+        choices=["same", "beginning", "cycle-window", "random-window"],
+        default="same",
+        help="Initial time for eval rollouts. same reuses --rollout-start-mode.",
+    )
     parser.add_argument("--task-compute-scale", type=float, default=1.0)
     parser.add_argument("--task-data-scale", type=float, default=1.0)
     parser.add_argument(
@@ -157,6 +175,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--rollouts-per-update must be >= 1")
     if args.replicas_per_stage < 0:
         parser.error("--replicas-per-stage must be >= 0")
+    try:
+        _parse_float_list(args.load_multipliers, "--load-multipliers")
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -164,6 +186,50 @@ def effective_replicas_per_stage(args: argparse.Namespace) -> int:
     if int(args.replicas_per_stage) == 0:
         return int(args.num_edge_nodes)
     return min(int(args.replicas_per_stage), int(args.num_edge_nodes))
+
+
+def _parse_float_list(raw: str, name: str) -> tuple[float, ...]:
+    try:
+        values = tuple(float(part.strip()) for part in raw.split(",") if part.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a comma-separated list of positive numbers") from exc
+    if not values or any(value <= 0 for value in values):
+        raise ValueError(f"{name} must contain at least one positive number")
+    return values
+
+
+def load_multiplier_for_rollout(args: argparse.Namespace, rollout_idx: int) -> float:
+    multipliers = _parse_float_list(getattr(args, "load_multipliers", "1.0"), "--load-multipliers")
+    return multipliers[int(rollout_idx) % len(multipliers)]
+
+
+def rollout_start_minute(args: argparse.Namespace, rollout_idx: int, *, eval_mode: bool = False) -> float:
+    mode = getattr(args, "rollout_start_mode", "beginning")
+    if eval_mode:
+        eval_mode_value = getattr(args, "eval_rollout_start_mode", "same")
+        mode = mode if eval_mode_value == "same" else eval_mode_value
+    if mode == "beginning":
+        return 0.0
+    interval = 240
+    total_minutes = int(getattr(args, "episode_hours", 24) * 60)
+    starts = list(range(0, max(total_minutes - interval + 1, 1), interval))
+    if not starts:
+        return 0.0
+    if mode == "cycle-window":
+        return float(starts[int(rollout_idx) % len(starts)])
+    rng = np.random.default_rng(int(getattr(args, "seed", 2026)) + 100_000 + int(rollout_idx))
+    return float(starts[int(rng.integers(0, len(starts)))])
+
+
+def start_env_at_minute(env: EdgeComputingEnv, start_minute: float) -> None:
+    if start_minute <= 0.0:
+        return
+    env.current_time_minute = float(start_minute)
+    env.next_deployment_update_minute = float(start_minute)
+    env.last_load_update_minute = float(start_minute)
+    env.pending_requests = []
+    env.current_request = env._next_request()
+    env.last_load_update_minute = env.current_time_minute
 
 
 def scenario_seed_for_offset(args: argparse.Namespace, seed_offset: int = 0, *, group_by_refresh: bool = False) -> int:
@@ -194,6 +260,7 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             active_user_ratio=args.active_user_ratio,
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
             traffic_scale=args.traffic_scale,
+            demand_load_multiplier=load_multiplier_for_rollout(args, seed_offset),
             task_compute_scale=args.task_compute_scale,
             task_data_scale=args.task_data_scale,
             node_compute_capacity_scale=args.node_compute_capacity_scale,
@@ -222,6 +289,7 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             active_user_ratio=args.active_user_ratio,
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
             traffic_scale=args.traffic_scale,
+            demand_load_multiplier=load_multiplier_for_rollout(args, rollout_idx),
             task_compute_scale=args.task_compute_scale,
             task_data_scale=args.task_data_scale,
             node_compute_capacity_scale=args.node_compute_capacity_scale,
@@ -609,10 +677,11 @@ def rollout(
     rollout_valid_requests = float(env.metrics["valid_requests"] - start_metrics.get("valid_requests", 0.0))
     rollout_deadline_violations = float(env.metrics["deadline_violations"] - start_metrics.get("deadline_violations", 0.0))
     rollout_deployment_updates = float(env.metrics["deployment_updates"] - start_metrics.get("deployment_updates", 0.0))
+    rollout_duration_minutes = max(env.current_time_minute - rollout_start_minute, 0.0)
     return {
         "requests": rollout_requests,
         "aggregate_events": rollout_aggregate_events,
-        "simulated_hours": float(env.current_time_minute / 60.0),
+        "simulated_hours": float(rollout_duration_minutes / 60.0),
         "episode_fraction": float(env.current_time_minute / max(env.config.episode_hours * 60.0, 1e-9)),
         "episode_complete": float(env.done),
         "avg_reward": _weighted_mean(rewards, weights),
@@ -958,6 +1027,11 @@ def evaluate_agent(
     runs = []
     for seed_idx in range(args.eval_seeds):
         eval_env = build_env(args, seed_offset=seed_base + seed_idx)
+        reset_env = True
+        if rollout_unit == "window":
+            eval_env.reset()
+            start_env_at_minute(eval_env, rollout_start_minute(args, seed_idx, eval_mode=True))
+            reset_env = False
         runs.append(
             rollout(
                 eval_env,
@@ -970,6 +1044,7 @@ def evaluate_agent(
                 progress_label=f"eval seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
                 progress_interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
                 rollout_unit=rollout_unit,
+                reset_env=reset_env,
             )
         )
     avg_latencies = np.array([r["avg_latency_s"] for r in runs], dtype=np.float64)
@@ -1114,6 +1189,8 @@ def evaluate_policy_diagnostics(
     for seed_idx in range(args.eval_seeds):
         env = build_env(args, seed_offset=seed_base + seed_idx)
         env.reset()
+        if rollout_unit == "window":
+            start_env_at_minute(env, rollout_start_minute(args, seed_idx, eval_mode=True))
         det_target_requests = max_requests if rollout_unit == "requests" else estimate_episode_requests(env)
         det_progress = RolloutProgress(
             label=f"diag-det seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
@@ -1153,6 +1230,11 @@ def evaluate_policy_diagnostics(
         det_progress.finish(env)
 
         stochastic_env = build_env(args, seed_offset=seed_base + seed_idx)
+        stochastic_reset_env = True
+        if rollout_unit == "window":
+            stochastic_env.reset()
+            start_env_at_minute(stochastic_env, rollout_start_minute(args, seed_idx, eval_mode=True))
+            stochastic_reset_env = False
         stochastic_stats = rollout(
             stochastic_env,
             agent,
@@ -1164,6 +1246,7 @@ def evaluate_policy_diagnostics(
             progress_label=f"diag-sto seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
             progress_interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
             rollout_unit=rollout_unit,
+            reset_env=stochastic_reset_env,
         )
         stochastic_latencies.append(stochastic_stats["avg_latency_s"])
 
@@ -1391,6 +1474,8 @@ def main() -> None:
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
     print(f"  rollouts_per_update={args.rollouts_per_update}")
+    print(f"  rollout_start_mode={args.rollout_start_mode} eval_rollout_start_mode={args.eval_rollout_start_mode}")
+    print(f"  load_multipliers={args.load_multipliers}")
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
@@ -1491,6 +1576,10 @@ def main() -> None:
             "episode": 0,
             "demand_seed": scenario_seed_for_offset(args, 0),
             "demand_seed_end": scenario_seed_for_offset(args, 0),
+            "load_multiplier": load_multiplier_for_rollout(args, 0),
+            "load_multiplier_end": load_multiplier_for_rollout(args, 0),
+            "start_minute": rollout_start_minute(args, 0),
+            "start_minute_end": rollout_start_minute(args, 0),
             "rollouts_collected": 0,
             "window_in_episode": 0,
             "requests": 0,
@@ -1626,15 +1715,20 @@ def main() -> None:
     for update in range(args.updates):
         rollout_stats: list[dict[str, float]] = []
         demand_seeds: list[int] = []
+        load_multipliers: list[float] = []
+        start_minutes: list[float] = []
         episode_numbers: list[int] = []
         window_numbers: list[int] = []
         for rollout_in_update in range(max(args.rollouts_per_update, 1)):
             rollout_idx = update * max(args.rollouts_per_update, 1) + rollout_in_update
+            start_minute = rollout_start_minute(args, rollout_idx)
+            load_multiplier = load_multiplier_for_rollout(args, rollout_idx)
             batch_suffix = "" if args.rollouts_per_update <= 1 else f" rollout={rollout_in_update + 1:02d}/{args.rollouts_per_update:02d}"
             if args.rollout_unit == "window":
                 if args.demand_sampling_mode == "rollout":
                     train_env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
                     train_env.reset()
+                    start_env_at_minute(train_env, start_minute)
                     episode_number = rollout_idx + 1
                 else:
                     if train_env is None or train_env.done:
@@ -1684,6 +1778,8 @@ def main() -> None:
                 window_in_episode = int(one_stats["deployment_updates"])
             rollout_stats.append(one_stats)
             demand_seeds.append(demand_seed)
+            load_multipliers.append(load_multiplier)
+            start_minutes.append(start_minute)
             episode_numbers.append(episode_number)
             window_numbers.append(window_in_episode)
 
@@ -1692,6 +1788,10 @@ def main() -> None:
         window_in_episode = window_numbers[-1]
         demand_seed = demand_seeds[0]
         demand_seed_end = demand_seeds[-1]
+        load_multiplier = load_multipliers[0]
+        load_multiplier_end = load_multipliers[-1]
+        start_minute = start_minutes[0]
+        start_minute_end = start_minutes[-1]
         if args.train_mode == "fast-only":
             losses = {
                 "slow": {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0},
@@ -1744,6 +1844,10 @@ def main() -> None:
             "episode": episode_number,
             "demand_seed": demand_seed,
             "demand_seed_end": demand_seed_end,
+            "load_multiplier": load_multiplier,
+            "load_multiplier_end": load_multiplier_end,
+            "start_minute": start_minute,
+            "start_minute_end": start_minute_end,
             "rollouts_collected": len(rollout_stats),
             "window_in_episode": window_in_episode,
             "requests": int(stats["requests"]),
@@ -1857,7 +1961,7 @@ def main() -> None:
         }
         append_log(log_path, log_row)
         print(
-            "update={:03d} episode={:03d} demand_seed={}-{} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} episode={:03d} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} res_penalty={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} idle_deployed={:.1%} "
@@ -1866,6 +1970,10 @@ def main() -> None:
                 episode_number,
                 demand_seed,
                 demand_seed_end,
+                load_multiplier,
+                load_multiplier_end,
+                start_minute,
+                start_minute_end,
                 len(rollout_stats),
                 int(stats["episode_complete"]),
                 window_in_episode,
