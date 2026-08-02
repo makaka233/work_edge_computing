@@ -159,7 +159,7 @@ def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollout_unit=episode" in result.stdout
-    assert "update=001 episode=001 demand_seed=2026 complete=1" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026-2026 rollouts=1 complete=1" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -204,13 +204,14 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollout_unit=window" in result.stdout
-    assert "update=001 episode=001 demand_seed=2026 complete=0 window=01" in result.stdout
-    assert "update=002 episode=001 demand_seed=2026 complete=1 window=02" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026-2026 rollouts=1 complete=0 window=01" in result.stdout
+    assert "update=002 episode=001 demand_seed=2026-2026 rollouts=1 complete=1 window=02" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["update"] for row in rows] == ["1", "2"]
     assert [row["episode"] for row in rows] == ["1", "1"]
+    assert [row["rollouts_collected"] for row in rows] == ["1", "1"]
     assert [row["window_in_episode"] for row in rows] == ["1", "2"]
     assert rows[0]["episode_complete"] == "0"
     assert rows[1]["episode_complete"] == "1"
@@ -256,14 +257,61 @@ def test_window_rollout_demand_sampling_resets_each_update(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "demand_sampling_mode=rollout" in result.stdout
-    assert "update=001 episode=001 demand_seed=2026 complete=0 window=01" in result.stdout
-    assert "update=002 episode=002 demand_seed=2027 complete=0 window=01" in result.stdout
+    assert "update=001 episode=001 demand_seed=2026-2026 rollouts=1 complete=0 window=01" in result.stdout
+    assert "update=002 episode=002 demand_seed=2027-2027 rollouts=1 complete=0 window=01" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["episode"] for row in rows] == ["1", "2"]
     assert [row["demand_seed"] for row in rows] == ["2026", "2027"]
+    assert [row["demand_seed_end"] for row in rows] == ["2026", "2027"]
     assert [row["window_in_episode"] for row in rows] == ["1", "1"]
+
+
+def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--rollout-unit",
+        "window",
+        "--demand-sampling-mode",
+        "rollout",
+        "--rollouts-per-update",
+        "2",
+        "--mean-requests-per-minute",
+        "2",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--episode-hours",
+        "8",
+        "--request-aggregation-window-seconds",
+        "60",
+        "--max-representative-groups-per-window",
+        "4",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "rollouts_per_update=2" in result.stdout
+    assert "update=001 episode=002 demand_seed=2026-2027 rollouts=2 complete=0 window=01" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[-1]["rollouts_collected"] == "2"
+    assert rows[-1]["demand_seed"] == "2026"
+    assert rows[-1]["demand_seed_end"] == "2027"
 
 
 def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):

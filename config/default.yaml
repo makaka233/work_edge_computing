@@ -51,9 +51,13 @@ agent:
   drl:
     type: dual_agent_ppo
     optimizer_reward_scale: 10.0
+    rollouts_per_update: 1
     slow_agent_update: every_240_minutes
     fast_agent_update: per_task_request
     max_replicas_per_stage: 5
     actual_replica_count: learned_by_count_ppo
     masked_actions: true
     feasibility_repair: true
+    slow_count_entropy_coef: null
+    slow_placement_entropy_coef: null
+    slow_value_coef: 0.5

@@ -33,12 +33,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-updates", type=int, default=80)
     parser.add_argument("--joint-updates", type=int, default=120)
     parser.add_argument("--requests-per-update", type=int, default=256)
+    parser.add_argument("--rollouts-per-update", type=int, default=1)
     parser.add_argument("--rollout-unit", choices=["requests", "window", "episode"], default="requests")
     parser.add_argument("--eval-rollout-unit", choices=["requests", "window", "episode", "same"], default="requests")
     parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--max-replicas-per-stage", dest="replicas_per_stage", type=int, default=5)
+    parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
+    parser.add_argument("--slow-placement-entropy-coef", type=float, default=None)
+    parser.add_argument("--slow-value-coef", type=float, default=0.5)
+    parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-minibatch-size", type=int, default=2048)
     parser.add_argument("--fast-minibatch-size", type=int, default=512)
     parser.add_argument("--device", type=str, default="cpu")
@@ -90,6 +95,8 @@ def main() -> None:
         str(args.radio_rtt_ms),
         "--requests-per-update",
         str(args.requests_per_update),
+        "--rollouts-per-update",
+        str(args.rollouts_per_update),
         "--rollout-unit",
         args.rollout_unit,
         "--eval-rollout-unit",
@@ -102,6 +109,10 @@ def main() -> None:
         args.fast_policy_kind,
         "--max-replicas-per-stage",
         str(args.replicas_per_stage),
+        "--slow-value-coef",
+        str(args.slow_value_coef),
+        "--fast-value-coef",
+        str(args.fast_value_coef),
         "--slow-minibatch-size",
         str(args.slow_minibatch_size),
         "--fast-minibatch-size",
@@ -121,6 +132,10 @@ def main() -> None:
     ]
     if args.mean_requests_per_minute is not None:
         common.extend(["--mean-requests-per-minute", str(args.mean_requests_per_minute)])
+    if args.slow_count_entropy_coef is not None:
+        common.extend(["--slow-count-entropy-coef", str(args.slow_count_entropy_coef)])
+    if args.slow_placement_entropy_coef is not None:
+        common.extend(["--slow-placement-entropy-coef", str(args.slow_placement_entropy_coef)])
 
     baseline_cmd = [
         *common,

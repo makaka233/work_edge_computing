@@ -35,6 +35,9 @@ class SlowDeploymentPPOAgent:
     lr: float = 3e-4
     k_epochs: int = 3
     entropy_coef: float = 0.001
+    count_entropy_coef: float | None = None
+    placement_entropy_coef: float | None = None
+    value_coef: float = 0.5
     target_kl: float | None = 0.03
     minibatch_size: int = 2048
     device: str = "cpu"
@@ -52,7 +55,8 @@ class SlowDeploymentPPOAgent:
             lr=self.lr,
             gamma=0.99,
             k_epochs=self.k_epochs,
-            entropy_coef=self.entropy_coef,
+            entropy_coef=self.entropy_coef if self.count_entropy_coef is None else self.count_entropy_coef,
+            value_coef=self.value_coef,
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
             device=self.device,
@@ -64,7 +68,8 @@ class SlowDeploymentPPOAgent:
             lr=self.lr,
             gamma=0.99,
             k_epochs=self.k_epochs,
-            entropy_coef=self.entropy_coef,
+            entropy_coef=self.entropy_coef if self.placement_entropy_coef is None else self.placement_entropy_coef,
+            value_coef=self.value_coef,
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
             device=self.device,
@@ -274,6 +279,7 @@ class FastSchedulingPPOAgent:
     lr: float = 3e-4
     k_epochs: int = 4
     entropy_coef: float = 0.0
+    value_coef: float = 0.5
     target_kl: float | None = 0.03
     minibatch_size: int = 512
     device: str = "cpu"
@@ -288,6 +294,7 @@ class FastSchedulingPPOAgent:
             gamma=0.99,
             k_epochs=self.k_epochs,
             entropy_coef=self.entropy_coef,
+            value_coef=self.value_coef,
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
             policy_kind=self.policy_kind,
@@ -474,7 +481,11 @@ class HierarchicalPPOAgent:
         slow_k_epochs: int = 3,
         fast_k_epochs: int = 4,
         slow_entropy_coef: float = 0.001,
+        slow_count_entropy_coef: float | None = None,
+        slow_placement_entropy_coef: float | None = None,
         fast_entropy_coef: float = 0.0,
+        slow_value_coef: float = 0.5,
+        fast_value_coef: float = 0.5,
         slow_target_kl: float | None = 0.03,
         fast_target_kl: float | None = 0.03,
         slow_minibatch_size: int = 2048,
@@ -490,6 +501,9 @@ class HierarchicalPPOAgent:
                 lr=slow_lr,
                 k_epochs=slow_k_epochs,
                 entropy_coef=slow_entropy_coef,
+                count_entropy_coef=slow_count_entropy_coef,
+                placement_entropy_coef=slow_placement_entropy_coef,
+                value_coef=slow_value_coef,
                 target_kl=slow_target_kl,
                 minibatch_size=slow_minibatch_size,
                 device=device,
@@ -501,6 +515,7 @@ class HierarchicalPPOAgent:
                 lr=fast_lr,
                 k_epochs=fast_k_epochs,
                 entropy_coef=fast_entropy_coef,
+                value_coef=fast_value_coef,
                 target_kl=fast_target_kl,
                 minibatch_size=fast_minibatch_size,
                 device=device,

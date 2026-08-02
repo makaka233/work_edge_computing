@@ -84,11 +84,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-k-epochs", type=int, default=3)
     parser.add_argument("--fast-k-epochs", type=int, default=4)
     parser.add_argument("--slow-entropy-coef", type=float, default=0.001)
+    parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
+    parser.add_argument("--slow-placement-entropy-coef", type=float, default=None)
     parser.add_argument("--fast-entropy-coef", type=float, default=0.0)
+    parser.add_argument("--slow-value-coef", type=float, default=0.5)
+    parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-target-kl", type=float, default=0.03)
     parser.add_argument("--fast-target-kl", type=float, default=0.03)
     parser.add_argument("--slow-minibatch-size", type=int, default=2048)
     parser.add_argument("--fast-minibatch-size", type=int, default=512)
+    parser.add_argument(
+        "--rollouts-per-update",
+        type=int,
+        default=1,
+        help="Collect this many independent rollouts before each PPO optimizer update.",
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--load-checkpoint", type=str, default="")
     parser.add_argument("--deterministic-eval", action="store_true")
@@ -121,7 +131,10 @@ def parse_args() -> argparse.Namespace:
         default=10.0,
         help="Print in-rollout terminal progress every N seconds. Use 0 to disable.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.rollouts_per_update < 1:
+        parser.error("--rollouts-per-update must be >= 1")
+    return args
 
 
 def scenario_seed_for_offset(args: argparse.Namespace, seed_offset: int = 0, *, group_by_refresh: bool = False) -> int:
@@ -694,6 +707,75 @@ def _resource_usage_stats(env: EdgeComputingEnv) -> dict[str, float]:
     }
 
 
+def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float]:
+    if not rollouts:
+        raise ValueError("cannot aggregate an empty rollout batch")
+    if len(rollouts) == 1:
+        return dict(rollouts[0])
+
+    requests = np.asarray([r["requests"] for r in rollouts], dtype=np.float64)
+    valid_requests = np.asarray([r["valid_requests"] for r in rollouts], dtype=np.float64)
+    aggregate_events = np.asarray([r["aggregate_events"] for r in rollouts], dtype=np.float64)
+    deployment_updates = np.asarray([r["deployment_updates"] for r in rollouts], dtype=np.float64)
+
+    request_weighted = [
+        "avg_reward",
+        "avg_train_reward",
+        "avg_latency_s",
+        "p95_latency_s",
+        "avg_penalty_latency_s",
+        "penalty_latency_share",
+        "avg_greedy_latency_s",
+        "invalid_action_rate",
+        "deadline_violation_rate",
+        "first_window_avg_latency_s",
+        "last_window_avg_latency_s",
+        "window_latency_delta_s",
+    ]
+    valid_weighted = ["avg_valid_latency_s", "p95_valid_latency_s"]
+    simple_mean = [
+        "episode_fraction",
+        "avg_replicas_per_stage",
+        "min_replicas_per_stage",
+        "max_replicas_per_stage",
+        "single_replica_stage_rate",
+        "total_deployed_replicas",
+        "avg_node_compute_load",
+        "max_node_compute_load",
+        "p95_node_compute_load",
+        "avg_link_load",
+        "max_link_load",
+        "p95_link_load",
+        "avg_node_memory_util",
+        "max_node_memory_util",
+        "avg_node_storage_util",
+        "max_node_storage_util",
+        "deployed_node_rate",
+    ]
+
+    aggregated: dict[str, float] = {
+        "requests": float(requests.sum()),
+        "aggregate_events": float(aggregate_events.sum()),
+        "simulated_hours": float(sum(r["simulated_hours"] for r in rollouts)),
+        "episode_complete": float(rollouts[-1]["episode_complete"]),
+        "valid_requests": float(valid_requests.sum()),
+        "invalid_actions": float(sum(r["invalid_actions"] for r in rollouts)),
+        "deployment_updates": float(deployment_updates.sum()),
+    }
+    for key in request_weighted:
+        values = np.asarray([r[key] for r in rollouts], dtype=np.float64)
+        finite = np.isfinite(values)
+        aggregated[key] = float(np.average(values[finite], weights=requests[finite])) if finite.any() else float("nan")
+    for key in valid_weighted:
+        values = np.asarray([r[key] for r in rollouts], dtype=np.float64)
+        finite = np.isfinite(values) & (valid_requests > 0)
+        aggregated[key] = float(np.average(values[finite], weights=valid_requests[finite])) if finite.any() else float("nan")
+    for key in simple_mean:
+        values = np.asarray([r[key] for r in rollouts], dtype=np.float64)
+        aggregated[key] = float(np.nanmean(values))
+    return aggregated
+
+
 def _training_reward(
     args: argparse.Namespace,
     *,
@@ -1054,7 +1136,11 @@ def main() -> None:
         slow_k_epochs=args.slow_k_epochs,
         fast_k_epochs=args.fast_k_epochs,
         slow_entropy_coef=args.slow_entropy_coef,
+        slow_count_entropy_coef=args.slow_count_entropy_coef,
+        slow_placement_entropy_coef=args.slow_placement_entropy_coef,
         fast_entropy_coef=args.fast_entropy_coef,
+        slow_value_coef=args.slow_value_coef,
+        fast_value_coef=args.fast_value_coef,
         slow_target_kl=args.slow_target_kl,
         fast_target_kl=args.fast_target_kl,
         slow_minibatch_size=args.slow_minibatch_size,
@@ -1088,16 +1174,20 @@ def main() -> None:
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
+    print(f"  rollouts_per_update={args.rollouts_per_update}")
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
     print(f"  max_replicas_per_stage={args.replicas_per_stage} actual_replica_count=learned_by_count_ppo")
     print(
-        "  ppo slow_lr={} fast_lr={} slow_entropy={} fast_entropy={}".format(
+        "  ppo slow_lr={} fast_lr={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={} fast_entropy={} slow_value_coef={}".format(
             args.slow_lr,
             args.fast_lr,
             args.slow_entropy_coef,
+            args.slow_count_entropy_coef if args.slow_count_entropy_coef is not None else args.slow_entropy_coef,
+            args.slow_placement_entropy_coef if args.slow_placement_entropy_coef is not None else args.slow_entropy_coef,
             args.fast_entropy_coef,
+            args.slow_value_coef,
         )
     )
     print(f"  ppo_minibatch slow={args.slow_minibatch_size} fast={args.fast_minibatch_size}")
@@ -1156,6 +1246,8 @@ def main() -> None:
             "update": 0,
             "episode": 0,
             "demand_seed": scenario_seed_for_offset(args, 0),
+            "demand_seed_end": scenario_seed_for_offset(args, 0),
+            "rollouts_collected": 0,
             "window_in_episode": 0,
             "requests": 0,
             "aggregate_events": 0,
@@ -1267,51 +1359,74 @@ def main() -> None:
     train_episode_idx = 0
     total_windows = max(int(np.ceil(args.episode_hours * 60.0 / 240.0)), 1)
     for update in range(args.updates):
-        if args.rollout_unit == "window":
-            if args.demand_sampling_mode == "rollout":
-                train_env = build_training_env(args, rollout_idx=update, episode_idx=update)
-                train_env.reset()
-                episode_number = update + 1
-            else:
-                if train_env is None or train_env.done:
-                    train_env = build_training_env(args, rollout_idx=update, episode_idx=train_episode_idx)
+        rollout_stats: list[dict[str, float]] = []
+        demand_seeds: list[int] = []
+        episode_numbers: list[int] = []
+        window_numbers: list[int] = []
+        for rollout_in_update in range(max(args.rollouts_per_update, 1)):
+            rollout_idx = update * max(args.rollouts_per_update, 1) + rollout_in_update
+            batch_suffix = "" if args.rollouts_per_update <= 1 else f" rollout={rollout_in_update + 1:02d}/{args.rollouts_per_update:02d}"
+            if args.rollout_unit == "window":
+                if args.demand_sampling_mode == "rollout":
+                    train_env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
                     train_env.reset()
-                episode_number = train_episode_idx + 1
-            env = train_env
-            window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
-            demand_seed = demand_seed_for_training_rollout(args, update, train_episode_idx if args.demand_sampling_mode == "episode" else update)
-            progress_label = (
-                f"update={update + 1:03d}/{args.updates:03d} "
-                f"ep={episode_number:03d} win={window_in_episode:02d}/{total_windows:02d}"
-            )
-            stats = rollout(
-                env,
-                agent,
-                args.requests_per_update,
-                args=args,
-                reward_scale=args.reward_scale,
-                train_mode=args.train_mode,
-                progress_label=progress_label,
-                progress_interval_seconds=args.progress_interval_seconds,
-                rollout_unit=args.rollout_unit,
-                reset_env=False,
-            )
-        else:
-            env = build_training_env(args, rollout_idx=update, episode_idx=update)
-            episode_number = update + 1
-            demand_seed = demand_seed_for_training_rollout(args, update, update)
-            stats = rollout(
-                env,
-                agent,
-                args.requests_per_update,
-                args=args,
-                reward_scale=args.reward_scale,
-                train_mode=args.train_mode,
-                progress_label=f"update={update + 1:03d}/{args.updates:03d}",
-                progress_interval_seconds=args.progress_interval_seconds,
-                rollout_unit=args.rollout_unit,
-            )
-            window_in_episode = int(stats["deployment_updates"])
+                    episode_number = rollout_idx + 1
+                else:
+                    if train_env is None or train_env.done:
+                        train_env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=train_episode_idx)
+                        train_env.reset()
+                    episode_number = train_episode_idx + 1
+                env = train_env
+                window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
+                demand_seed = demand_seed_for_training_rollout(
+                    args,
+                    rollout_idx,
+                    train_episode_idx if args.demand_sampling_mode == "episode" else rollout_idx,
+                )
+                progress_label = (
+                    f"update={update + 1:03d}/{args.updates:03d}{batch_suffix} "
+                    f"ep={episode_number:03d} win={window_in_episode:02d}/{total_windows:02d}"
+                )
+                one_stats = rollout(
+                    env,
+                    agent,
+                    args.requests_per_update,
+                    args=args,
+                    reward_scale=args.reward_scale,
+                    train_mode=args.train_mode,
+                    progress_label=progress_label,
+                    progress_interval_seconds=args.progress_interval_seconds,
+                    rollout_unit=args.rollout_unit,
+                    reset_env=False,
+                )
+                if args.rollout_unit == "window" and one_stats["episode_complete"]:
+                    train_episode_idx += 1
+            else:
+                env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
+                episode_number = rollout_idx + 1
+                demand_seed = demand_seed_for_training_rollout(args, rollout_idx, rollout_idx)
+                one_stats = rollout(
+                    env,
+                    agent,
+                    args.requests_per_update,
+                    args=args,
+                    reward_scale=args.reward_scale,
+                    train_mode=args.train_mode,
+                    progress_label=f"update={update + 1:03d}/{args.updates:03d}{batch_suffix}",
+                    progress_interval_seconds=args.progress_interval_seconds,
+                    rollout_unit=args.rollout_unit,
+                )
+                window_in_episode = int(one_stats["deployment_updates"])
+            rollout_stats.append(one_stats)
+            demand_seeds.append(demand_seed)
+            episode_numbers.append(episode_number)
+            window_numbers.append(window_in_episode)
+
+        stats = aggregate_rollout_stats(rollout_stats)
+        episode_number = episode_numbers[-1]
+        window_in_episode = window_numbers[-1]
+        demand_seed = demand_seeds[0]
+        demand_seed_end = demand_seeds[-1]
         if args.train_mode == "fast-only":
             losses = {
                 "slow": {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0},
@@ -1354,6 +1469,8 @@ def main() -> None:
             "update": update + 1,
             "episode": episode_number,
             "demand_seed": demand_seed,
+            "demand_seed_end": demand_seed_end,
+            "rollouts_collected": len(rollout_stats),
             "window_in_episode": window_in_episode,
             "requests": int(stats["requests"]),
             "aggregate_events": int(stats["aggregate_events"]),
@@ -1445,7 +1562,7 @@ def main() -> None:
         }
         append_log(log_path, log_row)
         print(
-            "update={:03d} episode={:03d} demand_seed={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} episode={:03d} demand_seed={}-{} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "node_load={:.1%}/{:.1%} link_load={:.1%}/{:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} "
@@ -1453,6 +1570,8 @@ def main() -> None:
                 update + 1,
                 episode_number,
                 demand_seed,
+                demand_seed_end,
+                len(rollout_stats),
                 int(stats["episode_complete"]),
                 window_in_episode,
                 int(stats["requests"]),
@@ -1503,8 +1622,6 @@ def main() -> None:
                     diagnostic_stats.get("eval_action_change_rate", np.nan),
                 )
             )
-        if args.rollout_unit == "window" and stats["episode_complete"]:
-            train_episode_idx += 1
         selection_latency = eval_stats.get("eval_avg_latency_s", stats["avg_latency_s"])
         if args.save_best and selection_latency < best_latency:
             best_latency = selection_latency

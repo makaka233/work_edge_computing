@@ -100,3 +100,11 @@ physical network.
 Training logs include deployment size and resource diagnostics: node compute
 EWMA load, wired-link EWMA load, memory/storage deployment utilization, and the
 fraction of nodes with at least one deployed stage.
+
+For high-variance demand-randomized PPO, `--rollouts-per-update K` can collect
+multiple independent 4h rollout windows before one optimizer update. This is
+closer to batched PPO sampling than updating after a single demand seed, and it
+makes the logged training latency less dominated by one sampled demand profile.
+Slow deployment exploration can also be controlled separately with
+`--slow-count-entropy-coef` and `--slow-placement-entropy-coef`; the count policy
+is especially sensitive because its action space is only the replica count.
