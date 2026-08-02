@@ -359,6 +359,45 @@ def test_task_load_scales_request_compute_and_data():
     assert sum(heavy_request.stage_output_mb) > sum(base_request.stage_output_mb)
 
 
+def test_physical_capacity_scales_node_compute_and_wired_links():
+    base_env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=48,
+            physical_seed=48,
+            scenario_seed=99,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+        )
+    )
+    constrained_env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=48,
+            physical_seed=48,
+            scenario_seed=99,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            node_compute_capacity_scale=0.5,
+            wired_link_bandwidth_scale=0.25,
+        )
+    )
+    base_env.reset()
+    constrained_env.reset()
+    assert base_env.scenario is not None
+    assert constrained_env.scenario is not None
+
+    base_compute = np.array([node.compute_gcycles_per_s for node in base_env.scenario.nodes])
+    constrained_compute = np.array([node.compute_gcycles_per_s for node in constrained_env.scenario.nodes])
+    np.testing.assert_allclose(constrained_compute, base_compute * 0.5)
+
+    finite = np.isfinite(base_env.scenario.bandwidth_mb_s) & ~np.eye(16, dtype=bool)
+    np.testing.assert_allclose(
+        constrained_env.scenario.bandwidth_mb_s[finite],
+        base_env.scenario.bandwidth_mb_s[finite] * 0.25,
+    )
+
+
 def test_representative_group_sampling_preserves_window_request_count():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

@@ -27,6 +27,9 @@ kept thin. The problem model is different, so the code is specialized for:
 - Fully connected wired metro links between edge nodes, with heterogeneous
   bottleneck, ordinary metro, and backbone-like bandwidth classes so placement
   and scheduling still have visible network tradeoffs.
+- Compute and wired-link pressure can be calibrated without changing the fixed
+  physical topology by using `--node-compute-capacity-scale` and
+  `--wired-link-bandwidth-scale`.
 - The physical edge infrastructure is fixed by `--physical-seed`: edge-node
   positions, compute capacity, memory, storage, service catalogue, and wired
   link bandwidth/propagation do not change during scenario refresh.
@@ -54,7 +57,7 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --demand-sampling-mode rollout --rollouts-per-update 8 --updates 120 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 2.5 --task-compute-scale 1.5 --eval-interval 10 --eval-seeds 5 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 5 --max-representative-groups-per-window 8 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --run-name joint_gat_city32_svc10_loadcheck --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode joint --rollout-unit window --demand-sampling-mode rollout --rollouts-per-update 8 --updates 120 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 3.5 --task-compute-scale 2.0 --task-data-scale 3.0 --node-compute-capacity-scale 0.65 --wired-link-bandwidth-scale 0.25 --eval-interval 10 --eval-seeds 5 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --max-representative-groups-per-window 8 --compute-hotspot-coef 0.08 --link-hotspot-coef 0.04 --compute-imbalance-coef 0.02 --link-imbalance-coef 0.01 --idle-deployed-node-coef 0.01 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --run-name joint_gat_city32_svc10_resource_efficiency --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
@@ -79,8 +82,11 @@ The DRL version has a slow deployment agent for service-stage deployment and a
 fast PPO agent for request-level stage scheduling. The slow deployment agent
 contains two PPO policies: `count_ppo` first chooses the replica count
 `k in [1, --max-replicas-per-stage]`, then `placement_ppo` chooses `k` distinct
-nodes under memory/storage masks. Continuous compute and bandwidth allocation
-remains outside the neural policy and is solved by the KKT module.
+nodes under memory/storage masks. Use `--max-replicas-per-stage 0` to remove
+the artificial replica cap; the physical maximum then becomes the number of
+edge nodes because duplicate placement on the same node is masked. Continuous
+compute and bandwidth allocation remains outside the neural policy and is solved
+by the KKT module.
 
 When `--fixed-scenario` is omitted, demand-side variation can be sampled in two
 ways while the physical edge network remains fixed by `--physical-seed`.
@@ -96,15 +102,27 @@ physical network.
 
 Training logs include deployment size and resource diagnostics: node compute
 EWMA load, wired-link EWMA load, memory/storage deployment utilization, and the
-fraction of nodes with at least one deployed stage.
+fraction of nodes with at least one deployed stage. They also include load
+standard deviation, active-node/link rates, hot-node/link rates, and the idle
+deployed-node rate so resource efficiency can be diagnosed separately from
+latency.
 
 Demand-side load can be raised without changing physical infrastructure. Use
 `--traffic-scale`, `--active-user-ratio`, and
 `--active-user-request-rate-per-minute` to increase arrival volume. Use
 `--task-compute-scale` and `--task-data-scale` to make each sampled task heavier
-in CPU cycles or transferred data. These parameters affect request demand only;
-node locations, node capacities, service catalogue, and wired links remain fixed
-by `--physical-seed`.
+in CPU cycles or transferred data. Use `--node-compute-capacity-scale` and
+`--wired-link-bandwidth-scale` below 1.0 when the fixed physical environment is
+too over-provisioned for the desired experiment. These capacity scales are part
+of the fixed physical scenario for a run and remain tied to `--physical-seed`.
+
+The optimizer reward remains latency-centered by default:
+`train_reward = -latency_s`. Resource-efficiency shaping can be enabled with
+explicit coefficients:
+`--compute-hotspot-coef`, `--link-hotspot-coef`,
+`--compute-imbalance-coef`, `--link-imbalance-coef`, and
+`--idle-deployed-node-coef`. These terms penalize hotspots, imbalance, and idle
+deployed nodes instead of directly rewarding more replicas.
 
 At each eval interval, `eval_*` fields report held-out demand seeds, while
 `seen_eval_*` fields report fixed demand seeds from the training distribution.

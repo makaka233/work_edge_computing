@@ -76,6 +76,8 @@ def generate_realistic_scenario(
     num_edge_nodes: int,
     num_service_types: int,
     max_service_stages: int,
+    node_compute_capacity_scale: float = 1.0,
+    wired_link_bandwidth_scale: float = 1.0,
 ) -> EdgeScenario:
     """Generate a city-scale MEC scenario with realistic heterogeneity.
 
@@ -115,7 +117,7 @@ def generate_realistic_scenario(
         tier = rng.choice([0, 1, 2], p=[0.50, 0.35, 0.15])
         memory_gb = [64, 128, 256][tier] * rng.uniform(0.85, 1.20)
         storage_gb = [512, 1024, 2048][tier] * rng.uniform(0.85, 1.25)
-        compute = [96, 192, 384][tier] * rng.uniform(0.80, 1.25)
+        compute = [96, 192, 384][tier] * rng.uniform(0.80, 1.25) * node_compute_capacity_scale
         nodes.append(
             EdgeNode(
                 node_id=node_id,
@@ -173,7 +175,7 @@ def generate_realistic_scenario(
                 raw_bandwidth = rng.uniform(120.0, 650.0)
             else:
                 raw_bandwidth = rng.uniform(750.0, 1800.0)
-            link_bandwidth = raw_bandwidth / (1.0 + 0.06 * distance)
+            link_bandwidth = raw_bandwidth / (1.0 + 0.06 * distance) * wired_link_bandwidth_scale
             link_propagation = 0.35 * distance + rng.uniform(0.2, 1.5)
             bandwidth[i, j] = link_bandwidth
             bandwidth[j, i] = link_bandwidth

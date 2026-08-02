@@ -55,6 +55,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traffic-scale", type=float, default=1.0)
     parser.add_argument("--task-compute-scale", type=float, default=1.0)
     parser.add_argument("--task-data-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--node-compute-capacity-scale",
+        type=float,
+        default=1.0,
+        help="Scale fixed edge-node compute capacities for this run. Values below 1.0 create a heavier compute bottleneck.",
+    )
+    parser.add_argument(
+        "--wired-link-bandwidth-scale",
+        type=float,
+        default=1.0,
+        help="Scale fixed wired-link bandwidths for this run. Values below 1.0 create stronger link bottlenecks.",
+    )
     parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
     parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
@@ -76,9 +88,17 @@ def parse_args() -> argparse.Namespace:
         "--max-replicas-per-stage",
         dest="replicas_per_stage",
         type=int,
-        default=5,
-        help="Maximum replicas the slow count PPO may choose per service stage.",
+        default=0,
+        help="Maximum replicas the slow count PPO may choose per service stage. Use 0 for no artificial cap, i.e. num_edge_nodes.",
     )
+    parser.add_argument("--compute-hotspot-threshold", type=float, default=0.60)
+    parser.add_argument("--link-hotspot-threshold", type=float, default=0.60)
+    parser.add_argument("--resource-active-load-threshold", type=float, default=0.01)
+    parser.add_argument("--compute-hotspot-coef", type=float, default=0.0)
+    parser.add_argument("--link-hotspot-coef", type=float, default=0.0)
+    parser.add_argument("--compute-imbalance-coef", type=float, default=0.0)
+    parser.add_argument("--link-imbalance-coef", type=float, default=0.0)
+    parser.add_argument("--idle-deployed-node-coef", type=float, default=0.0)
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--slow-lr", type=float, default=3e-4)
     parser.add_argument("--fast-lr", type=float, default=3e-4)
@@ -135,7 +155,15 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.rollouts_per_update < 1:
         parser.error("--rollouts-per-update must be >= 1")
+    if args.replicas_per_stage < 0:
+        parser.error("--replicas-per-stage must be >= 0")
     return args
+
+
+def effective_replicas_per_stage(args: argparse.Namespace) -> int:
+    if int(args.replicas_per_stage) == 0:
+        return int(args.num_edge_nodes)
+    return min(int(args.replicas_per_stage), int(args.num_edge_nodes))
 
 
 def scenario_seed_for_offset(args: argparse.Namespace, seed_offset: int = 0, *, group_by_refresh: bool = False) -> int:
@@ -168,6 +196,8 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             traffic_scale=args.traffic_scale,
             task_compute_scale=args.task_compute_scale,
             task_data_scale=args.task_data_scale,
+            node_compute_capacity_scale=args.node_compute_capacity_scale,
+            wired_link_bandwidth_scale=args.wired_link_bandwidth_scale,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             max_representative_groups_per_window=args.max_representative_groups_per_window,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
@@ -194,6 +224,8 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             traffic_scale=args.traffic_scale,
             task_compute_scale=args.task_compute_scale,
             task_data_scale=args.task_data_scale,
+            node_compute_capacity_scale=args.node_compute_capacity_scale,
+            wired_link_bandwidth_scale=args.wired_link_bandwidth_scale,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             max_representative_groups_per_window=args.max_representative_groups_per_window,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
@@ -454,13 +486,30 @@ def rollout(
     reset_env: bool = True,
 ) -> dict[str, float]:
     if args is None:
-        args = argparse.Namespace(reward_mode="latency")
+        args = argparse.Namespace(
+            reward_mode="latency",
+            compute_hotspot_threshold=0.60,
+            link_hotspot_threshold=0.60,
+            resource_active_load_threshold=0.01,
+            compute_hotspot_coef=0.0,
+            link_hotspot_coef=0.0,
+            compute_imbalance_coef=0.0,
+            link_imbalance_coef=0.0,
+            idle_deployed_node_coef=0.0,
+        )
     if reset_env:
         env.reset()
     if frozen_slow_policy is None:
         frozen_slow_policy = SlowGreedyDeploymentPolicy()
     rewards: list[float] = []
     train_rewards: list[float] = []
+    train_latency_costs: list[float] = []
+    train_resource_penalties: list[float] = []
+    compute_hotspot_penalties: list[float] = []
+    link_hotspot_penalties: list[float] = []
+    compute_imbalance_penalties: list[float] = []
+    link_imbalance_penalties: list[float] = []
+    idle_deployed_node_penalties: list[float] = []
     latencies: list[float] = []
     valid_latencies: list[float] = []
     valid_weights: list[float] = []
@@ -507,7 +556,8 @@ def rollout(
         deployment_window = int(env.metrics["deployment_updates"])
         _, reward, done, info = env.step(action)
         request_count = float(info.get("request_count", 1.0))
-        train_reward = _training_reward(info)
+        train_reward_info = _training_reward_components(info, env, args)
+        train_reward = train_reward_info["train_reward"]
         if record:
             agent.observe_step_reward(
                 train_reward * reward_scale,
@@ -517,6 +567,13 @@ def rollout(
             )
         rewards.append(float(reward))
         train_rewards.append(float(train_reward))
+        train_latency_costs.append(float(train_reward_info["train_latency_cost_s"]))
+        train_resource_penalties.append(float(train_reward_info["train_resource_penalty"]))
+        compute_hotspot_penalties.append(float(train_reward_info["compute_hotspot_penalty"]))
+        link_hotspot_penalties.append(float(train_reward_info["link_hotspot_penalty"]))
+        compute_imbalance_penalties.append(float(train_reward_info["compute_imbalance_penalty"]))
+        link_imbalance_penalties.append(float(train_reward_info["link_imbalance_penalty"]))
+        idle_deployed_node_penalties.append(float(train_reward_info["idle_deployed_node_penalty"]))
         latencies.append(float(info["latency_s"]))
         penalty_latencies.append(float(info["penalty_latency_s"]))
         if info["valid"]:
@@ -545,7 +602,7 @@ def rollout(
         agent.flush_slow_window_reward(done=env.done)
     window_stats = _deployment_window_latency_stats(window_latencies)
     replica_stats = _deployment_replica_stats(env)
-    resource_stats = _resource_usage_stats(env)
+    resource_stats = _resource_usage_stats(env, args)
     rollout_requests = float(env.metrics["requests"] - start_metrics.get("requests", 0.0))
     rollout_aggregate_events = float(env.metrics["aggregate_events"] - start_metrics.get("aggregate_events", 0.0))
     rollout_invalid_actions = float(env.metrics["invalid_actions"] - start_metrics.get("invalid_actions", 0.0))
@@ -560,6 +617,13 @@ def rollout(
         "episode_complete": float(env.done),
         "avg_reward": _weighted_mean(rewards, weights),
         "avg_train_reward": _weighted_mean(train_rewards, weights),
+        "avg_train_latency_cost_s": _weighted_mean(train_latency_costs, weights),
+        "avg_train_resource_penalty": _weighted_mean(train_resource_penalties, weights),
+        "avg_compute_hotspot_penalty": _weighted_mean(compute_hotspot_penalties, weights),
+        "avg_link_hotspot_penalty": _weighted_mean(link_hotspot_penalties, weights),
+        "avg_compute_imbalance_penalty": _weighted_mean(compute_imbalance_penalties, weights),
+        "avg_link_imbalance_penalty": _weighted_mean(link_imbalance_penalties, weights),
+        "avg_idle_deployed_node_penalty": _weighted_mean(idle_deployed_node_penalties, weights),
         "avg_latency_s": _weighted_mean(latencies, weights),
         "p95_latency_s": _weighted_percentile(latencies, weights, 95.0),
         "avg_valid_latency_s": _weighted_mean(valid_latencies, valid_weights),
@@ -648,20 +712,27 @@ def _deployment_replica_stats(env: EdgeComputingEnv) -> dict[str, float]:
     }
 
 
-def _resource_usage_stats(env: EdgeComputingEnv) -> dict[str, float]:
+def _resource_usage_stats(env: EdgeComputingEnv, args: argparse.Namespace | None = None) -> dict[str, float]:
     if env.scenario is None or env.deployment is None:
         return {
             "avg_node_compute_load": float("nan"),
             "max_node_compute_load": float("nan"),
             "p95_node_compute_load": float("nan"),
+            "std_node_compute_load": float("nan"),
+            "active_node_rate": float("nan"),
+            "hot_node_rate": float("nan"),
             "avg_link_load": float("nan"),
             "max_link_load": float("nan"),
             "p95_link_load": float("nan"),
+            "std_link_load": float("nan"),
+            "active_link_rate": float("nan"),
+            "hot_link_rate": float("nan"),
             "avg_node_memory_util": float("nan"),
             "max_node_memory_util": float("nan"),
             "avg_node_storage_util": float("nan"),
             "max_node_storage_util": float("nan"),
             "deployed_node_rate": float("nan"),
+            "idle_deployed_node_rate": float("nan"),
         }
 
     compute_load = np.asarray(env.node_compute_load, dtype=np.float64)
@@ -682,22 +753,37 @@ def _resource_usage_stats(env: EdgeComputingEnv) -> dict[str, float]:
     memory_util = memory_used / np.maximum(memory_capacity, 1e-9)
     storage_util = storage_used / np.maximum(storage_capacity, 1e-9)
     deployed_nodes = np.logical_or(memory_used > 0.0, storage_used > 0.0)
+    active_threshold = float(getattr(args, "resource_active_load_threshold", 0.01))
+    hot_threshold = float(getattr(args, "compute_hotspot_threshold", 0.60))
+    link_hot_threshold = float(getattr(args, "link_hotspot_threshold", hot_threshold))
 
     if link_load.size == 0:
         link_load = np.asarray([float("nan")], dtype=np.float64)
+    finite_link_load = link_load[np.isfinite(link_load)]
+    if finite_link_load.size == 0:
+        finite_link_load = np.asarray([float("nan")], dtype=np.float64)
 
     return {
         "avg_node_compute_load": float(np.mean(compute_load)),
         "max_node_compute_load": float(np.max(compute_load)),
         "p95_node_compute_load": float(np.percentile(compute_load, 95)),
+        "std_node_compute_load": float(np.std(compute_load)),
+        "active_node_rate": float(np.mean(compute_load > active_threshold)),
+        "hot_node_rate": float(np.mean(compute_load > hot_threshold)),
         "avg_link_load": float(np.nanmean(link_load)),
         "max_link_load": float(np.nanmax(link_load)),
         "p95_link_load": float(np.nanpercentile(link_load, 95)),
+        "std_link_load": float(np.nanstd(link_load)),
+        "active_link_rate": float(np.mean(finite_link_load > active_threshold)),
+        "hot_link_rate": float(np.mean(finite_link_load > link_hot_threshold)),
         "avg_node_memory_util": float(np.mean(memory_util)),
         "max_node_memory_util": float(np.max(memory_util)),
         "avg_node_storage_util": float(np.mean(storage_util)),
         "max_node_storage_util": float(np.max(storage_util)),
         "deployed_node_rate": float(np.mean(deployed_nodes)),
+        "idle_deployed_node_rate": float(
+            np.mean(compute_load[deployed_nodes] <= active_threshold) if deployed_nodes.any() else 0.0
+        ),
     }
 
 
@@ -715,6 +801,13 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
     request_weighted = [
         "avg_reward",
         "avg_train_reward",
+        "avg_train_latency_cost_s",
+        "avg_train_resource_penalty",
+        "avg_compute_hotspot_penalty",
+        "avg_link_hotspot_penalty",
+        "avg_compute_imbalance_penalty",
+        "avg_link_imbalance_penalty",
+        "avg_idle_deployed_node_penalty",
         "avg_latency_s",
         "p95_latency_s",
         "avg_penalty_latency_s",
@@ -736,14 +829,21 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "avg_node_compute_load",
         "max_node_compute_load",
         "p95_node_compute_load",
+        "std_node_compute_load",
+        "active_node_rate",
+        "hot_node_rate",
         "avg_link_load",
         "max_link_load",
         "p95_link_load",
+        "std_link_load",
+        "active_link_rate",
+        "hot_link_rate",
         "avg_node_memory_util",
         "max_node_memory_util",
         "avg_node_storage_util",
         "max_node_storage_util",
         "deployed_node_rate",
+        "idle_deployed_node_rate",
     ]
 
     aggregated: dict[str, float] = {
@@ -769,10 +869,81 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
     return aggregated
 
 
+def _resource_reward_components(
+    env: EdgeComputingEnv,
+    args: argparse.Namespace,
+) -> dict[str, float]:
+    compute_load = np.asarray(env.node_compute_load, dtype=np.float64)
+    max_compute = float(np.max(compute_load)) if compute_load.size else 0.0
+    compute_hotspot_excess = max(0.0, max_compute - float(args.compute_hotspot_threshold))
+
+    finite_links = np.isfinite(env.scenario.bandwidth_mb_s) & env.scenario.adjacency if env.scenario is not None else None
+    if finite_links is not None:
+        np.fill_diagonal(finite_links, False)
+        link_load = np.asarray(env.link_load[finite_links], dtype=np.float64)
+        link_load = link_load[np.isfinite(link_load)]
+    else:
+        link_load = np.asarray([], dtype=np.float64)
+    max_link = float(np.max(link_load)) if link_load.size else 0.0
+    link_hotspot_excess = max(0.0, max_link - float(args.link_hotspot_threshold))
+
+    deployed_idle_rate = 0.0
+    if env.deployment is not None and env.scenario is not None:
+        memory_used = np.zeros(env.config.num_edge_nodes, dtype=np.float64)
+        storage_used = np.zeros(env.config.num_edge_nodes, dtype=np.float64)
+        for service in env.scenario.services:
+            for stage in service.stages:
+                placed = env.deployment[service.service_id, stage.stage_id]
+                memory_used += placed * stage.memory_gb
+                storage_used += placed * stage.storage_gb
+        deployed_nodes = np.logical_or(memory_used > 0.0, storage_used > 0.0)
+        if deployed_nodes.any():
+            deployed_idle_rate = float(
+                np.mean(compute_load[deployed_nodes] <= float(args.resource_active_load_threshold))
+            )
+
+    compute_imbalance = float(np.std(compute_load)) if compute_load.size else 0.0
+    link_imbalance = float(np.std(link_load)) if link_load.size else 0.0
+    return {
+        "compute_hotspot_penalty": float(args.compute_hotspot_coef) * compute_hotspot_excess,
+        "link_hotspot_penalty": float(args.link_hotspot_coef) * link_hotspot_excess,
+        "compute_imbalance_penalty": float(args.compute_imbalance_coef) * compute_imbalance,
+        "link_imbalance_penalty": float(args.link_imbalance_coef) * link_imbalance,
+        "idle_deployed_node_penalty": float(args.idle_deployed_node_coef) * deployed_idle_rate,
+        "compute_hotspot_excess": compute_hotspot_excess,
+        "link_hotspot_excess": link_hotspot_excess,
+    }
+
+
+def _training_reward_components(
+    policy_info: dict[str, object],
+    env: EdgeComputingEnv,
+    args: argparse.Namespace,
+) -> dict[str, float]:
+    latency_cost = float(policy_info["latency_s"])
+    components = _resource_reward_components(env, args)
+    resource_penalty = (
+        components["compute_hotspot_penalty"]
+        + components["link_hotspot_penalty"]
+        + components["compute_imbalance_penalty"]
+        + components["link_imbalance_penalty"]
+        + components["idle_deployed_node_penalty"]
+    )
+    reward = -latency_cost - resource_penalty
+    return {
+        "train_reward": reward,
+        "train_latency_cost_s": latency_cost,
+        "train_resource_penalty": resource_penalty,
+        **components,
+    }
+
+
 def _training_reward(
     policy_info: dict[str, object],
+    env: EdgeComputingEnv,
+    args: argparse.Namespace,
 ) -> float:
-    return -float(policy_info["latency_s"])
+    return _training_reward_components(policy_info, env, args)["train_reward"]
 
 
 def evaluate_agent(
@@ -820,14 +991,21 @@ def evaluate_agent(
     avg_node_compute_load = np.array([r["avg_node_compute_load"] for r in runs], dtype=np.float64)
     max_node_compute_load = np.array([r["max_node_compute_load"] for r in runs], dtype=np.float64)
     p95_node_compute_load = np.array([r["p95_node_compute_load"] for r in runs], dtype=np.float64)
+    std_node_compute_load = np.array([r["std_node_compute_load"] for r in runs], dtype=np.float64)
+    active_node_rate = np.array([r["active_node_rate"] for r in runs], dtype=np.float64)
+    hot_node_rate = np.array([r["hot_node_rate"] for r in runs], dtype=np.float64)
     avg_link_load = np.array([r["avg_link_load"] for r in runs], dtype=np.float64)
     max_link_load = np.array([r["max_link_load"] for r in runs], dtype=np.float64)
     p95_link_load = np.array([r["p95_link_load"] for r in runs], dtype=np.float64)
+    std_link_load = np.array([r["std_link_load"] for r in runs], dtype=np.float64)
+    active_link_rate = np.array([r["active_link_rate"] for r in runs], dtype=np.float64)
+    hot_link_rate = np.array([r["hot_link_rate"] for r in runs], dtype=np.float64)
     avg_node_memory_util = np.array([r["avg_node_memory_util"] for r in runs], dtype=np.float64)
     max_node_memory_util = np.array([r["max_node_memory_util"] for r in runs], dtype=np.float64)
     avg_node_storage_util = np.array([r["avg_node_storage_util"] for r in runs], dtype=np.float64)
     max_node_storage_util = np.array([r["max_node_storage_util"] for r in runs], dtype=np.float64)
     deployed_node_rate = np.array([r["deployed_node_rate"] for r in runs], dtype=np.float64)
+    idle_deployed_node_rate = np.array([r["idle_deployed_node_rate"] for r in runs], dtype=np.float64)
     return {
         "eval_avg_latency_s": float(avg_latencies.mean()),
         "eval_avg_latency_std": float(avg_latencies.std()),
@@ -850,14 +1028,21 @@ def evaluate_agent(
         "eval_avg_node_compute_load": float(np.nanmean(avg_node_compute_load)),
         "eval_max_node_compute_load": float(np.nanmean(max_node_compute_load)),
         "eval_p95_node_compute_load": float(np.nanmean(p95_node_compute_load)),
+        "eval_std_node_compute_load": float(np.nanmean(std_node_compute_load)),
+        "eval_active_node_rate": float(np.nanmean(active_node_rate)),
+        "eval_hot_node_rate": float(np.nanmean(hot_node_rate)),
         "eval_avg_link_load": float(np.nanmean(avg_link_load)),
         "eval_max_link_load": float(np.nanmean(max_link_load)),
         "eval_p95_link_load": float(np.nanmean(p95_link_load)),
+        "eval_std_link_load": float(np.nanmean(std_link_load)),
+        "eval_active_link_rate": float(np.nanmean(active_link_rate)),
+        "eval_hot_link_rate": float(np.nanmean(hot_link_rate)),
         "eval_avg_node_memory_util": float(np.nanmean(avg_node_memory_util)),
         "eval_max_node_memory_util": float(np.nanmean(max_node_memory_util)),
         "eval_avg_node_storage_util": float(np.nanmean(avg_node_storage_util)),
         "eval_max_node_storage_util": float(np.nanmean(max_node_storage_util)),
         "eval_deployed_node_rate": float(np.nanmean(deployed_node_rate)),
+        "eval_idle_deployed_node_rate": float(np.nanmean(idle_deployed_node_rate)),
     }
 
 
@@ -883,14 +1068,21 @@ EVAL_STAT_KEYS = [
     "eval_avg_node_compute_load",
     "eval_max_node_compute_load",
     "eval_p95_node_compute_load",
+    "eval_std_node_compute_load",
+    "eval_active_node_rate",
+    "eval_hot_node_rate",
     "eval_avg_link_load",
     "eval_max_link_load",
     "eval_p95_link_load",
+    "eval_std_link_load",
+    "eval_active_link_rate",
+    "eval_hot_link_rate",
     "eval_avg_node_memory_util",
     "eval_max_node_memory_util",
     "eval_avg_node_storage_util",
     "eval_max_node_storage_util",
     "eval_deployed_node_rate",
+    "eval_idle_deployed_node_rate",
 ]
 
 
@@ -1150,10 +1342,11 @@ def main() -> None:
     env = build_env(args)
     env.reset()
     traffic = traffic_rate_summary(env)
+    replica_action_dim = effective_replicas_per_stage(args)
     agent = HierarchicalPPOAgent.from_env(
         env,
         device=args.device,
-        replicas_per_stage=args.replicas_per_stage,
+        replicas_per_stage=replica_action_dim,
         slow_lr=args.slow_lr,
         fast_lr=args.fast_lr,
         slow_k_epochs=args.slow_k_epochs,
@@ -1201,7 +1394,27 @@ def main() -> None:
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
-    print(f"  max_replicas_per_stage={args.replicas_per_stage} actual_replica_count=learned_by_count_ppo")
+    print(
+        f"  max_replicas_per_stage={replica_action_dim} "
+        f"actual_replica_count=learned_by_count_ppo artificial_cap={'none' if args.replicas_per_stage == 0 else 'explicit'}"
+    )
+    print(
+        "  load_scales compute_task={} data_task={} node_capacity={} wired_bandwidth={}".format(
+            args.task_compute_scale,
+            args.task_data_scale,
+            args.node_compute_capacity_scale,
+            args.wired_link_bandwidth_scale,
+        )
+    )
+    print(
+        "  resource_reward compute_hotspot_coef={} link_hotspot_coef={} compute_imbalance_coef={} link_imbalance_coef={} idle_deployed_node_coef={}".format(
+            args.compute_hotspot_coef,
+            args.link_hotspot_coef,
+            args.compute_imbalance_coef,
+            args.link_imbalance_coef,
+            args.idle_deployed_node_coef,
+        )
+    )
     print(
         "  ppo slow_lr={} fast_lr={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={} fast_entropy={} slow_value_coef={}".format(
             args.slow_lr,
@@ -1287,6 +1500,13 @@ def main() -> None:
             "episode_complete": 0,
             "avg_reward": np.nan,
             "avg_train_reward": np.nan,
+            "avg_train_latency_cost_s": np.nan,
+            "avg_train_resource_penalty": np.nan,
+            "avg_compute_hotspot_penalty": np.nan,
+            "avg_link_hotspot_penalty": np.nan,
+            "avg_compute_imbalance_penalty": np.nan,
+            "avg_link_imbalance_penalty": np.nan,
+            "avg_idle_deployed_node_penalty": np.nan,
             "avg_latency_s": np.nan,
             "p95_latency_s": np.nan,
             "avg_valid_latency_s": np.nan,
@@ -1306,14 +1526,21 @@ def main() -> None:
             "avg_node_compute_load": np.nan,
             "max_node_compute_load": np.nan,
             "p95_node_compute_load": np.nan,
+            "std_node_compute_load": np.nan,
+            "active_node_rate": np.nan,
+            "hot_node_rate": np.nan,
             "avg_link_load": np.nan,
             "max_link_load": np.nan,
             "p95_link_load": np.nan,
+            "std_link_load": np.nan,
+            "active_link_rate": np.nan,
+            "hot_link_rate": np.nan,
             "avg_node_memory_util": np.nan,
             "max_node_memory_util": np.nan,
             "avg_node_storage_util": np.nan,
             "max_node_storage_util": np.nan,
             "deployed_node_rate": np.nan,
+            "idle_deployed_node_rate": np.nan,
             "first_window_avg_latency_s": np.nan,
             "last_window_avg_latency_s": np.nan,
             "window_latency_delta_s": np.nan,
@@ -1349,14 +1576,21 @@ def main() -> None:
             "eval_avg_node_compute_load": eval_stats["eval_avg_node_compute_load"],
             "eval_max_node_compute_load": eval_stats["eval_max_node_compute_load"],
             "eval_p95_node_compute_load": eval_stats["eval_p95_node_compute_load"],
+            "eval_std_node_compute_load": eval_stats["eval_std_node_compute_load"],
+            "eval_active_node_rate": eval_stats["eval_active_node_rate"],
+            "eval_hot_node_rate": eval_stats["eval_hot_node_rate"],
             "eval_avg_link_load": eval_stats["eval_avg_link_load"],
             "eval_max_link_load": eval_stats["eval_max_link_load"],
             "eval_p95_link_load": eval_stats["eval_p95_link_load"],
+            "eval_std_link_load": eval_stats["eval_std_link_load"],
+            "eval_active_link_rate": eval_stats["eval_active_link_rate"],
+            "eval_hot_link_rate": eval_stats["eval_hot_link_rate"],
             "eval_avg_node_memory_util": eval_stats["eval_avg_node_memory_util"],
             "eval_max_node_memory_util": eval_stats["eval_max_node_memory_util"],
             "eval_avg_node_storage_util": eval_stats["eval_avg_node_storage_util"],
             "eval_max_node_storage_util": eval_stats["eval_max_node_storage_util"],
             "eval_deployed_node_rate": eval_stats["eval_deployed_node_rate"],
+            "eval_idle_deployed_node_rate": eval_stats["eval_idle_deployed_node_rate"],
             "eval_first_window_avg_latency_s": eval_stats["eval_first_window_avg_latency_s"],
             "eval_last_window_avg_latency_s": eval_stats["eval_last_window_avg_latency_s"],
             "eval_window_latency_delta_s": eval_stats["eval_window_latency_delta_s"],
@@ -1519,6 +1753,13 @@ def main() -> None:
             "episode_complete": int(stats["episode_complete"]),
             "avg_reward": stats["avg_reward"],
             "avg_train_reward": stats["avg_train_reward"],
+            "avg_train_latency_cost_s": stats["avg_train_latency_cost_s"],
+            "avg_train_resource_penalty": stats["avg_train_resource_penalty"],
+            "avg_compute_hotspot_penalty": stats["avg_compute_hotspot_penalty"],
+            "avg_link_hotspot_penalty": stats["avg_link_hotspot_penalty"],
+            "avg_compute_imbalance_penalty": stats["avg_compute_imbalance_penalty"],
+            "avg_link_imbalance_penalty": stats["avg_link_imbalance_penalty"],
+            "avg_idle_deployed_node_penalty": stats["avg_idle_deployed_node_penalty"],
             "avg_latency_s": stats["avg_latency_s"],
             "p95_latency_s": stats["p95_latency_s"],
             "avg_valid_latency_s": stats["avg_valid_latency_s"],
@@ -1538,14 +1779,21 @@ def main() -> None:
             "avg_node_compute_load": stats["avg_node_compute_load"],
             "max_node_compute_load": stats["max_node_compute_load"],
             "p95_node_compute_load": stats["p95_node_compute_load"],
+            "std_node_compute_load": stats["std_node_compute_load"],
+            "active_node_rate": stats["active_node_rate"],
+            "hot_node_rate": stats["hot_node_rate"],
             "avg_link_load": stats["avg_link_load"],
             "max_link_load": stats["max_link_load"],
             "p95_link_load": stats["p95_link_load"],
+            "std_link_load": stats["std_link_load"],
+            "active_link_rate": stats["active_link_rate"],
+            "hot_link_rate": stats["hot_link_rate"],
             "avg_node_memory_util": stats["avg_node_memory_util"],
             "max_node_memory_util": stats["max_node_memory_util"],
             "avg_node_storage_util": stats["avg_node_storage_util"],
             "max_node_storage_util": stats["max_node_storage_util"],
             "deployed_node_rate": stats["deployed_node_rate"],
+            "idle_deployed_node_rate": stats["idle_deployed_node_rate"],
             "first_window_avg_latency_s": stats["first_window_avg_latency_s"],
             "last_window_avg_latency_s": stats["last_window_avg_latency_s"],
             "window_latency_delta_s": stats["window_latency_delta_s"],
@@ -1581,14 +1829,21 @@ def main() -> None:
             "eval_avg_node_compute_load": eval_stats.get("eval_avg_node_compute_load", np.nan),
             "eval_max_node_compute_load": eval_stats.get("eval_max_node_compute_load", np.nan),
             "eval_p95_node_compute_load": eval_stats.get("eval_p95_node_compute_load", np.nan),
+            "eval_std_node_compute_load": eval_stats.get("eval_std_node_compute_load", np.nan),
+            "eval_active_node_rate": eval_stats.get("eval_active_node_rate", np.nan),
+            "eval_hot_node_rate": eval_stats.get("eval_hot_node_rate", np.nan),
             "eval_avg_link_load": eval_stats.get("eval_avg_link_load", np.nan),
             "eval_max_link_load": eval_stats.get("eval_max_link_load", np.nan),
             "eval_p95_link_load": eval_stats.get("eval_p95_link_load", np.nan),
+            "eval_std_link_load": eval_stats.get("eval_std_link_load", np.nan),
+            "eval_active_link_rate": eval_stats.get("eval_active_link_rate", np.nan),
+            "eval_hot_link_rate": eval_stats.get("eval_hot_link_rate", np.nan),
             "eval_avg_node_memory_util": eval_stats.get("eval_avg_node_memory_util", np.nan),
             "eval_max_node_memory_util": eval_stats.get("eval_max_node_memory_util", np.nan),
             "eval_avg_node_storage_util": eval_stats.get("eval_avg_node_storage_util", np.nan),
             "eval_max_node_storage_util": eval_stats.get("eval_max_node_storage_util", np.nan),
             "eval_deployed_node_rate": eval_stats.get("eval_deployed_node_rate", np.nan),
+            "eval_idle_deployed_node_rate": eval_stats.get("eval_idle_deployed_node_rate", np.nan),
             "eval_first_window_avg_latency_s": eval_stats.get("eval_first_window_avg_latency_s", np.nan),
             "eval_last_window_avg_latency_s": eval_stats.get("eval_last_window_avg_latency_s", np.nan),
             "eval_window_latency_delta_s": eval_stats.get("eval_window_latency_delta_s", np.nan),
@@ -1603,9 +1858,9 @@ def main() -> None:
         append_log(log_path, log_row)
         print(
             "update={:03d} episode={:03d} demand_seed={}-{} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
-            "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
+            "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} res_penalty={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
-            "node_load={:.1%}/{:.1%} link_load={:.1%}/{:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} "
+            "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} idle_deployed={:.1%} "
             "slow_loss={:.4f} fast_loss={:.4f}".format(
                 update + 1,
                 episode_number,
@@ -1623,6 +1878,7 @@ def main() -> None:
                 stats["avg_valid_latency_s"],
                 stats["avg_penalty_latency_s"],
                 stats["avg_train_reward"],
+                stats["avg_train_resource_penalty"],
                 int(stats["invalid_actions"]),
                 stats["invalid_action_rate"],
                 int(stats["deployment_updates"]),
@@ -1632,12 +1888,17 @@ def main() -> None:
                 stats["single_replica_stage_rate"],
                 stats["avg_node_compute_load"],
                 stats["max_node_compute_load"],
+                stats["active_node_rate"],
+                stats["hot_node_rate"],
                 stats["avg_link_load"],
                 stats["max_link_load"],
+                stats["active_link_rate"],
+                stats["hot_link_rate"],
                 stats["avg_node_memory_util"],
                 stats["max_node_memory_util"],
                 stats["avg_node_storage_util"],
                 stats["max_node_storage_util"],
+                stats["idle_deployed_node_rate"],
                 losses["slow"]["loss"],
                 losses["fast"]["loss"],
             )
@@ -1645,7 +1906,7 @@ def main() -> None:
         if eval_stats:
             print(
                 "  eval_mean_latency={:.4f}s eval_valid_latency={:.4f}s eval_penalty_latency={:.4f}s eval_std={:.4f}s eval_p95={:.4f}s invalid={:.2f} "
-                "eval_replicas={:.2f} single={:.1%} node_load={:.1%}/{:.1%} link_load={:.1%}/{:.1%} entropy={:.4f} action_change={:.4f}".format(
+                "eval_replicas={:.2f} single={:.1%} node_load={:.1%}/{:.1%} hot={:.1%} link_load={:.2%}/{:.1%} hot_link={:.1%} entropy={:.4f} action_change={:.4f}".format(
                     eval_stats["eval_avg_latency_s"],
                     eval_stats["eval_avg_valid_latency_s"],
                     eval_stats["eval_avg_penalty_latency_s"],
@@ -1656,8 +1917,10 @@ def main() -> None:
                     eval_stats["eval_single_replica_stage_rate"],
                     eval_stats["eval_avg_node_compute_load"],
                     eval_stats["eval_max_node_compute_load"],
+                    eval_stats["eval_hot_node_rate"],
                     eval_stats["eval_avg_link_load"],
                     eval_stats["eval_max_link_load"],
+                    eval_stats["eval_hot_link_rate"],
                     diagnostic_stats.get("eval_policy_entropy", np.nan),
                     diagnostic_stats.get("eval_action_change_rate", np.nan),
                 )

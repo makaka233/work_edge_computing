@@ -4,7 +4,7 @@ import csv
 from argparse import Namespace
 from pathlib import Path
 
-from train_dual_ppo import demand_seed_for_training_rollout, scenario_seed_for_offset
+from train_dual_ppo import demand_seed_for_training_rollout, effective_replicas_per_stage, scenario_seed_for_offset
 
 
 def test_scenario_refresh_groups_training_episodes():
@@ -24,6 +24,14 @@ def test_demand_sampling_mode_controls_training_demand_seed():
     assert demand_seed_for_training_rollout(episode_args, rollout_idx=20, episode_idx=1) == 2026
     assert demand_seed_for_training_rollout(rollout_args, rollout_idx=19, episode_idx=0) == 2045
     assert demand_seed_for_training_rollout(rollout_args, rollout_idx=20, episode_idx=1) == 2046
+
+
+def test_zero_replica_cap_uses_node_count():
+    args = Namespace(replicas_per_stage=0, num_edge_nodes=32)
+    assert effective_replicas_per_stage(args) == 32
+
+    explicit_args = Namespace(replicas_per_stage=5, num_edge_nodes=32)
+    assert effective_replicas_per_stage(explicit_args) == 5
 
 
 def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
@@ -46,6 +54,10 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
         "1",
         "--request-aggregation-window-seconds",
         "0",
+        "--compute-hotspot-coef",
+        "0.08",
+        "--link-hotspot-coef",
+        "0.04",
         "--eval-baseline",
         "--eval-requests",
         "4",
@@ -58,9 +70,17 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "baseline requests=4" in result.stdout
     assert "update=001" in result.stdout
+    assert "artificial_cap=none" in result.stdout
+    assert "res_penalty=" in result.stdout
     assert (log_dir / "training.csv").exists()
     assert (save_dir / "last.pt").exists()
     assert (save_dir / "best.pt").exists()
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "avg_train_resource_penalty" in rows[0]
+    assert "active_node_rate" in rows[0]
+    assert "hot_link_rate" in rows[0]
 
 
 def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):

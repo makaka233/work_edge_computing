@@ -26,6 +26,8 @@ class EdgeEnvConfig:
     traffic_scale: float = 1.0
     task_compute_scale: float = 1.0
     task_data_scale: float = 1.0
+    node_compute_capacity_scale: float = 1.0
+    wired_link_bandwidth_scale: float = 1.0
     request_aggregation_window_seconds: float = 10.0
     max_representative_groups_per_window: int | None = 16
     load_ewma_tau_minutes: float = 1.0
@@ -54,6 +56,10 @@ class EdgeEnvConfig:
             raise ValueError("task_compute_scale must be positive.")
         if self.task_data_scale <= 0:
             raise ValueError("task_data_scale must be positive.")
+        if self.node_compute_capacity_scale <= 0:
+            raise ValueError("node_compute_capacity_scale must be positive.")
+        if self.wired_link_bandwidth_scale <= 0:
+            raise ValueError("wired_link_bandwidth_scale must be positive.")
         if self.request_aggregation_window_seconds < 0:
             raise ValueError("request_aggregation_window_seconds must be non-negative.")
         if self.max_representative_groups_per_window is not None and self.max_representative_groups_per_window <= 0:
@@ -106,6 +112,8 @@ class EdgeComputingEnv:
             num_edge_nodes=self.config.num_edge_nodes,
             num_service_types=self.config.num_service_types,
             max_service_stages=self.config.max_service_stages,
+            node_compute_capacity_scale=self.config.node_compute_capacity_scale,
+            wired_link_bandwidth_scale=self.config.wired_link_bandwidth_scale,
         )
         self.deployment = np.zeros(
             (self.config.num_service_types, self.config.max_service_stages, self.config.num_edge_nodes),

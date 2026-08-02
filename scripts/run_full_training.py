@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traffic-scale", type=float, default=1.0)
     parser.add_argument("--task-compute-scale", type=float, default=1.0)
     parser.add_argument("--task-data-scale", type=float, default=1.0)
+    parser.add_argument("--node-compute-capacity-scale", type=float, default=1.0)
+    parser.add_argument("--wired-link-bandwidth-scale", type=float, default=1.0)
     parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
     parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
@@ -41,7 +43,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency"], default="latency")
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
-    parser.add_argument("--max-replicas-per-stage", dest="replicas_per_stage", type=int, default=5)
+    parser.add_argument("--max-replicas-per-stage", dest="replicas_per_stage", type=int, default=0)
+    parser.add_argument("--compute-hotspot-threshold", type=float, default=0.60)
+    parser.add_argument("--link-hotspot-threshold", type=float, default=0.60)
+    parser.add_argument("--resource-active-load-threshold", type=float, default=0.01)
+    parser.add_argument("--compute-hotspot-coef", type=float, default=0.0)
+    parser.add_argument("--link-hotspot-coef", type=float, default=0.0)
+    parser.add_argument("--compute-imbalance-coef", type=float, default=0.0)
+    parser.add_argument("--link-imbalance-coef", type=float, default=0.0)
+    parser.add_argument("--idle-deployed-node-coef", type=float, default=0.0)
     parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
     parser.add_argument("--slow-placement-entropy-coef", type=float, default=None)
     parser.add_argument("--slow-value-coef", type=float, default=0.5)
@@ -89,6 +99,10 @@ def main() -> None:
         str(args.task_compute_scale),
         "--task-data-scale",
         str(args.task_data_scale),
+        "--node-compute-capacity-scale",
+        str(args.node_compute_capacity_scale),
+        "--wired-link-bandwidth-scale",
+        str(args.wired_link_bandwidth_scale),
         "--request-aggregation-window-seconds",
         str(args.request_aggregation_window_seconds),
         "--max-representative-groups-per-window",
@@ -115,6 +129,22 @@ def main() -> None:
         args.fast_policy_kind,
         "--max-replicas-per-stage",
         str(args.replicas_per_stage),
+        "--compute-hotspot-threshold",
+        str(args.compute_hotspot_threshold),
+        "--link-hotspot-threshold",
+        str(args.link_hotspot_threshold),
+        "--resource-active-load-threshold",
+        str(args.resource_active_load_threshold),
+        "--compute-hotspot-coef",
+        str(args.compute_hotspot_coef),
+        "--link-hotspot-coef",
+        str(args.link_hotspot_coef),
+        "--compute-imbalance-coef",
+        str(args.compute_imbalance_coef),
+        "--link-imbalance-coef",
+        str(args.link_imbalance_coef),
+        "--idle-deployed-node-coef",
+        str(args.idle_deployed_node_coef),
         "--slow-value-coef",
         str(args.slow_value_coef),
         "--fast-value-coef",
