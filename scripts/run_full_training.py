@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-unit", choices=["requests", "window", "episode"], default="requests")
     parser.add_argument("--eval-rollout-unit", choices=["requests", "window", "episode", "same"], default="requests")
     parser.add_argument("--reward-scale", type=float, default=10.0)
-    parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
+    parser.add_argument("--reward-mode", choices=["latency"], default="latency")
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument("--max-replicas-per-stage", dest="replicas_per_stage", type=int, default=5)
     parser.add_argument("--slow-count-entropy-coef", type=float, default=None)

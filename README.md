@@ -46,30 +46,27 @@ kept thin. The problem model is different, so the code is specialized for:
 - `edge_drl/agents/hierarchical.py`: slow greedy deployment and fast greedy scheduler baseline.
 - `edge_drl/agents/drl.py`: trainable hierarchical dual-agent PPO scaffold.
 - `edge_drl/models/ppo.py`: masked categorical PPO core, following the rollout-memory style used by DRL-AC-Allocation.
-- `train.py`: runnable rollout entrypoint.
-- `train_dual_ppo.py`: slow deployment PPO + fast scheduling PPO training smoke entrypoint.
+- `train_dual_ppo.py`: slow deployment PPO + fast scheduling PPO training entrypoint.
 - `tests/test_env_smoke.py`: KKT and environment smoke tests.
 - `tests/test_dual_ppo_smoke.py`: dual-agent PPO rollout/update tests.
 
 ## Run
 
 ```powershell
-python train.py --max-requests 1000
 python train_dual_ppo.py --updates 2 --requests-per-update 64
-python train_dual_ppo.py --updates 20 --requests-per-update 48 --eval-interval 5 --eval-seeds 2 --reward-scale 10
-python train_dual_ppo.py --train-mode joint --rollout-unit episode --episode-hours 24 --updates 200 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --scenario-refresh-episodes 20 --traffic-scale 1.6 --eval-interval 20 --eval-rollout-unit episode --eval-seeds 5 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 5 --max-representative-groups-per-window 16 --run-name joint_gat_city32_svc10_day200 --save-best --progress-interval-seconds 30
+python train_dual_ppo.py --train-mode joint --rollout-unit window --demand-sampling-mode rollout --rollouts-per-update 8 --updates 120 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 2.5 --task-compute-scale 1.5 --eval-interval 10 --eval-seeds 5 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 5 --max-representative-groups-per-window 8 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --run-name joint_gat_city32_svc10_loadcheck --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
 python -m pytest tests
 ```
 
-Use `--rollout-unit episode` for serious training: each PPO update then collects
-one complete environment episode before optimizing, so the logged `update` and
-`episode` advance together. `train_dual_ppo.py` prints in-rollout terminal
-progress by default every 10 seconds. The progress line reports update progress,
-real request count, aggregate event count, simulated hours, episode fraction,
-deployment updates, average latency, elapsed time, and ETA. Use
+For the current convergence experiments, prefer `--rollout-unit window` with
+`--demand-sampling-mode rollout`: each rollout samples an independent 4h demand
+window while the physical edge network stays fixed. `train_dual_ppo.py` prints
+in-rollout terminal progress by default every 10 seconds. The progress line
+reports update progress, real request count, aggregate event count, simulated
+hours, deployment updates, average latency, elapsed time, and ETA. Use
 `--progress-interval-seconds 0` to disable it or a smaller value for more
 frequent refreshes.
 

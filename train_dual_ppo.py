@@ -69,8 +69,7 @@ def parse_args() -> argparse.Namespace:
         help="Collect each PPO update by request count, one 4h slow-deployment window, or one full environment episode.",
     )
     parser.add_argument("--reward-scale", type=float, default=10.0)
-    parser.add_argument("--reward-mode", choices=["latency", "greedy-advantage", "mixed"], default="latency")
-    parser.add_argument("--mixed-latency-weight", type=float, default=0.1)
+    parser.add_argument("--reward-mode", choices=["latency"], default="latency")
     parser.add_argument("--train-mode", choices=["joint", "fast-only"], default="joint")
     parser.add_argument(
         "--replicas-per-stage",
@@ -455,12 +454,11 @@ def rollout(
     reset_env: bool = True,
 ) -> dict[str, float]:
     if args is None:
-        args = argparse.Namespace(reward_mode="latency", mixed_latency_weight=0.1)
+        args = argparse.Namespace(reward_mode="latency")
     if reset_env:
         env.reset()
     if frozen_slow_policy is None:
         frozen_slow_policy = SlowGreedyDeploymentPolicy()
-    greedy_scheduler = FastGreedyScheduler()
     rewards: list[float] = []
     train_rewards: list[float] = []
     latencies: list[float] = []
@@ -468,8 +466,6 @@ def rollout(
     valid_weights: list[float] = []
     penalty_latencies: list[float] = []
     weights: list[float] = []
-    greedy_latencies: list[float] = []
-    greedy_weights: list[float] = []
     window_latencies: dict[int, list[tuple[float, float]]] = {}
     start_metrics = dict(env.metrics)
     rollout_start_minute = env.current_time_minute
@@ -509,13 +505,9 @@ def rollout(
         else:
             action = agent.act(env, deterministic=deterministic, record=record)
         deployment_window = int(env.metrics["deployment_updates"])
-        greedy_info = None
-        if record and getattr(args, "reward_mode", "latency") in {"greedy-advantage", "mixed"}:
-            greedy_action = greedy_scheduler.act(env, request)
-            greedy_info = env.evaluate_schedule(request, greedy_action)
         _, reward, done, info = env.step(action)
         request_count = float(info.get("request_count", 1.0))
-        train_reward = _training_reward(args, env_reward=reward, policy_info=info, greedy_info=greedy_info)
+        train_reward = _training_reward(info)
         if record:
             agent.observe_step_reward(
                 train_reward * reward_scale,
@@ -532,9 +524,6 @@ def rollout(
             valid_weights.append(request_count)
         weights.append(request_count)
         window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
-        if greedy_info is not None:
-            greedy_latencies.append(float(greedy_info["latency_s"]))
-            greedy_weights.append(request_count)
         if progress.should_print():
             progress.maybe_print(
                 env,
@@ -578,7 +567,6 @@ def rollout(
         "valid_requests": rollout_valid_requests,
         "avg_penalty_latency_s": _weighted_mean(penalty_latencies, weights),
         "penalty_latency_share": _weighted_mean(penalty_latencies, weights) / max(_weighted_mean(latencies, weights), 1e-9),
-        "avg_greedy_latency_s": _weighted_mean(greedy_latencies, greedy_weights) if greedy_latencies else float("nan"),
         "invalid_actions": rollout_invalid_actions,
         "invalid_action_rate": float(rollout_invalid_actions / max(rollout_requests, 1.0)),
         "deadline_violation_rate": float(rollout_deadline_violations / max(rollout_requests, 1.0)),
@@ -731,7 +719,6 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "p95_latency_s",
         "avg_penalty_latency_s",
         "penalty_latency_share",
-        "avg_greedy_latency_s",
         "invalid_action_rate",
         "deadline_violation_rate",
         "first_window_avg_latency_s",
@@ -783,19 +770,9 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
 
 
 def _training_reward(
-    args: argparse.Namespace,
-    *,
-    env_reward: float,
     policy_info: dict[str, object],
-    greedy_info: dict[str, object] | None,
 ) -> float:
-    mode = getattr(args, "reward_mode", "latency")
-    if mode == "latency" or greedy_info is None:
-        return -float(policy_info["latency_s"])
-    advantage = float(greedy_info["latency_s"]) - float(policy_info["latency_s"])
-    if mode == "greedy-advantage":
-        return advantage
-    return advantage - args.mixed_latency_weight * float(policy_info["latency_s"])
+    return -float(policy_info["latency_s"])
 
 
 def evaluate_agent(
@@ -1317,7 +1294,6 @@ def main() -> None:
             "valid_requests": 0,
             "avg_penalty_latency_s": np.nan,
             "penalty_latency_share": np.nan,
-            "avg_greedy_latency_s": np.nan,
             "invalid_actions": 0,
             "invalid_action_rate": np.nan,
             "deadline_violation_rate": np.nan,
@@ -1550,7 +1526,6 @@ def main() -> None:
             "valid_requests": int(stats["valid_requests"]),
             "avg_penalty_latency_s": stats["avg_penalty_latency_s"],
             "penalty_latency_share": stats["penalty_latency_share"],
-            "avg_greedy_latency_s": stats["avg_greedy_latency_s"],
             "invalid_actions": int(stats["invalid_actions"]),
             "invalid_action_rate": stats["invalid_action_rate"],
             "deadline_violation_rate": stats["deadline_violation_rate"],
