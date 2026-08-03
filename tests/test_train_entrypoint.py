@@ -260,6 +260,9 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
     assert "avg_node_compute_load" in rows[0]
     assert "load_multiplier" in rows[0]
     assert "start_minute" in rows[0]
+    assert "used_replica_rate" in rows[0]
+    assert "avg_replica_use_entropy" in rows[0]
+    assert "cross_node_stage_transition_rate" in rows[0]
     assert "max_node_memory_util" in rows[0]
 
 

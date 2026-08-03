@@ -584,6 +584,9 @@ def rollout(
     penalty_latencies: list[float] = []
     weights: list[float] = []
     window_latencies: dict[int, list[tuple[float, float]]] = {}
+    scheduled_replica_counts: dict[tuple[int, int, int], float] = {}
+    cross_node_stage_transitions = 0.0
+    total_stage_transitions = 0.0
     start_metrics = dict(env.metrics)
     rollout_start_minute = env.current_time_minute
     stop_time_minute = None
@@ -647,6 +650,16 @@ def rollout(
         if info["valid"]:
             valid_latencies.append(float(info["physical_latency_s"]))
             valid_weights.append(request_count)
+            _accumulate_schedule_usage(
+                scheduled_replica_counts,
+                request.service_id,
+                info["stage_nodes"],
+                request_count,
+            )
+            for previous_node, next_node in zip(info["stage_nodes"], info["stage_nodes"][1:]):
+                total_stage_transitions += request_count
+                if previous_node != next_node:
+                    cross_node_stage_transitions += request_count
         weights.append(request_count)
         window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
         if progress.should_print():
@@ -671,6 +684,12 @@ def rollout(
     window_stats = _deployment_window_latency_stats(window_latencies)
     replica_stats = _deployment_replica_stats(env)
     resource_stats = _resource_usage_stats(env, args)
+    schedule_usage_stats = _schedule_usage_stats(
+        env,
+        scheduled_replica_counts,
+        cross_node_stage_transitions=cross_node_stage_transitions,
+        total_stage_transitions=total_stage_transitions,
+    )
     rollout_requests = float(env.metrics["requests"] - start_metrics.get("requests", 0.0))
     rollout_aggregate_events = float(env.metrics["aggregate_events"] - start_metrics.get("aggregate_events", 0.0))
     rollout_invalid_actions = float(env.metrics["invalid_actions"] - start_metrics.get("invalid_actions", 0.0))
@@ -707,6 +726,7 @@ def rollout(
         **window_stats,
         **replica_stats,
         **resource_stats,
+        **schedule_usage_stats,
     }
 
 
@@ -778,6 +798,75 @@ def _deployment_replica_stats(env: EdgeComputingEnv) -> dict[str, float]:
         "max_replicas_per_stage": float(counts_np.max()),
         "single_replica_stage_rate": float(np.mean(counts_np <= 1.0)),
         "total_deployed_replicas": float(counts_np.sum()),
+    }
+
+
+def _accumulate_schedule_usage(
+    usage: dict[tuple[int, int, int], float],
+    service_id: int,
+    stage_nodes: list[int] | tuple[int, ...],
+    request_count: float,
+) -> None:
+    for stage_id, node_id in enumerate(stage_nodes):
+        key = (int(service_id), int(stage_id), int(node_id))
+        usage[key] = usage.get(key, 0.0) + float(request_count)
+
+
+def _schedule_usage_stats(
+    env: EdgeComputingEnv,
+    usage: dict[tuple[int, int, int], float],
+    *,
+    cross_node_stage_transitions: float,
+    total_stage_transitions: float,
+) -> dict[str, float]:
+    if env.scenario is None or env.deployment is None:
+        return {
+            "scheduled_stage_invocations": float("nan"),
+            "used_replica_rate": float("nan"),
+            "idle_replica_rate": float("nan"),
+            "used_replicas_per_stage": float("nan"),
+            "avg_replica_use_entropy": float("nan"),
+            "avg_replica_use_top1_share": float("nan"),
+            "cross_node_stage_transition_rate": float("nan"),
+        }
+
+    deployed_total = 0
+    used_total = 0
+    used_per_stage = []
+    entropies = []
+    top1_shares = []
+    scheduled_stage_invocations = float(sum(usage.values()))
+
+    for service in env.scenario.services:
+        for stage in service.stages:
+            deployed_nodes = np.flatnonzero(env.deployment[service.service_id, stage.stage_id])
+            deployed_total += int(len(deployed_nodes))
+            counts = np.asarray(
+                [usage.get((service.service_id, stage.stage_id, int(node_id)), 0.0) for node_id in deployed_nodes],
+                dtype=np.float64,
+            )
+            used = int(np.count_nonzero(counts > 0.0))
+            used_total += used
+            used_per_stage.append(float(used))
+            total = float(counts.sum())
+            if total > 0.0 and counts.size > 1:
+                probabilities = counts[counts > 0.0] / total
+                entropy = -float(np.sum(probabilities * np.log(probabilities)))
+                entropies.append(entropy / max(np.log(float(counts.size)), 1e-9))
+                top1_shares.append(float(counts.max() / total))
+            elif total > 0.0:
+                entropies.append(0.0)
+                top1_shares.append(1.0)
+
+    used_replica_rate = used_total / max(float(deployed_total), 1.0)
+    return {
+        "scheduled_stage_invocations": scheduled_stage_invocations,
+        "used_replica_rate": float(used_replica_rate),
+        "idle_replica_rate": float(1.0 - used_replica_rate),
+        "used_replicas_per_stage": float(np.mean(used_per_stage)) if used_per_stage else float("nan"),
+        "avg_replica_use_entropy": float(np.mean(entropies)) if entropies else 0.0,
+        "avg_replica_use_top1_share": float(np.mean(top1_shares)) if top1_shares else 0.0,
+        "cross_node_stage_transition_rate": float(cross_node_stage_transitions / max(total_stage_transitions, 1.0)),
     }
 
 
@@ -913,6 +1002,13 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "max_node_storage_util",
         "deployed_node_rate",
         "idle_deployed_node_rate",
+        "scheduled_stage_invocations",
+        "used_replica_rate",
+        "idle_replica_rate",
+        "used_replicas_per_stage",
+        "avg_replica_use_entropy",
+        "avg_replica_use_top1_share",
+        "cross_node_stage_transition_rate",
     ]
 
     aggregated: dict[str, float] = {
@@ -1081,6 +1177,13 @@ def evaluate_agent(
     max_node_storage_util = np.array([r["max_node_storage_util"] for r in runs], dtype=np.float64)
     deployed_node_rate = np.array([r["deployed_node_rate"] for r in runs], dtype=np.float64)
     idle_deployed_node_rate = np.array([r["idle_deployed_node_rate"] for r in runs], dtype=np.float64)
+    scheduled_stage_invocations = np.array([r["scheduled_stage_invocations"] for r in runs], dtype=np.float64)
+    used_replica_rate = np.array([r["used_replica_rate"] for r in runs], dtype=np.float64)
+    idle_replica_rate = np.array([r["idle_replica_rate"] for r in runs], dtype=np.float64)
+    used_replicas_per_stage = np.array([r["used_replicas_per_stage"] for r in runs], dtype=np.float64)
+    avg_replica_use_entropy = np.array([r["avg_replica_use_entropy"] for r in runs], dtype=np.float64)
+    avg_replica_use_top1_share = np.array([r["avg_replica_use_top1_share"] for r in runs], dtype=np.float64)
+    cross_node_stage_transition_rate = np.array([r["cross_node_stage_transition_rate"] for r in runs], dtype=np.float64)
     return {
         "eval_avg_latency_s": float(avg_latencies.mean()),
         "eval_avg_latency_std": float(avg_latencies.std()),
@@ -1118,6 +1221,13 @@ def evaluate_agent(
         "eval_max_node_storage_util": float(np.nanmean(max_node_storage_util)),
         "eval_deployed_node_rate": float(np.nanmean(deployed_node_rate)),
         "eval_idle_deployed_node_rate": float(np.nanmean(idle_deployed_node_rate)),
+        "eval_scheduled_stage_invocations": float(np.nanmean(scheduled_stage_invocations)),
+        "eval_used_replica_rate": float(np.nanmean(used_replica_rate)),
+        "eval_idle_replica_rate": float(np.nanmean(idle_replica_rate)),
+        "eval_used_replicas_per_stage": float(np.nanmean(used_replicas_per_stage)),
+        "eval_avg_replica_use_entropy": float(np.nanmean(avg_replica_use_entropy)),
+        "eval_avg_replica_use_top1_share": float(np.nanmean(avg_replica_use_top1_share)),
+        "eval_cross_node_stage_transition_rate": float(np.nanmean(cross_node_stage_transition_rate)),
     }
 
 
@@ -1158,6 +1268,13 @@ EVAL_STAT_KEYS = [
     "eval_max_node_storage_util",
     "eval_deployed_node_rate",
     "eval_idle_deployed_node_rate",
+    "eval_scheduled_stage_invocations",
+    "eval_used_replica_rate",
+    "eval_idle_replica_rate",
+    "eval_used_replicas_per_stage",
+    "eval_avg_replica_use_entropy",
+    "eval_avg_replica_use_top1_share",
+    "eval_cross_node_stage_transition_rate",
 ]
 
 
@@ -1630,6 +1747,13 @@ def main() -> None:
             "max_node_storage_util": np.nan,
             "deployed_node_rate": np.nan,
             "idle_deployed_node_rate": np.nan,
+            "scheduled_stage_invocations": np.nan,
+            "used_replica_rate": np.nan,
+            "idle_replica_rate": np.nan,
+            "used_replicas_per_stage": np.nan,
+            "avg_replica_use_entropy": np.nan,
+            "avg_replica_use_top1_share": np.nan,
+            "cross_node_stage_transition_rate": np.nan,
             "first_window_avg_latency_s": np.nan,
             "last_window_avg_latency_s": np.nan,
             "window_latency_delta_s": np.nan,
@@ -1680,6 +1804,13 @@ def main() -> None:
             "eval_max_node_storage_util": eval_stats["eval_max_node_storage_util"],
             "eval_deployed_node_rate": eval_stats["eval_deployed_node_rate"],
             "eval_idle_deployed_node_rate": eval_stats["eval_idle_deployed_node_rate"],
+            "eval_scheduled_stage_invocations": eval_stats["eval_scheduled_stage_invocations"],
+            "eval_used_replica_rate": eval_stats["eval_used_replica_rate"],
+            "eval_idle_replica_rate": eval_stats["eval_idle_replica_rate"],
+            "eval_used_replicas_per_stage": eval_stats["eval_used_replicas_per_stage"],
+            "eval_avg_replica_use_entropy": eval_stats["eval_avg_replica_use_entropy"],
+            "eval_avg_replica_use_top1_share": eval_stats["eval_avg_replica_use_top1_share"],
+            "eval_cross_node_stage_transition_rate": eval_stats["eval_cross_node_stage_transition_rate"],
             "eval_first_window_avg_latency_s": eval_stats["eval_first_window_avg_latency_s"],
             "eval_last_window_avg_latency_s": eval_stats["eval_last_window_avg_latency_s"],
             "eval_window_latency_delta_s": eval_stats["eval_window_latency_delta_s"],
@@ -1898,6 +2029,13 @@ def main() -> None:
             "max_node_storage_util": stats["max_node_storage_util"],
             "deployed_node_rate": stats["deployed_node_rate"],
             "idle_deployed_node_rate": stats["idle_deployed_node_rate"],
+            "scheduled_stage_invocations": stats["scheduled_stage_invocations"],
+            "used_replica_rate": stats["used_replica_rate"],
+            "idle_replica_rate": stats["idle_replica_rate"],
+            "used_replicas_per_stage": stats["used_replicas_per_stage"],
+            "avg_replica_use_entropy": stats["avg_replica_use_entropy"],
+            "avg_replica_use_top1_share": stats["avg_replica_use_top1_share"],
+            "cross_node_stage_transition_rate": stats["cross_node_stage_transition_rate"],
             "first_window_avg_latency_s": stats["first_window_avg_latency_s"],
             "last_window_avg_latency_s": stats["last_window_avg_latency_s"],
             "window_latency_delta_s": stats["window_latency_delta_s"],
@@ -1948,6 +2086,13 @@ def main() -> None:
             "eval_max_node_storage_util": eval_stats.get("eval_max_node_storage_util", np.nan),
             "eval_deployed_node_rate": eval_stats.get("eval_deployed_node_rate", np.nan),
             "eval_idle_deployed_node_rate": eval_stats.get("eval_idle_deployed_node_rate", np.nan),
+            "eval_scheduled_stage_invocations": eval_stats.get("eval_scheduled_stage_invocations", np.nan),
+            "eval_used_replica_rate": eval_stats.get("eval_used_replica_rate", np.nan),
+            "eval_idle_replica_rate": eval_stats.get("eval_idle_replica_rate", np.nan),
+            "eval_used_replicas_per_stage": eval_stats.get("eval_used_replicas_per_stage", np.nan),
+            "eval_avg_replica_use_entropy": eval_stats.get("eval_avg_replica_use_entropy", np.nan),
+            "eval_avg_replica_use_top1_share": eval_stats.get("eval_avg_replica_use_top1_share", np.nan),
+            "eval_cross_node_stage_transition_rate": eval_stats.get("eval_cross_node_stage_transition_rate", np.nan),
             "eval_first_window_avg_latency_s": eval_stats.get("eval_first_window_avg_latency_s", np.nan),
             "eval_last_window_avg_latency_s": eval_stats.get("eval_last_window_avg_latency_s", np.nan),
             "eval_window_latency_delta_s": eval_stats.get("eval_window_latency_delta_s", np.nan),
@@ -1964,6 +2109,7 @@ def main() -> None:
             "update={:03d} episode={:03d} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} res_penalty={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
+            "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
             "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} idle_deployed={:.1%} "
             "slow_loss={:.4f} fast_loss={:.4f}".format(
                 update + 1,
@@ -1994,6 +2140,11 @@ def main() -> None:
                 stats["min_replicas_per_stage"],
                 stats["max_replicas_per_stage"],
                 stats["single_replica_stage_rate"],
+                stats["used_replica_rate"],
+                stats["idle_replica_rate"],
+                stats["avg_replica_use_entropy"],
+                stats["avg_replica_use_top1_share"],
+                stats["cross_node_stage_transition_rate"],
                 stats["avg_node_compute_load"],
                 stats["max_node_compute_load"],
                 stats["active_node_rate"],
@@ -2014,7 +2165,8 @@ def main() -> None:
         if eval_stats:
             print(
                 "  eval_mean_latency={:.4f}s eval_valid_latency={:.4f}s eval_penalty_latency={:.4f}s eval_std={:.4f}s eval_p95={:.4f}s invalid={:.2f} "
-                "eval_replicas={:.2f} single={:.1%} node_load={:.1%}/{:.1%} hot={:.1%} link_load={:.2%}/{:.1%} hot_link={:.1%} entropy={:.4f} action_change={:.4f}".format(
+                "eval_replicas={:.2f} single={:.1%} used_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
+                "node_load={:.1%}/{:.1%} hot={:.1%} link_load={:.2%}/{:.1%} hot_link={:.1%} entropy={:.4f} action_change={:.4f}".format(
                     eval_stats["eval_avg_latency_s"],
                     eval_stats["eval_avg_valid_latency_s"],
                     eval_stats["eval_avg_penalty_latency_s"],
@@ -2023,6 +2175,10 @@ def main() -> None:
                     eval_stats["eval_invalid_actions"],
                     eval_stats["eval_avg_replicas_per_stage"],
                     eval_stats["eval_single_replica_stage_rate"],
+                    eval_stats["eval_used_replica_rate"],
+                    eval_stats["eval_avg_replica_use_entropy"],
+                    eval_stats["eval_avg_replica_use_top1_share"],
+                    eval_stats["eval_cross_node_stage_transition_rate"],
                     eval_stats["eval_avg_node_compute_load"],
                     eval_stats["eval_max_node_compute_load"],
                     eval_stats["eval_hot_node_rate"],

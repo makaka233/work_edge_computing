@@ -108,7 +108,10 @@ EWMA load, wired-link EWMA load, memory/storage deployment utilization, and the
 fraction of nodes with at least one deployed stage. They also include load
 standard deviation, active-node/link rates, hot-node/link rates, and the idle
 deployed-node rate so resource efficiency can be diagnosed separately from
-latency.
+latency. Scheduler utilization diagnostics report whether fast scheduling uses
+the deployed service replicas: `used_replica_rate`, `idle_replica_rate`,
+`used_replicas_per_stage`, normalized replica-use entropy,
+top-1 replica-use share, and cross-node stage transition rate.
 
 Demand-side load can be raised without changing physical infrastructure. Use
 `--traffic-scale`, `--active-user-ratio`, and
