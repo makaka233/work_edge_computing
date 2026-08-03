@@ -91,6 +91,15 @@ edge nodes because duplicate placement on the same node is masked. Continuous
 compute and bandwidth allocation remains outside the neural policy and is solved
 by the KKT module.
 
+Slow deployment is trained as one composite action per 4-hour window. Count and
+placement actors share a window-level advantage and a dedicated window critic;
+the component choices are not treated as consecutive GAE steps. Fast PPO is
+optimized only against physical task latency. The slow window return combines
+request-weighted physical latency with separately logged deployment-resource and
+migration costs. `--service-resource-fraction` fixes the share of each physical
+node's memory/storage available to this controller, representing system and
+co-tenant reservations without imposing a per-service replica-count cap.
+
 When `--fixed-scenario` is omitted, demand-side variation can be sampled in two
 ways while the physical edge network remains fixed by `--physical-seed`.
 `--demand-sampling-mode episode` reuses one demand scenario for

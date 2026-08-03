@@ -90,7 +90,8 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "baseline requests=4" in result.stdout
     assert "update=001" in result.stdout
     assert "artificial_cap=none" in result.stdout
-    assert "res_penalty=" in result.stdout
+    assert "diag_res=" in result.stdout
+    assert "slowR=" in result.stdout
     assert (log_dir / "training.csv").exists()
     assert (save_dir / "last.pt").exists()
     assert (save_dir / "best.pt").exists()
@@ -98,6 +99,11 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert "avg_train_resource_penalty" in rows[0]
+    assert "avg_diagnostic_resource_penalty" in rows[0]
+    assert "slow_window_return" in rows[0]
+    assert "slow_window_count" in rows[0]
+    assert "slow_critic_explained_variance" in rows[0]
+    assert "avg_service_memory_util" in rows[0]
     assert "active_node_rate" in rows[0]
     assert "hot_link_rate" in rows[0]
 

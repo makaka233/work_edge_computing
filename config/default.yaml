@@ -34,6 +34,7 @@ traffic:
   task_data_scale: 1.0
   node_compute_capacity_scale: 1.0
   wired_link_bandwidth_scale: 1.0
+  service_resource_fraction: 0.5
   request_aggregation_window_seconds: 10.0
   max_representative_groups_per_window: 16
   load_ewma_tau_minutes: 1.0
@@ -59,8 +60,9 @@ agent:
     type: dual_agent_ppo
     optimizer_reward_scale: 10.0
     rollouts_per_update: 1
-    slow_agent_update: every_240_minutes
-    fast_agent_update: per_task_request
+    slow_agent_decision: every_240_minutes
+    fast_agent_decision: per_task_request
+    optimizer_update: after_rollout_batch
     max_replicas_per_stage: null
     actual_replica_count: learned_by_count_ppo
     masked_actions: true
@@ -68,8 +70,16 @@ agent:
     slow_count_entropy_coef: null
     slow_placement_entropy_coef: null
     slow_value_coef: 0.5
+    slow_critic_lr: 0.0003
+    slow_critic_k_epochs: 4
+    slow_composite_action_return: one_return_per_4h_window
+    slow_deployment_memory_coef: 0.03
+    slow_deployment_storage_coef: 0.01
+    slow_migration_coef: 0.02
     reward:
-      base: negative_physical_latency_seconds
+      fast: negative_physical_latency_seconds
+      slow: window_mean_latency_plus_deployment_and_migration_cost
+      resource_shaping_scope: diagnostics_only
       compute_hotspot_threshold: 0.60
       link_hotspot_threshold: 0.60
       compute_hotspot_coef: 0.0

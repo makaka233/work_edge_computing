@@ -398,6 +398,26 @@ def test_physical_capacity_scales_node_compute_and_wired_links():
     )
 
 
+def test_service_resource_fraction_preserves_physical_nodes_but_limits_placement_capacity():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=49,
+            physical_seed=49,
+            scenario_seed=101,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            service_resource_fraction=0.4,
+        )
+    )
+    env.reset()
+    assert env.scenario is not None
+    physical_memory = np.asarray([node.memory_gb for node in env.scenario.nodes])
+    physical_storage = np.asarray([node.storage_gb for node in env.scenario.nodes])
+    np.testing.assert_allclose(env.service_memory_capacities(), physical_memory * 0.4)
+    np.testing.assert_allclose(env.service_storage_capacities(), physical_storage * 0.4)
+
+
 def test_representative_group_sampling_preserves_window_request_count():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

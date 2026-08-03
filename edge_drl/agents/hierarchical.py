@@ -28,8 +28,8 @@ class SlowGreedyDeploymentPolicy:
             env.config.num_edge_nodes,
         )
         deployment = np.zeros(shape, dtype=bool)
-        remaining_memory = np.array([n.memory_gb for n in env.scenario.nodes], dtype=np.float64)
-        remaining_storage = np.array([n.storage_gb for n in env.scenario.nodes], dtype=np.float64)
+        remaining_memory = env.service_memory_capacities()
+        remaining_storage = env.service_storage_capacities()
 
         node_demand = self._forecast_node_service_demand(env)
         node_capacity = np.array([n.compute_gcycles_per_s for n in env.scenario.nodes], dtype=np.float64)

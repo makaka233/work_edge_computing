@@ -29,6 +29,7 @@ class EdgeEnvConfig:
     task_data_scale: float = 1.0
     node_compute_capacity_scale: float = 1.0
     wired_link_bandwidth_scale: float = 1.0
+    service_resource_fraction: float = 0.5
     request_aggregation_window_seconds: float = 10.0
     max_representative_groups_per_window: int | None = 16
     load_ewma_tau_minutes: float = 1.0
@@ -63,6 +64,8 @@ class EdgeEnvConfig:
             raise ValueError("node_compute_capacity_scale must be positive.")
         if self.wired_link_bandwidth_scale <= 0:
             raise ValueError("wired_link_bandwidth_scale must be positive.")
+        if not 0.0 < self.service_resource_fraction <= 1.0:
+            raise ValueError("service_resource_fraction must be in (0, 1].")
         if self.request_aggregation_window_seconds < 0:
             raise ValueError("request_aggregation_window_seconds must be non-negative.")
         if self.max_representative_groups_per_window is not None and self.max_representative_groups_per_window <= 0:
@@ -261,6 +264,22 @@ class EdgeComputingEnv:
             mask[stage_id] = self.deployment[request.service_id, stage_id]
         return mask
 
+    def service_memory_capacities(self) -> np.ndarray:
+        self._require_ready()
+        assert self.scenario is not None
+        return np.asarray(
+            [node.memory_gb * self.config.service_resource_fraction for node in self.scenario.nodes],
+            dtype=np.float64,
+        )
+
+    def service_storage_capacities(self) -> np.ndarray:
+        self._require_ready()
+        assert self.scenario is not None
+        return np.asarray(
+            [node.storage_gb * self.config.service_resource_fraction for node in self.scenario.nodes],
+            dtype=np.float64,
+        )
+
     def check_deployment_feasible(self, deployment: np.ndarray) -> tuple[bool, str]:
         self._require_ready()
         assert self.scenario is not None
@@ -272,8 +291,8 @@ class EdgeComputingEnv:
                 placed = deployment[service.service_id, stage.stage_id]
                 memory += placed * stage.memory_gb
                 storage += placed * stage.storage_gb
-        node_memory = np.array([n.memory_gb for n in self.scenario.nodes])
-        node_storage = np.array([n.storage_gb for n in self.scenario.nodes])
+        node_memory = self.service_memory_capacities()
+        node_storage = self.service_storage_capacities()
         if np.any(memory > node_memory + 1e-9):
             return False, "deployment exceeds node memory"
         if np.any(storage > node_storage + 1e-9):

@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-data-scale", type=float, default=1.0)
     parser.add_argument("--node-compute-capacity-scale", type=float, default=1.0)
     parser.add_argument("--wired-link-bandwidth-scale", type=float, default=1.0)
+    parser.add_argument("--service-resource-fraction", type=float, default=0.5)
     parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
     parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
@@ -62,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
     parser.add_argument("--slow-placement-entropy-coef", type=float, default=None)
     parser.add_argument("--slow-value-coef", type=float, default=0.5)
+    parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
+    parser.add_argument("--slow-critic-k-epochs", type=int, default=4)
+    parser.add_argument("--slow-deployment-memory-coef", type=float, default=0.03)
+    parser.add_argument("--slow-deployment-storage-coef", type=float, default=0.01)
+    parser.add_argument("--slow-migration-coef", type=float, default=0.02)
     parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-minibatch-size", type=int, default=2048)
     parser.add_argument("--fast-minibatch-size", type=int, default=512)
@@ -116,6 +122,8 @@ def main() -> None:
         str(args.node_compute_capacity_scale),
         "--wired-link-bandwidth-scale",
         str(args.wired_link_bandwidth_scale),
+        "--service-resource-fraction",
+        str(args.service_resource_fraction),
         "--request-aggregation-window-seconds",
         str(args.request_aggregation_window_seconds),
         "--max-representative-groups-per-window",
@@ -160,6 +168,16 @@ def main() -> None:
         str(args.idle_deployed_node_coef),
         "--slow-value-coef",
         str(args.slow_value_coef),
+        "--slow-critic-lr",
+        str(args.slow_critic_lr),
+        "--slow-critic-k-epochs",
+        str(args.slow_critic_k_epochs),
+        "--slow-deployment-memory-coef",
+        str(args.slow_deployment_memory_coef),
+        "--slow-deployment-storage-coef",
+        str(args.slow_deployment_storage_coef),
+        "--slow-migration-coef",
+        str(args.slow_migration_coef),
         "--fast-value-coef",
         str(args.fast_value_coef),
         "--slow-minibatch-size",

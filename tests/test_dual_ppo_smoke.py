@@ -40,6 +40,9 @@ def test_dual_ppo_rollout_and_update():
     agent.flush_slow_window_reward(done=True)
     assert len(agent.slow_agent.count_ppo.buffer) > 0
     assert len(agent.slow_agent.placement_ppo.buffer) > 0
+    assert len(agent.slow_agent.window_returns) == 1
+    assert len(agent.slow_agent.count_ppo.buffer.rewards) == 0
+    assert len(agent.slow_agent.placement_ppo.buffer.rewards) == 0
     assert len(agent.fast_agent.ppo.buffer) >= request_count
 
     losses = agent.update()
@@ -48,9 +51,12 @@ def test_dual_ppo_rollout_and_update():
     assert np.isfinite(losses["slow"]["loss"])
     assert np.isfinite(losses["slow"]["count_loss"])
     assert np.isfinite(losses["slow"]["placement_loss"])
+    assert losses["slow"]["window_count"] == 1
+    assert np.isfinite(losses["slow"]["critic_explained_variance"])
     assert np.isfinite(losses["fast"]["loss"])
     assert len(agent.slow_agent.count_ppo.buffer) == 0
     assert len(agent.slow_agent.placement_ppo.buffer) == 0
+    assert len(agent.slow_agent.window_returns) == 0
     assert len(agent.fast_agent.ppo.buffer) == 0
 
 

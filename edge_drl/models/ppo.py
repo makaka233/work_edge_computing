@@ -431,6 +431,122 @@ class PPOAgent:
         self.buffer.clear()
         return last_metrics
 
+    def update_actor(
+        self,
+        advantages: np.ndarray,
+        *,
+        sample_weights: np.ndarray | None = None,
+        progress_label: str = "",
+        progress_interval_seconds: float = 0.0,
+    ) -> dict[str, float]:
+        """Update only the actor using externally computed window advantages.
+
+        Slow deployment is a composite action whose count and placement choices
+        share one window-level return. Its actors therefore must not run GAE over
+        those component choices as if they were consecutive environment steps.
+        """
+
+        n = len(self.buffer)
+        if n == 0:
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "entropy": 0.0,
+                "approx_kl": 0.0,
+            }
+        advantages_np = np.asarray(advantages, dtype=np.float32)
+        if advantages_np.shape != (n,):
+            raise ValueError(f"advantages must have shape ({n},), got {advantages_np.shape}")
+        if sample_weights is None:
+            weights_np = np.ones(n, dtype=np.float32)
+        else:
+            weights_np = np.asarray(sample_weights, dtype=np.float32)
+            if weights_np.shape != (n,):
+                raise ValueError(f"sample_weights must have shape ({n},), got {weights_np.shape}")
+            if np.any(weights_np < 0.0) or not np.isfinite(weights_np).all():
+                raise ValueError("sample_weights must be finite and non-negative")
+            weights_np = weights_np / max(float(weights_np.mean()), 1e-8)
+
+        actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
+        old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
+        minibatch_size = max(1, min(self.minibatch_size, n))
+        batches_per_epoch = int(np.ceil(n / minibatch_size))
+        progress = None
+        if tqdm is not None and progress_interval_seconds > 0 and progress_label:
+            progress = tqdm(
+                total=self.k_epochs * batches_per_epoch,
+                desc=progress_label,
+                unit="mb",
+                dynamic_ncols=True,
+                mininterval=progress_interval_seconds,
+                leave=True,
+                bar_format="{desc}: {percentage:5.1f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                file=sys.stdout,
+            )
+
+        last_metrics: dict[str, float] = {}
+        for epoch_idx in range(self.k_epochs):
+            order = np.random.permutation(n)
+            approx_kls: list[float] = []
+            for start in range(0, n, minibatch_size):
+                idx = order[start : start + minibatch_size]
+                states = torch.as_tensor(
+                    np.stack([self.buffer.states[i] for i in idx]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                masks = torch.as_tensor(
+                    np.stack([self.buffer.masks[i] for i in idx]),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
+                old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
+                batch_advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
+                batch_weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
+
+                dist, _ = self.policy(states, masks)
+                logprobs = dist.log_prob(actions)
+                entropies = dist.entropy()
+                ratios = torch.exp(logprobs - old_logprobs)
+                approx_kl = (old_logprobs - logprobs).mean()
+                surr1 = ratios * batch_advantages
+                surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * batch_advantages
+                denominator = batch_weights.sum().clamp_min(1e-8)
+                policy_loss = -(torch.min(surr1, surr2) * batch_weights).sum() / denominator
+                entropy = (entropies * batch_weights).sum() / denominator
+                loss = policy_loss - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.optimizer.step()
+                approx_kls.append(float(approx_kl.item()))
+                last_metrics = {
+                    "loss": float(loss.item()),
+                    "policy_loss": float(policy_loss.item()),
+                    "value_loss": 0.0,
+                    "entropy": float(entropy.item()),
+                    "approx_kl": float(approx_kl.item()),
+                }
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix_str(
+                        "epoch={} loss={:.4f} kl={:.5f}".format(
+                            epoch_idx + 1,
+                            last_metrics["loss"],
+                            last_metrics["approx_kl"],
+                        ),
+                        refresh=False,
+                    )
+            if self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
+                break
+        if progress is not None:
+            progress.close()
+        self.buffer.clear()
+        return last_metrics
+
     def behavior_clone(
         self,
         states: np.ndarray,
