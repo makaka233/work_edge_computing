@@ -8,6 +8,22 @@ from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 from edge_drl.env.scenario import generate_realistic_scenario
 
 
+def test_default_episode_is_one_stationary_deployment_window():
+    config = EdgeEnvConfig()
+    env = EdgeComputingEnv(config)
+
+    assert config.episode_hours == 4
+    assert config.deployment_interval_minutes == 240
+    assert config.arrival_profile == "stationary"
+    env.current_time_minute = 0.0
+    initial_rate = env._arrival_rate_per_minute()
+    env.current_time_minute = 180.0
+    assert env._arrival_rate_per_minute() == initial_rate
+    assert not env.done
+    env.current_time_minute = 240.0
+    assert env.done
+
+
 def test_kkt_compute_sqrt_rule():
     demands = [
         ComputeDemand("a", 0, 4.0),
@@ -70,7 +86,7 @@ def test_environment_constraints_and_rollout():
             break
 
 
-def test_migration_cost_is_charged_once():
+def test_migration_change_is_logged_without_default_penalty():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=17,
@@ -90,6 +106,7 @@ def test_migration_cost_is_charged_once():
     first_action = agent.act(env)
     _, _, _, first_info = env.step(first_action)
     assert first_info["migration_cost"] > 0
+    assert first_info["migration_penalty"] == 0
     assert env.last_migration_cost == 0
 
     second_action = agent.act(env)
@@ -185,6 +202,7 @@ def test_default_traffic_is_city_scale_for_ten_thousand_users():
             num_edge_nodes=16,
             num_service_types=3,
             episode_hours=24,
+            arrival_profile="daily",
         )
     )
     rates = []

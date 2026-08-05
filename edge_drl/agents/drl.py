@@ -696,7 +696,7 @@ class HierarchicalPPOAgent:
     slow_reward_scale: float = 1.0
     slow_deployment_memory_coef: float = 0.03
     slow_deployment_storage_coef: float = 0.01
-    slow_migration_coef: float = 0.02
+    slow_migration_coef: float = 0.0
     window_deployment_memory_fraction: float = 0.0
     window_deployment_storage_fraction: float = 0.0
     window_migration_fraction: float = 0.0
@@ -728,7 +728,7 @@ class HierarchicalPPOAgent:
         slow_reward_scale: float = 1.0,
         slow_deployment_memory_coef: float = 0.03,
         slow_deployment_storage_coef: float = 0.01,
-        slow_migration_coef: float = 0.02,
+        slow_migration_coef: float = 0.0,
     ) -> "HierarchicalPPOAgent":
         return cls(
             slow_agent=SlowDeploymentPPOAgent(

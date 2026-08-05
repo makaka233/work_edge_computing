@@ -9,6 +9,18 @@ from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_
 from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_grouped_request, generate_realistic_scenario, generate_request
 
 
+def _daily_arrival_factor(minute_of_day: float) -> float:
+    morning_peak = np.exp(-0.5 * ((minute_of_day - 9 * 60) / 105.0) ** 2)
+    lunch_peak = np.exp(-0.5 * ((minute_of_day - 13 * 60) / 90.0) ** 2)
+    evening_peak = np.exp(-0.5 * ((minute_of_day - 19 * 60) / 135.0) ** 2)
+    night_factor = 0.35 if minute_of_day < 6 * 60 else 1.0
+    return float(night_factor * (0.58 + 0.58 * morning_peak + 0.25 * lunch_peak + 0.82 * evening_peak))
+
+
+# Keep stationary 4h episodes at the mean traffic level of the legacy daily profile.
+_STATIONARY_ARRIVAL_FACTOR = float(np.mean([_daily_arrival_factor(float(minute)) for minute in range(24 * 60)]))
+
+
 @dataclass
 class EdgeEnvConfig:
     seed: int = 2026
@@ -18,8 +30,9 @@ class EdgeEnvConfig:
     num_edge_nodes: int = 48
     num_service_types: int = 5
     max_service_stages: int = 3
-    episode_hours: int = 24
+    episode_hours: int = 4
     deployment_interval_minutes: int = 240
+    arrival_profile: str = "stationary"
     mean_requests_per_minute: float | None = None
     active_user_ratio: float = 0.15
     active_user_request_rate_per_minute: float = 1.5
@@ -36,7 +49,7 @@ class EdgeEnvConfig:
     wireless_uplink_mbps: float = 150.0
     radio_rtt_ms: float = 10.0
     load_penalty_weight: float = 0.08
-    migration_cost_weight: float = 0.02
+    migration_cost_weight: float = 0.0
     invalid_action_penalty: float = 10.0
 
     def __post_init__(self) -> None:
@@ -46,6 +59,10 @@ class EdgeEnvConfig:
             raise ValueError("max_service_stages must be <= 3.")
         if self.deployment_interval_minutes != 240:
             raise ValueError("slow deployment interval must be exactly 240 minutes.")
+        if self.episode_hours <= 0:
+            raise ValueError("episode_hours must be positive.")
+        if self.arrival_profile not in {"stationary", "daily"}:
+            raise ValueError("arrival_profile must be 'stationary' or 'daily'.")
         if self.mean_requests_per_minute is not None and self.mean_requests_per_minute <= 0:
             raise ValueError("mean_requests_per_minute override must be positive.")
         if not 0.0 < self.active_user_ratio <= 1.0:
@@ -516,13 +533,10 @@ class EdgeComputingEnv:
         return sampled_counts
 
     def _arrival_rate_per_minute(self) -> float:
+        if self.config.arrival_profile == "stationary":
+            return self._base_arrival_rate_per_minute() * _STATIONARY_ARRIVAL_FACTOR
         minute_of_day = self.current_time_minute % (24 * 60)
-        morning_peak = np.exp(-0.5 * ((minute_of_day - 9 * 60) / 105.0) ** 2)
-        lunch_peak = np.exp(-0.5 * ((minute_of_day - 13 * 60) / 90.0) ** 2)
-        evening_peak = np.exp(-0.5 * ((minute_of_day - 19 * 60) / 135.0) ** 2)
-        night_factor = 0.35 if minute_of_day < 6 * 60 else 1.0
-        daily_factor = 0.58 + 0.58 * morning_peak + 0.25 * lunch_peak + 0.82 * evening_peak
-        return self._base_arrival_rate_per_minute() * night_factor * daily_factor
+        return self._base_arrival_rate_per_minute() * _daily_arrival_factor(minute_of_day)
 
     def _base_arrival_rate_per_minute(self) -> float:
         if self.config.mean_requests_per_minute is not None:

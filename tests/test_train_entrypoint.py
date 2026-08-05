@@ -52,6 +52,15 @@ def test_rollout_load_and_start_modes_cycle():
     assert [load_multiplier_for_rollout(args, idx) for idx in range(5)] == [1.0, 1.5, 2.0, 1.0, 1.5]
     assert [rollout_start_minute(args, idx) for idx in range(7)] == [0.0, 240.0, 480.0, 720.0, 960.0, 1200.0, 0.0]
 
+    stationary_args = Namespace(
+        seed=2026,
+        rollout_start_mode="cycle-window",
+        eval_rollout_start_mode="same",
+        episode_hours=4,
+        arrival_profile="stationary",
+    )
+    assert [rollout_start_minute(stationary_args, idx) for idx in range(3)] == [0.0, 0.0, 0.0]
+
 
 def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     log_dir = tmp_path / "logs"
@@ -340,8 +349,6 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
         "16",
         "--num-service-types",
         "3",
-        "--episode-hours",
-        "8",
         "--request-aggregation-window-seconds",
         "60",
         "--max-representative-groups-per-window",
@@ -355,7 +362,9 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollouts_per_update=2" in result.stdout
-    assert "update=001 episode=002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=0 window=01" in result.stdout
+    assert "episode_horizon=4h deployment_windows=1" in result.stdout
+    assert "arrival_profile=stationary" in result.stdout
+    assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=1 window=01" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -382,6 +391,8 @@ def test_rollouts_per_update_batches_pressure_levels_and_start_windows(tmp_path)
         "1.0,1.5",
         "--rollout-start-mode",
         "cycle-window",
+        "--arrival-profile",
+        "daily",
         "--mean-requests-per-minute",
         "2",
         "--num-users",

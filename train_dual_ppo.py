@@ -42,13 +42,24 @@ def parse_args() -> argparse.Namespace:
         default="episode",
         help=(
             "episode keeps the demand scenario for --scenario-refresh-episodes training episodes; "
-            "rollout samples a new demand scenario for every PPO rollout/update while keeping physical_seed fixed."
+            "rollout samples a new demand scenario for every PPO rollout while keeping physical_seed fixed."
         ),
     )
     parser.add_argument("--num-users", type=int, default=10_000)
     parser.add_argument("--num-edge-nodes", type=int, default=32)
     parser.add_argument("--num-service-types", type=int, default=10)
-    parser.add_argument("--episode-hours", type=int, default=24)
+    parser.add_argument(
+        "--episode-hours",
+        type=int,
+        default=4,
+        help="Environment episode horizon in hours. The default 4h equals one slow-deployment window.",
+    )
+    parser.add_argument(
+        "--arrival-profile",
+        choices=["stationary", "daily"],
+        default="stationary",
+        help="Use stationary demand for independent 4h episodes, or the legacy 24h morning/lunch/evening profile.",
+    )
     parser.add_argument("--mean-requests-per-minute", type=float, default=None)
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
     parser.add_argument("--active-user-request-rate-per-minute", type=float, default=1.5)
@@ -63,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         "--rollout-start-mode",
         choices=["beginning", "cycle-window", "random-window"],
         default="beginning",
-        help="Initial time for each training rollout. cycle/random-window covers different 4h deployment windows.",
+        help="Initial time for each training rollout. Nonzero starts only affect the legacy daily arrival profile.",
     )
     parser.add_argument(
         "--eval-rollout-start-mode",
@@ -102,7 +113,10 @@ def parse_args() -> argparse.Namespace:
         "--rollout-unit",
         choices=["requests", "window", "episode"],
         default="requests",
-        help="Collect each PPO update by request count, one 4h slow-deployment window, or one full environment episode.",
+        help=(
+            "Collect each PPO rollout by request count, one 4h window, or one full environment episode. "
+            "With the default 4h horizon, window and episode both collect one complete episode."
+        ),
     )
     parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency"], default="latency")
@@ -137,7 +151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-critic-k-epochs", type=int, default=4)
     parser.add_argument("--slow-deployment-memory-coef", type=float, default=0.03)
     parser.add_argument("--slow-deployment-storage-coef", type=float, default=0.01)
-    parser.add_argument("--slow-migration-coef", type=float, default=0.02)
+    parser.add_argument(
+        "--slow-migration-coef",
+        type=float,
+        default=0.0,
+        help="Slow-return migration penalty. Disabled for independent 4h episodes; migration changes remain logged.",
+    )
     parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-target-kl", type=float, default=0.03)
     parser.add_argument("--fast-target-kl", type=float, default=0.03)
@@ -190,6 +209,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--service-resource-fraction must be in (0, 1]")
     if args.slow_critic_k_epochs < 1:
         parser.error("--slow-critic-k-epochs must be >= 1")
+    if args.episode_hours < 1:
+        parser.error("--episode-hours must be >= 1")
     try:
         _parse_float_list(args.load_multipliers, "--load-multipliers")
     except ValueError as exc:
@@ -219,6 +240,8 @@ def load_multiplier_for_rollout(args: argparse.Namespace, rollout_idx: int) -> f
 
 
 def rollout_start_minute(args: argparse.Namespace, rollout_idx: int, *, eval_mode: bool = False) -> float:
+    if getattr(args, "arrival_profile", "daily") == "stationary":
+        return 0.0
     mode = getattr(args, "rollout_start_mode", "beginning")
     if eval_mode:
         eval_mode_value = getattr(args, "eval_rollout_start_mode", "same")
@@ -271,6 +294,7 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
             episode_hours=args.episode_hours,
+            arrival_profile=args.arrival_profile,
             mean_requests_per_minute=args.mean_requests_per_minute,
             active_user_ratio=args.active_user_ratio,
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
@@ -301,6 +325,7 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
             episode_hours=args.episode_hours,
+            arrival_profile=args.arrival_profile,
             mean_requests_per_minute=args.mean_requests_per_minute,
             active_user_ratio=args.active_user_ratio,
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
@@ -323,7 +348,8 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
 def traffic_rate_summary(env: EdgeComputingEnv) -> dict[str, float]:
     rates = []
     original_time = env.current_time_minute
-    for minute in range(24 * 60):
+    episode_minutes = max(int(env.config.episode_hours * 60), 1)
+    for minute in range(episode_minutes):
         env.current_time_minute = float(minute)
         rates.append(env._arrival_rate_per_minute())
     env.current_time_minute = original_time
@@ -332,7 +358,7 @@ def traffic_rate_summary(env: EdgeComputingEnv) -> dict[str, float]:
         "avg_requests_per_second": float(values.mean() / 60.0),
         "min_requests_per_second": float(values.min() / 60.0),
         "max_requests_per_second": float(values.max() / 60.0),
-        "expected_requests_per_day": float(values.sum()),
+        "expected_requests_per_episode": float(values.sum()),
     }
 
 
@@ -1645,11 +1671,12 @@ def main() -> None:
     print(f"  reference_style=DRL-AC-Allocation sequential masked PPO")
     print(f"  users={args.num_users}, nodes={args.num_edge_nodes}, services={args.num_service_types}")
     print(
-        "  traffic avg={:.2f}/s min={:.2f}/s peak={:.2f}/s expected_day={:.0f}".format(
+        "  traffic avg={:.2f}/s min={:.2f}/s peak={:.2f}/s expected_episode({}h)={:.0f}".format(
             traffic["avg_requests_per_second"],
             traffic["min_requests_per_second"],
             traffic["max_requests_per_second"],
-            traffic["expected_requests_per_day"],
+            args.episode_hours,
+            traffic["expected_requests_per_episode"],
         )
     )
     print(f"  train_mode={args.train_mode}")
@@ -1659,7 +1686,12 @@ def main() -> None:
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
     print(f"  rollouts_per_update={args.rollouts_per_update}")
-    print(f"  rollout_start_mode={args.rollout_start_mode} eval_rollout_start_mode={args.eval_rollout_start_mode}")
+    print(f"  episode_horizon={args.episode_hours}h deployment_windows={max(int(np.ceil(args.episode_hours / 4.0)), 1)}")
+    print(f"  arrival_profile={args.arrival_profile}")
+    if args.arrival_profile == "stationary":
+        print("  rollout_start_mode=beginning (stationary demand; requested start modes have no effect)")
+    else:
+        print(f"  rollout_start_mode={args.rollout_start_mode} eval_rollout_start_mode={args.eval_rollout_start_mode}")
     print(f"  load_multipliers={args.load_multipliers}")
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
@@ -2012,6 +2044,7 @@ def main() -> None:
             window_numbers.append(window_in_episode)
 
         stats = aggregate_rollout_stats(rollout_stats)
+        episode_start_number = episode_numbers[0]
         episode_number = episode_numbers[-1]
         window_in_episode = window_numbers[-1]
         demand_seed = demand_seeds[0]
@@ -2221,15 +2254,20 @@ def main() -> None:
             **prefix_eval_stats(seen_eval_stats, "seen_eval_"),
         }
         append_log(log_path, log_row)
+        episode_label = (
+            f"episode={episode_number:03d}"
+            if episode_start_number == episode_number
+            else f"episodes={episode_start_number:03d}-{episode_number:03d}"
+        )
         print(
-            "update={:03d} episode={:03d} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} diag_res={:.4f} slowR={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
             "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} service_mem={:.1%}/{:.1%} service_storage={:.1%}/{:.1%} idle_deployed={:.1%} "
             "slow_loss={:.4f} slow_windows={:.0f} critic_ev={:.3f} fast_loss={:.4f}".format(
                 update + 1,
-                episode_number,
+                episode_label,
                 demand_seed,
                 demand_seed_end,
                 load_multiplier,

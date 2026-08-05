@@ -24,6 +24,7 @@ def test_dual_ppo_rollout_and_update():
     )
     env.reset()
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    assert agent.slow_migration_coef == 0
 
     request_count = 0
     while request_count < 6 and not env.done:
