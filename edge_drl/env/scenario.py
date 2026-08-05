@@ -234,14 +234,33 @@ def generate_grouped_request(
 ) -> TaskRequest:
     service = services[service_id]
 
-    input_mb = float(rng.lognormal(np.log(service.input_mb_mean * task_data_scale), 0.35))
+    input_mb = _sample_lognormal_group_mean(
+        rng,
+        service.input_mb_mean * task_data_scale,
+        0.35,
+        request_count,
+    )
     stage_compute = []
     stage_output = []
     for stage in service.stages:
-        stage_compute.append(float(rng.lognormal(np.log(stage.compute_gcycles_mean * task_compute_scale), 0.30)))
-        stage_output.append(float(rng.lognormal(np.log(stage.output_mb_mean * task_data_scale), 0.35)))
+        stage_compute.append(
+            _sample_lognormal_group_mean(
+                rng,
+                stage.compute_gcycles_mean * task_compute_scale,
+                0.30,
+                request_count,
+            )
+        )
+        stage_output.append(
+            _sample_lognormal_group_mean(
+                rng,
+                stage.output_mb_mean * task_data_scale,
+                0.35,
+                request_count,
+            )
+        )
 
-    deadline_s = float(rng.lognormal(np.log(service.deadline_s_mean), 0.18))
+    deadline_s = _sample_lognormal_group_mean(rng, service.deadline_s_mean, 0.18, request_count)
     deadline_s = float(np.clip(deadline_s, 0.05, 0.60))
     return TaskRequest(
         request_id=request_id,
@@ -255,6 +274,24 @@ def generate_grouped_request(
         stage_output_mb=tuple(stage_output),
         deadline_s=float(deadline_s),
     )
+
+
+def _sample_lognormal_group_mean(
+    rng: np.random.Generator,
+    median: float,
+    sigma: float,
+    count: int,
+) -> float:
+    """Sample a moment-matched mean for a group of iid lognormal tasks."""
+
+    count = max(int(count), 1)
+    mu = float(np.log(max(median, 1e-12)))
+    single_mean = float(np.exp(mu + 0.5 * sigma**2))
+    single_variance = float((np.exp(sigma**2) - 1.0) * np.exp(2.0 * mu + sigma**2))
+    mean_variance = single_variance / count
+    group_sigma_sq = float(np.log1p(mean_variance / max(single_mean**2, 1e-24)))
+    group_mu = float(np.log(single_mean) - 0.5 * group_sigma_sq)
+    return float(rng.lognormal(group_mu, np.sqrt(group_sigma_sq)))
 
 
 def _generate_services(

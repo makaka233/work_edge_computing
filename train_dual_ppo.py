@@ -52,7 +52,13 @@ def parse_args() -> argparse.Namespace:
         "--episode-hours",
         type=int,
         default=4,
-        help="Environment episode horizon in hours. The default 4h equals one slow-deployment window.",
+        help="Environment episode horizon in hours. One episode contains one-second environment steps.",
+    )
+    parser.add_argument(
+        "--deployment-interval-minutes",
+        type=int,
+        default=10,
+        help="Slow deployment period. The default 10 minutes equals 600 environment steps.",
     )
     parser.add_argument(
         "--arrival-profile",
@@ -102,8 +108,12 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Fixed fraction of each node's memory/storage available to this service-placement controller.",
     )
-    parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
-    parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
+    parser.add_argument(
+        "--request-aggregation-window-seconds",
+        type=float,
+        default=1.0,
+        help="Fixed at 1 second: one env.step jointly settles all non-empty node-service groups in that second.",
+    )
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
     parser.add_argument("--wireless-uplink-mbps", type=float, default=150.0)
     parser.add_argument("--radio-rtt-ms", type=float, default=10.0)
@@ -112,10 +122,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rollout-unit",
         choices=["requests", "window", "episode"],
-        default="requests",
+        default="window",
         help=(
-            "Collect each PPO rollout by request count, one 4h window, or one full environment episode. "
-            "With the default 4h horizon, window and episode both collect one complete episode."
+            "Collect each PPO rollout by request count, one slow-deployment window, or one full environment episode."
         ),
     )
     parser.add_argument("--reward-scale", type=float, default=10.0)
@@ -155,7 +164,7 @@ def parse_args() -> argparse.Namespace:
         "--slow-migration-coef",
         type=float,
         default=0.0,
-        help="Slow-return migration penalty. Disabled for independent 4h episodes; migration changes remain logged.",
+        help="Slow-return migration penalty. Disabled by default; deployment changes remain logged.",
     )
     parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-target-kl", type=float, default=0.03)
@@ -211,6 +220,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-critic-k-epochs must be >= 1")
     if args.episode_hours < 1:
         parser.error("--episode-hours must be >= 1")
+    if args.deployment_interval_minutes < 1:
+        parser.error("--deployment-interval-minutes must be >= 1")
+    if not np.isclose(args.request_aggregation_window_seconds, 1.0):
+        parser.error("--request-aggregation-window-seconds must be exactly 1.0")
+    if args.train_mode == "joint" and args.rollout_unit == "requests":
+        parser.error("joint training requires --rollout-unit window or episode so each slow action receives a complete return")
     try:
         _parse_float_list(args.load_multipliers, "--load-multipliers")
     except ValueError as exc:
@@ -248,7 +263,7 @@ def rollout_start_minute(args: argparse.Namespace, rollout_idx: int, *, eval_mod
         mode = mode if eval_mode_value == "same" else eval_mode_value
     if mode == "beginning":
         return 0.0
-    interval = 240
+    interval = int(getattr(args, "deployment_interval_minutes", 10))
     total_minutes = int(getattr(args, "episode_hours", 24) * 60)
     starts = list(range(0, max(total_minutes - interval + 1, 1), interval))
     if not starts:
@@ -265,9 +280,8 @@ def start_env_at_minute(env: EdgeComputingEnv, start_minute: float) -> None:
     env.current_time_minute = float(start_minute)
     env.next_deployment_update_minute = float(start_minute)
     env.last_load_update_minute = float(start_minute)
-    env.pending_requests = []
-    env.current_request = env._next_request()
-    env.last_load_update_minute = env.current_time_minute
+    env.current_requests = env._generate_current_second_requests()
+    env.current_request = env.current_requests[0] if env.current_requests else None
 
 
 def scenario_seed_for_offset(args: argparse.Namespace, seed_offset: int = 0, *, group_by_refresh: bool = False) -> int:
@@ -294,6 +308,7 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
             episode_hours=args.episode_hours,
+            deployment_interval_minutes=args.deployment_interval_minutes,
             arrival_profile=args.arrival_profile,
             mean_requests_per_minute=args.mean_requests_per_minute,
             active_user_ratio=args.active_user_ratio,
@@ -306,7 +321,6 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             wired_link_bandwidth_scale=args.wired_link_bandwidth_scale,
             service_resource_fraction=args.service_resource_fraction,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
-            max_representative_groups_per_window=args.max_representative_groups_per_window,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
             wireless_uplink_mbps=args.wireless_uplink_mbps,
             radio_rtt_ms=args.radio_rtt_ms,
@@ -325,6 +339,7 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
             episode_hours=args.episode_hours,
+            deployment_interval_minutes=args.deployment_interval_minutes,
             arrival_profile=args.arrival_profile,
             mean_requests_per_minute=args.mean_requests_per_minute,
             active_user_ratio=args.active_user_ratio,
@@ -337,7 +352,6 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             wired_link_bandwidth_scale=args.wired_link_bandwidth_scale,
             service_resource_fraction=args.service_resource_fraction,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
-            max_representative_groups_per_window=args.max_representative_groups_per_window,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
             wireless_uplink_mbps=args.wireless_uplink_mbps,
             radio_rtt_ms=args.radio_rtt_ms,
@@ -662,54 +676,60 @@ def rollout(
         start_aggregate_events=float(start_metrics.get("aggregate_events", 0.0)),
     )
     while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit, stop_time_minute=stop_time_minute):
-        request = env.current_request
-        assert request is not None
+        requests = list(env.current_requests)
         if train_mode == "fast-only":
             if env.needs_deployment_update:
                 env.apply_deployment(frozen_slow_policy.act(env))
-            action = agent.fast_agent.schedule(env, deterministic=deterministic, record=record)
+            actions = [
+                agent.fast_agent.schedule(env, request=request, deterministic=deterministic, record=record)
+                for request in requests
+            ]
         else:
-            action = agent.act(env, deterministic=deterministic, record=record)
+            actions = agent.act_batch(env, deterministic=deterministic, record=record)
         deployment_window = int(env.metrics["deployment_updates"])
-        _, reward, done, info = env.step(action)
-        request_count = float(info.get("request_count", 1.0))
-        train_reward_info = _training_reward_components(info, env, args)
-        train_reward = train_reward_info["train_reward"]
-        if record:
-            agent.observe_step_reward(
-                train_reward * reward_scale,
-                stage_count=len(request.stage_compute_gcycles),
-                done=done,
-                weight=request_count,
-                slow_reward=-float(info["latency_s"]) * reward_scale,
-            )
-        rewards.append(float(reward))
-        train_rewards.append(float(train_reward))
-        train_latency_costs.append(float(train_reward_info["train_latency_cost_s"]))
-        train_resource_penalties.append(float(train_reward_info["train_resource_penalty"]))
-        diagnostic_resource_penalties.append(float(train_reward_info["diagnostic_resource_penalty"]))
-        compute_hotspot_penalties.append(float(train_reward_info["compute_hotspot_penalty"]))
-        link_hotspot_penalties.append(float(train_reward_info["link_hotspot_penalty"]))
-        compute_imbalance_penalties.append(float(train_reward_info["compute_imbalance_penalty"]))
-        link_imbalance_penalties.append(float(train_reward_info["link_imbalance_penalty"]))
-        idle_deployed_node_penalties.append(float(train_reward_info["idle_deployed_node_penalty"]))
-        latencies.append(float(info["latency_s"]))
-        penalty_latencies.append(float(info["penalty_latency_s"]))
-        if info["valid"]:
-            valid_latencies.append(float(info["physical_latency_s"]))
-            valid_weights.append(request_count)
-            _accumulate_schedule_usage(
-                scheduled_replica_counts,
-                request.service_id,
-                info["stage_nodes"],
-                request_count,
-            )
-            for previous_node, next_node in zip(info["stage_nodes"], info["stage_nodes"][1:]):
-                total_stage_transitions += request_count
-                if previous_node != next_node:
-                    cross_node_stage_transitions += request_count
-        weights.append(request_count)
-        window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
+        _, _, done, batch_info = env.step(actions)
+        group_infos = batch_info["group_infos"]
+        for group_idx, (request, info) in enumerate(zip(requests, group_infos)):
+            request_count = float(info.get("request_count", request.request_count))
+            train_reward_info = _training_reward_components(info, env, args)
+            train_reward = train_reward_info["train_reward"]
+            if record:
+                agent.observe_step_reward(
+                    train_reward * reward_scale,
+                    stage_count=len(request.stage_compute_gcycles),
+                    done=bool(done and group_idx == len(group_infos) - 1),
+                    weight=request_count,
+                    slow_reward=-float(info["latency_s"]) * reward_scale,
+                )
+            rewards.append(float(info["reward"]))
+            train_rewards.append(float(train_reward))
+            train_latency_costs.append(float(train_reward_info["train_latency_cost_s"]))
+            train_resource_penalties.append(float(train_reward_info["train_resource_penalty"]))
+            diagnostic_resource_penalties.append(float(train_reward_info["diagnostic_resource_penalty"]))
+            compute_hotspot_penalties.append(float(train_reward_info["compute_hotspot_penalty"]))
+            link_hotspot_penalties.append(float(train_reward_info["link_hotspot_penalty"]))
+            compute_imbalance_penalties.append(float(train_reward_info["compute_imbalance_penalty"]))
+            link_imbalance_penalties.append(float(train_reward_info["link_imbalance_penalty"]))
+            idle_deployed_node_penalties.append(float(train_reward_info["idle_deployed_node_penalty"]))
+            latencies.append(float(info["latency_s"]))
+            penalty_latencies.append(float(info["penalty_latency_s"]))
+            if info["valid"]:
+                valid_latencies.append(float(info["physical_latency_s"]))
+                valid_weights.append(request_count)
+                _accumulate_schedule_usage(
+                    scheduled_replica_counts,
+                    request.service_id,
+                    info["stage_nodes"],
+                    request_count,
+                )
+                for previous_node, next_node in zip(info["stage_nodes"], info["stage_nodes"][1:]):
+                    total_stage_transitions += request_count
+                    if previous_node != next_node:
+                        cross_node_stage_transitions += request_count
+            weights.append(request_count)
+            window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
+        if record and done and not group_infos:
+            agent.flush_slow_window_reward(done=True)
         if progress.should_print():
             progress.maybe_print(
                 env,
@@ -727,7 +747,7 @@ def rollout(
         avg_valid_latency_s=_weighted_mean(valid_latencies, valid_weights),
         avg_penalty_latency_s=_weighted_mean(penalty_latencies, weights),
     )
-    if record and env.metrics["requests"] > 0:
+    if record and (env.done or env.needs_deployment_update):
         agent.flush_slow_window_reward(done=env.done)
     slow_window_metrics = {
         "slow_window_return": float("nan"),
@@ -1385,6 +1405,7 @@ def evaluate_policy_diagnostics(
     top1_probs: list[float] = []
     top1_margins: list[float] = []
     deterministic_latencies: list[float] = []
+    deterministic_latency_weights: list[float] = []
     stochastic_latencies: list[float] = []
     slow_policy = SlowGreedyDeploymentPolicy()
 
@@ -1414,20 +1435,31 @@ def evaluate_policy_diagnostics(
             rollout_unit=rollout_unit,
             stop_time_minute=det_stop_time_minute,
         ):
-            request = env.current_request
-            assert request is not None
+            requests = list(env.current_requests)
             if train_mode == "fast-only":
                 if env.needs_deployment_update:
                     env.apply_deployment(slow_policy.act(env))
             else:
                 agent.maybe_update_deployment(env, deterministic=True, record=False)
-            action, stage_stats = agent.fast_agent.schedule_with_diagnostics(env, request)
-            _, _, _, info = env.step(action)
-            deterministic_latencies.append(float(info["latency_s"]))
-            deterministic_actions.extend(action)
-            entropies.extend(float(s["entropy"]) for s in stage_stats)
-            top1_probs.extend(float(s["top1_prob"]) for s in stage_stats)
-            top1_margins.extend(float(s["top1_margin"]) for s in stage_stats)
+            actions: list[list[int]] = []
+            diagnostics_by_group: list[list[dict[str, float | int]]] = []
+            for request in requests:
+                action, stage_stats = agent.fast_agent.schedule_with_diagnostics(env, request)
+                actions.append(action)
+                diagnostics_by_group.append(stage_stats)
+            _, _, _, batch_info = env.step(actions)
+            for request, action, stage_stats, info in zip(
+                requests,
+                actions,
+                diagnostics_by_group,
+                batch_info["group_infos"],
+            ):
+                deterministic_latencies.append(float(info["latency_s"]))
+                deterministic_latency_weights.append(float(request.request_count))
+                deterministic_actions.extend(action)
+                entropies.extend(float(s["entropy"]) for s in stage_stats)
+                top1_probs.extend(float(s["top1_prob"]) for s in stage_stats)
+                top1_margins.extend(float(s["top1_margin"]) for s in stage_stats)
             det_progress.maybe_print(env)
         det_progress.finish(env)
 
@@ -1466,7 +1498,11 @@ def evaluate_policy_diagnostics(
         "eval_top1_margin": float(np.mean(top1_margins)) if top1_margins else float("nan"),
         "eval_action_change_rate": action_change_rate,
         "eval_stochastic_avg_latency_s": float(np.mean(stochastic_latencies)) if stochastic_latencies else float("nan"),
-        "eval_deterministic_avg_latency_s": float(np.mean(deterministic_latencies)) if deterministic_latencies else float("nan"),
+        "eval_deterministic_avg_latency_s": (
+            float(np.average(deterministic_latencies, weights=deterministic_latency_weights))
+            if deterministic_latencies
+            else float("nan")
+        ),
     }
     return diagnostics, deterministic_actions
 
@@ -1478,11 +1514,13 @@ def rollout_baseline(env: EdgeComputingEnv, max_requests: int) -> dict[str, floa
     latencies: list[float] = []
     invalid = 0
     while not env.done and env.metrics["requests"] < max_requests:
-        action = agent.act(env)
-        _, reward, _, info = env.step(action)
-        rewards.append(float(reward))
-        latencies.append(float(info["latency_s"]))
-        invalid += int(not info["valid"])
+        requests = list(env.current_requests)
+        actions = agent.act_batch(env)
+        _, _, _, batch_info = env.step(actions)
+        for request, info in zip(requests, batch_info["group_infos"]):
+            rewards.extend([float(info["reward"])] * int(request.request_count))
+            latencies.extend([float(info["latency_s"])] * int(request.request_count))
+            invalid += int(not info["valid"]) * int(request.request_count)
     return {
         "requests": float(env.metrics["requests"]),
         "avg_reward": float(np.mean(rewards)) if rewards else 0.0,
@@ -1517,20 +1555,22 @@ def pretrain_fast_agent(
         while not env.done and collected_requests < requests:
             if env.needs_deployment_update:
                 env.apply_deployment(slow_policy.act(env))
-            request = env.current_request
-            assert request is not None
-            expert_nodes = expert.act(env, request)
-            partial_nodes: list[int] = []
-            for stage_id, node_id in enumerate(expert_nodes):
-                state = agent.fast_agent._build_state(env, request, stage_id, partial_nodes)
-                mask = agent.fast_agent._build_mask(env, request, stage_id, partial_nodes)
-                if mask[node_id]:
-                    states.append(state)
-                    masks.append(mask)
-                    actions.append(node_id)
-                partial_nodes.append(node_id)
-            _, _, _, _ = env.step(expert_nodes)
-            collected_requests += 1
+            tick_requests = list(env.current_requests)
+            expert_batch: list[list[int]] = []
+            for request in tick_requests:
+                expert_nodes = expert.act(env, request)
+                expert_batch.append(expert_nodes)
+                partial_nodes: list[int] = []
+                for stage_id, node_id in enumerate(expert_nodes):
+                    state = agent.fast_agent._build_state(env, request, stage_id, partial_nodes)
+                    mask = agent.fast_agent._build_mask(env, request, stage_id, partial_nodes)
+                    if mask[node_id]:
+                        states.append(state)
+                        masks.append(mask)
+                        actions.append(node_id)
+                    partial_nodes.append(node_id)
+            env.step(expert_batch)
+            collected_requests += int(sum(request.request_count for request in tick_requests))
 
     if not actions:
         return {"bc_loss": 0.0, "bc_accuracy": 0.0, "bc_samples": 0.0}
@@ -1668,7 +1708,7 @@ def main() -> None:
     )
 
     print("Hierarchical dual-agent PPO")
-    print(f"  reference_style=DRL-AC-Allocation sequential masked PPO")
+    print("  reference_style=DRL-AC-Allocation masked PPO with joint per-second settlement")
     print(f"  users={args.num_users}, nodes={args.num_edge_nodes}, services={args.num_service_types}")
     print(
         "  traffic avg={:.2f}/s min={:.2f}/s peak={:.2f}/s expected_episode({}h)={:.0f}".format(
@@ -1686,7 +1726,12 @@ def main() -> None:
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
     print(f"  rollouts_per_update={args.rollouts_per_update}")
-    print(f"  episode_horizon={args.episode_hours}h deployment_windows={max(int(np.ceil(args.episode_hours / 4.0)), 1)}")
+    deployment_windows = max(
+        int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
+        1,
+    )
+    print(f"  episode_horizon={args.episode_hours}h deployment_windows={deployment_windows}")
+    print("  environment_step=1s representative_group_sampling=disabled")
     print(f"  arrival_profile={args.arrival_profile}")
     if args.arrival_profile == "stationary":
         print("  rollout_start_mode=beginning (stationary demand; requested start modes have no effect)")
@@ -1739,8 +1784,8 @@ def main() -> None:
         )
     )
     print(f"  ppo_minibatch slow={args.slow_minibatch_size} fast={args.fast_minibatch_size}")
-    print("  slow_agent=service deployment every 240 minutes")
-    print("  fast_agent=stage scheduling per task request")
+    print(f"  slow_agent=service deployment every {args.deployment_interval_minutes} minutes")
+    print("  fast_agent=joint one-second group scheduling")
     if args.fast_bc_requests > 0:
         print(
             "  fast_bc samples={} loss={:.4f} accuracy={:.4f}".format(
@@ -1971,7 +2016,10 @@ def main() -> None:
 
     train_env: EdgeComputingEnv | None = None
     train_episode_idx = 0
-    total_windows = max(int(np.ceil(args.episode_hours * 60.0 / 240.0)), 1)
+    total_windows = max(
+        int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
+        1,
+    )
     for update in range(args.updates):
         rollout_stats: list[dict[str, float]] = []
         demand_seeds: list[int] = []

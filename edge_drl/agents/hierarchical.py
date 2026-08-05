@@ -17,7 +17,7 @@ class SlowGreedyDeploymentPolicy:
     broad_stage_replication: bool = True
 
     def act(self, env: EdgeComputingEnv) -> np.ndarray:
-        """Create a feasible service-stage placement for the next 4-hour window."""
+        """Create a feasible service-stage placement for the next slow-control window."""
 
         env._require_ready()
         assert env.scenario is not None
@@ -219,6 +219,10 @@ class HierarchicalBaselineAgent:
     def act(self, env: EdgeComputingEnv) -> list[int]:
         self.maybe_update_deployment(env)
         return self.fast_policy.act(env)
+
+    def act_batch(self, env: EdgeComputingEnv) -> list[list[int]]:
+        self.maybe_update_deployment(env)
+        return [self.fast_policy.act(env, request) for request in env.current_requests]
 
 
 def build_baseline_agent() -> HierarchicalBaselineAgent:

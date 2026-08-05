@@ -22,6 +22,7 @@ class RolloutBuffer:
     rewards: list[float] = field(default_factory=list)
     dones: list[bool] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
+    weights: list[float] = field(default_factory=list)
 
     def add(
         self,
@@ -33,6 +34,7 @@ class RolloutBuffer:
         reward: float,
         done: bool,
         value: float,
+        weight: float = 1.0,
     ) -> None:
         self.states.append(np.asarray(state, dtype=np.float32))
         self.masks.append(np.asarray(mask, dtype=bool))
@@ -41,12 +43,14 @@ class RolloutBuffer:
         self.rewards.append(float(reward))
         self.dones.append(bool(done))
         self.values.append(float(value))
+        self.weights.append(float(weight))
 
-    def extend_rewards_for_pending(self, reward: float, done: bool) -> None:
+    def extend_rewards_for_pending(self, reward: float, done: bool, weight: float = 1.0) -> None:
         missing = len(self.actions) - len(self.rewards)
         for _ in range(missing):
             self.rewards.append(float(reward))
             self.dones.append(bool(done))
+            self.weights.append(float(weight))
 
     def clear(self) -> None:
         self.states.clear()
@@ -56,6 +60,7 @@ class RolloutBuffer:
         self.rewards.clear()
         self.dones.clear()
         self.values.clear()
+        self.weights.clear()
 
     def __len__(self) -> int:
         return len(self.actions)
@@ -356,7 +361,16 @@ class PPOAgent:
             raise ValueError("buffer contains pending transitions without rewards")
 
         advantages_np, returns_np = self._gae_advantages_and_returns()
-        advantages_np = (advantages_np - advantages_np.mean()) / (advantages_np.std() + 1e-8)
+        if self.buffer.weights:
+            if len(self.buffer.weights) != len(self.buffer.actions):
+                raise ValueError("buffer sample weights do not match actions")
+            weights_np = np.asarray(self.buffer.weights, dtype=np.float32)
+        else:
+            weights_np = np.ones(len(self.buffer.actions), dtype=np.float32)
+        weights_np /= max(float(weights_np.mean()), 1e-8)
+        advantage_mean = float(np.average(advantages_np, weights=weights_np))
+        advantage_variance = float(np.average((advantages_np - advantage_mean) ** 2, weights=weights_np))
+        advantages_np = (advantages_np - advantage_mean) / (np.sqrt(advantage_variance) + 1e-8)
 
         actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
@@ -388,17 +402,20 @@ class PPOAgent:
                 old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
                 advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
                 returns = torch.as_tensor(returns_np[idx], dtype=torch.float32, device=self.device)
+                sample_weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
+                sample_weights = sample_weights / sample_weights.mean().clamp_min(1e-8)
 
                 dist, values = self.policy(states, masks)
                 logprobs = dist.log_prob(actions)
-                entropy = dist.entropy().mean()
+                entropy_values = dist.entropy()
+                entropy = (entropy_values * sample_weights).mean()
                 ratios = torch.exp(logprobs - old_logprobs)
-                approx_kl = (old_logprobs - logprobs).mean()
+                approx_kl = ((old_logprobs - logprobs) * sample_weights).mean()
 
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                value_loss = nn.functional.mse_loss(values, returns)
+                policy_loss = -(torch.min(surr1, surr2) * sample_weights).mean()
+                value_loss = (((values - returns) ** 2) * sample_weights).mean()
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()

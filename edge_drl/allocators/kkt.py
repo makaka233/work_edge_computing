@@ -10,6 +10,7 @@ class ComputeDemand:
     demand_id: str
     node_id: int
     compute_gcycles: float
+    multiplicity: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class LinkDemand:
     src_node: int
     dst_node: int
     data_mb: float
+    multiplicity: float = 1.0
 
 
 def allocate_compute_kkt(
@@ -45,14 +47,17 @@ def allocate_compute_kkt(
         capacity = float(node_capacities[node_id])
         if capacity <= 0:
             raise ValueError(f"node {node_id} has non-positive compute capacity")
-        sqrt_loads = np.sqrt([d.compute_gcycles for d in node_demands])
-        sqrt_sum = float(sqrt_loads.sum())
-        for demand, sqrt_load in zip(node_demands, sqrt_loads):
-            rate = capacity * float(sqrt_load) / sqrt_sum
-            delay = demand.compute_gcycles / rate
-            allocations[demand.demand_id] = rate
+        weighted_sqrt_loads = np.asarray(
+            [d.multiplicity * np.sqrt(d.compute_gcycles) for d in node_demands],
+            dtype=np.float64,
+        )
+        weighted_sqrt_sum = float(weighted_sqrt_loads.sum())
+        for demand, weighted_sqrt_load in zip(node_demands, weighted_sqrt_loads):
+            group_rate = capacity * float(weighted_sqrt_load) / weighted_sqrt_sum
+            delay = demand.compute_gcycles * demand.multiplicity / group_rate
+            allocations[demand.demand_id] = group_rate
             delays[demand.demand_id] = delay
-            total_delay += delay
+            total_delay += delay * demand.multiplicity
 
     return allocations, delays, total_delay
 
@@ -79,14 +84,16 @@ def allocate_link_kkt(
         capacity = float(link_capacities[src, dst])
         if not np.isfinite(capacity) or capacity <= 0:
             raise ValueError(f"link ({src}, {dst}) has non-positive bandwidth")
-        sqrt_loads = np.sqrt([d.data_mb for d in link_demands])
-        sqrt_sum = float(sqrt_loads.sum())
-        for demand, sqrt_load in zip(link_demands, sqrt_loads):
-            rate = capacity * float(sqrt_load) / sqrt_sum
-            delay = demand.data_mb / rate
-            allocations[demand.demand_id] = rate
+        weighted_sqrt_loads = np.asarray(
+            [d.multiplicity * np.sqrt(d.data_mb) for d in link_demands],
+            dtype=np.float64,
+        )
+        weighted_sqrt_sum = float(weighted_sqrt_loads.sum())
+        for demand, weighted_sqrt_load in zip(link_demands, weighted_sqrt_loads):
+            group_rate = capacity * float(weighted_sqrt_load) / weighted_sqrt_sum
+            delay = demand.data_mb * demand.multiplicity / group_rate
+            allocations[demand.demand_id] = group_rate
             delays[demand.demand_id] = delay
-            total_delay += delay
+            total_delay += delay * demand.multiplicity
 
     return allocations, delays, total_delay
-

@@ -47,16 +47,18 @@ def test_rollout_load_and_start_modes_cycle():
         rollout_start_mode="cycle-window",
         eval_rollout_start_mode="same",
         episode_hours=24,
+        deployment_interval_minutes=10,
     )
 
     assert [load_multiplier_for_rollout(args, idx) for idx in range(5)] == [1.0, 1.5, 2.0, 1.0, 1.5]
-    assert [rollout_start_minute(args, idx) for idx in range(7)] == [0.0, 240.0, 480.0, 720.0, 960.0, 1200.0, 0.0]
+    assert [rollout_start_minute(args, idx) for idx in range(7)] == [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
 
     stationary_args = Namespace(
         seed=2026,
         rollout_start_mode="cycle-window",
         eval_rollout_start_mode="same",
         episode_hours=4,
+        deployment_interval_minutes=10,
         arrival_profile="stationary",
     )
     assert [rollout_start_minute(stationary_args, idx) for idx in range(3)] == [0.0, 0.0, 0.0]
@@ -70,6 +72,10 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "1",
+        "--rollout-unit",
+        "window",
+        "--deployment-interval-minutes",
+        "1",
         "--requests-per-update",
         "4",
         "--num-users",
@@ -80,8 +86,10 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
         "3",
         "--episode-hours",
         "1",
+        "--mean-requests-per-minute",
+        "60",
         "--request-aggregation-window-seconds",
-        "0",
+        "1",
         "--compute-hotspot-coef",
         "0.08",
         "--link-hotspot-coef",
@@ -96,7 +104,7 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
         str(save_dir),
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
-    assert "baseline requests=4" in result.stdout
+    assert "baseline requests=" in result.stdout
     assert "update=001" in result.stdout
     assert "artificial_cap=none" in result.stdout
     assert "diag_res=" in result.stdout
@@ -127,6 +135,8 @@ def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):
         "fast-only",
         "--updates",
         "1",
+        "--rollout-unit",
+        "requests",
         "--requests-per-update",
         "4",
         "--num-users",
@@ -137,8 +147,10 @@ def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):
         "3",
         "--episode-hours",
         "1",
+        "--mean-requests-per-minute",
+        "60",
         "--request-aggregation-window-seconds",
-        "0",
+        "1",
         "--log-dir",
         str(log_dir),
         "--save-dir",
@@ -156,6 +168,10 @@ def test_default_entrypoint_writes_under_runs(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "1",
+        "--train-mode",
+        "fast-only",
+        "--rollout-unit",
+        "requests",
         "--requests-per-update",
         "4",
         "--num-users",
@@ -166,8 +182,10 @@ def test_default_entrypoint_writes_under_runs(tmp_path):
         "3",
         "--episode-hours",
         "1",
+        "--mean-requests-per-minute",
+        "60",
         "--request-aggregation-window-seconds",
-        "0",
+        "1",
         "--run-root",
         str(tmp_path / "runs"),
         "--run-name",
@@ -199,11 +217,11 @@ def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
         "--num-service-types",
         "3",
         "--episode-hours",
-        "8",
+        "1",
+        "--deployment-interval-minutes",
+        "30",
         "--request-aggregation-window-seconds",
-        "60",
-        "--max-representative-groups-per-window",
-        "4",
+        "1",
         "--progress-interval-seconds",
         "0",
         "--log-dir",
@@ -244,11 +262,11 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
         "--num-service-types",
         "3",
         "--episode-hours",
-        "8",
+        "1",
+        "--deployment-interval-minutes",
+        "30",
         "--request-aggregation-window-seconds",
-        "60",
-        "--max-representative-groups-per-window",
-        "4",
+        "1",
         "--progress-interval-seconds",
         "0",
         "--log-dir",
@@ -302,11 +320,11 @@ def test_window_rollout_demand_sampling_resets_each_update(tmp_path):
         "--num-service-types",
         "3",
         "--episode-hours",
-        "8",
+        "1",
+        "--deployment-interval-minutes",
+        "30",
         "--request-aggregation-window-seconds",
-        "60",
-        "--max-representative-groups-per-window",
-        "4",
+        "1",
         "--progress-interval-seconds",
         "0",
         "--log-dir",
@@ -342,7 +360,7 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
         "--rollouts-per-update",
         "2",
         "--mean-requests-per-minute",
-        "2",
+        "60",
         "--num-users",
         "10000",
         "--num-edge-nodes",
@@ -350,9 +368,7 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
         "--num-service-types",
         "3",
         "--request-aggregation-window-seconds",
-        "60",
-        "--max-representative-groups-per-window",
-        "4",
+        "1",
         "--progress-interval-seconds",
         "0",
         "--log-dir",
@@ -362,9 +378,9 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "rollouts_per_update=2" in result.stdout
-    assert "episode_horizon=4h deployment_windows=1" in result.stdout
+    assert "episode_horizon=4h deployment_windows=24" in result.stdout
     assert "arrival_profile=stationary" in result.stdout
-    assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=1 window=01" in result.stdout
+    assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=0 window=01" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -402,11 +418,11 @@ def test_rollouts_per_update_batches_pressure_levels_and_start_windows(tmp_path)
         "--num-service-types",
         "3",
         "--episode-hours",
-        "8",
+        "1",
+        "--deployment-interval-minutes",
+        "30",
         "--request-aggregation-window-seconds",
-        "60",
-        "--max-representative-groups-per-window",
-        "4",
+        "1",
         "--progress-interval-seconds",
         "0",
         "--log-dir",
@@ -417,14 +433,14 @@ def test_rollouts_per_update_batches_pressure_levels_and_start_windows(tmp_path)
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "load_multipliers=1.0,1.5" in result.stdout
     assert "rollout_start_mode=cycle-window" in result.stdout
-    assert "load=1.00-1.50 start_min=0-240" in result.stdout
+    assert "load=1.00-1.50 start_min=0-30" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[-1]["load_multiplier"] == "1.0"
     assert rows[-1]["load_multiplier_end"] == "1.5"
     assert rows[-1]["start_minute"] == "0.0"
-    assert rows[-1]["start_minute_end"] == "240.0"
+    assert rows[-1]["start_minute_end"] == "30.0"
 
 
 def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
@@ -435,6 +451,10 @@ def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "1",
+        "--train-mode",
+        "fast-only",
+        "--rollout-unit",
+        "requests",
         "--requests-per-update",
         "4",
         "--eval-interval",
@@ -451,8 +471,10 @@ def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
         "3",
         "--episode-hours",
         "1",
+        "--mean-requests-per-minute",
+        "60",
         "--request-aggregation-window-seconds",
-        "0",
+        "1",
         "--progress-interval-seconds",
         "0",
         "--log-dir",

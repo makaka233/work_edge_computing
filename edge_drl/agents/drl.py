@@ -22,8 +22,8 @@ def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
     return dim
 
 
-FAST_GLOBAL_DIM = 9
-FAST_NODE_FEATURE_DIM = 5
+FAST_GLOBAL_DIM = 12
+FAST_NODE_FEATURE_DIM = 6
 FAST_EDGE_FEATURE_DIM = 3
 
 
@@ -594,10 +594,11 @@ class FastSchedulingPPOAgent:
             diagnostics.append(stats)
         return stage_nodes, diagnostics
 
-    def assign_last_schedule_reward(self, reward: float, stage_count: int, done: bool) -> None:
+    def assign_last_schedule_reward(self, reward: float, stage_count: int, done: bool, weight: float = 1.0) -> None:
         for stage_idx in range(stage_count):
             self.ppo.buffer.rewards.append(float(reward))
             self.ppo.buffer.dones.append(bool(done or stage_idx == stage_count - 1))
+            self.ppo.buffer.weights.append(float(weight))
 
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         return self.ppo.update(progress_label=progress_label, progress_interval_seconds=progress_interval_seconds)
@@ -614,6 +615,14 @@ class FastSchedulingPPOAgent:
         nodes = env.scenario.nodes
         max_compute = max(n.compute_gcycles_per_s for n in nodes)
         max_bandwidth = np.nanmax(np.where(np.isfinite(env.scenario.bandwidth_mb_s), env.scenario.bandwidth_mb_s, 0.0))
+        tick_request_count = float(sum(item.request_count for item in env.current_requests))
+        tick_group_count = float(len(env.current_requests))
+        tick_service_count = float(
+            sum(item.request_count for item in env.current_requests if item.service_id == request.service_id)
+        )
+        tick_node_counts = np.zeros(self.num_nodes, dtype=np.float64)
+        for item in env.current_requests:
+            tick_node_counts[item.home_node] += float(item.request_count)
         node_features = []
         deployed = env.deployment[request.service_id, stage_id] if env.deployment is not None else np.zeros(self.num_nodes, dtype=bool)
         for node in nodes:
@@ -628,6 +637,7 @@ class FastSchedulingPPOAgent:
                     node.compute_gcycles_per_s / max_compute,
                     env.node_compute_load[node.node_id],
                     bandwidth / max(max_bandwidth, 1e-9),
+                    tick_node_counts[node.node_id] / max(tick_request_count, 1.0),
                 ]
             )
         scalars = [
@@ -640,6 +650,9 @@ class FastSchedulingPPOAgent:
             request.request_count / 100.0,
             env.current_time_minute / max(env.config.episode_hours * 60, 1),
             len(request.stage_compute_gcycles) / self.max_service_stages,
+            np.log1p(tick_request_count) / np.log1p(5_000.0),
+            tick_group_count / max(env.config.num_edge_nodes * env.config.num_service_types, 1),
+            tick_service_count / max(tick_request_count, 1.0),
         ]
         if self.policy_kind == "gat_node_scorer":
             node_features += self._build_edge_features(env)
@@ -786,6 +799,18 @@ class HierarchicalPPOAgent:
         self.maybe_update_deployment(env, deterministic=deterministic, record=record)
         return self.fast_agent.schedule(env, deterministic=deterministic, record=record)
 
+    def act_batch(
+        self,
+        env: EdgeComputingEnv,
+        deterministic: bool = False,
+        record: bool = True,
+    ) -> list[list[int]]:
+        self.maybe_update_deployment(env, deterministic=deterministic, record=record)
+        return [
+            self.fast_agent.schedule(env, request=request, deterministic=deterministic, record=record)
+            for request in env.current_requests
+        ]
+
     def observe_step_reward(
         self,
         reward: float,
@@ -794,16 +819,14 @@ class HierarchicalPPOAgent:
         weight: float = 1.0,
         slow_reward: float | None = None,
     ) -> None:
-        self.fast_agent.assign_last_schedule_reward(reward, stage_count, done)
+        self.fast_agent.assign_last_schedule_reward(reward, stage_count, done, weight=weight)
         self.window_reward += (reward if slow_reward is None else slow_reward) * weight
         self.window_steps += weight
         if done:
             self.flush_slow_window_reward(done=True)
 
     def flush_slow_window_reward(self, done: bool) -> None:
-        if self.window_steps <= 0:
-            return
-        latency_return = self.window_reward / float(self.window_steps)
+        latency_return = self.window_reward / float(self.window_steps) if self.window_steps > 0 else 0.0
         deployment_memory_cost = self.slow_deployment_memory_coef * self.window_deployment_memory_fraction
         deployment_storage_cost = self.slow_deployment_storage_coef * self.window_deployment_storage_fraction
         migration_cost = self.slow_migration_coef * self.window_migration_fraction

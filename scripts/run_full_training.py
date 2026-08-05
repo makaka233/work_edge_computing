@@ -14,7 +14,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-users", type=int, default=10_000)
     parser.add_argument("--num-edge-nodes", type=int, default=32)
     parser.add_argument("--num-service-types", type=int, default=10)
-    parser.add_argument("--episode-hours", type=int, default=24)
+    parser.add_argument("--episode-hours", type=int, default=4)
+    parser.add_argument("--deployment-interval-minutes", type=int, default=10)
     parser.add_argument("--scenario-refresh-episodes", type=int, default=20)
     parser.add_argument("--demand-sampling-mode", choices=["episode", "rollout"], default="episode")
     parser.add_argument("--mean-requests-per-minute", type=float, default=None)
@@ -33,8 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--node-compute-capacity-scale", type=float, default=1.0)
     parser.add_argument("--wired-link-bandwidth-scale", type=float, default=1.0)
     parser.add_argument("--service-resource-fraction", type=float, default=0.5)
-    parser.add_argument("--request-aggregation-window-seconds", type=float, default=10.0)
-    parser.add_argument("--max-representative-groups-per-window", type=int, default=16)
+    parser.add_argument("--request-aggregation-window-seconds", type=float, default=1.0)
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
     parser.add_argument("--wireless-uplink-mbps", type=float, default=150.0)
     parser.add_argument("--radio-rtt-ms", type=float, default=10.0)
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-updates", type=int, default=120)
     parser.add_argument("--requests-per-update", type=int, default=256)
     parser.add_argument("--rollouts-per-update", type=int, default=1)
-    parser.add_argument("--rollout-unit", choices=["requests", "window", "episode"], default="requests")
+    parser.add_argument("--rollout-unit", choices=["requests", "window", "episode"], default="window")
     parser.add_argument("--eval-rollout-unit", choices=["requests", "window", "episode", "same"], default="requests")
     parser.add_argument("--reward-scale", type=float, default=10.0)
     parser.add_argument("--reward-mode", choices=["latency"], default="latency")
@@ -98,6 +98,8 @@ def main() -> None:
         str(args.num_service_types),
         "--episode-hours",
         str(args.episode_hours),
+        "--deployment-interval-minutes",
+        str(args.deployment_interval_minutes),
         "--scenario-refresh-episodes",
         str(args.scenario_refresh_episodes),
         "--demand-sampling-mode",
@@ -126,8 +128,6 @@ def main() -> None:
         str(args.service_resource_fraction),
         "--request-aggregation-window-seconds",
         str(args.request_aggregation_window_seconds),
-        "--max-representative-groups-per-window",
-        str(args.max_representative_groups_per_window),
         "--load-ewma-tau-minutes",
         str(args.load_ewma_tau_minutes),
         "--wireless-uplink-mbps",

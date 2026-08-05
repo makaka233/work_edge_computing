@@ -8,12 +8,13 @@ from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 from edge_drl.env.scenario import generate_realistic_scenario
 
 
-def test_default_episode_is_one_stationary_deployment_window():
+def test_default_episode_uses_one_second_steps_and_ten_minute_deployment():
     config = EdgeEnvConfig()
     env = EdgeComputingEnv(config)
 
     assert config.episode_hours == 4
-    assert config.deployment_interval_minutes == 240
+    assert config.deployment_interval_minutes == 10
+    assert config.request_aggregation_window_seconds == 1.0
     assert config.arrival_profile == "stationary"
     env.current_time_minute = 0.0
     initial_rate = env._arrival_rate_per_minute()
@@ -52,6 +53,17 @@ def test_kkt_link_sqrt_rule():
     assert round(total, 6) == 7.5
 
 
+def test_kkt_group_multiplicity_matches_individual_equal_tasks():
+    grouped = [ComputeDemand("group", 0, 4.0, multiplicity=3.0)]
+    individuals = [ComputeDemand(f"task-{idx}", 0, 4.0) for idx in range(3)]
+
+    _, grouped_delays, grouped_total = allocate_compute_kkt(grouped, np.array([12.0]))
+    _, individual_delays, individual_total = allocate_compute_kkt(individuals, np.array([12.0]))
+
+    assert np.isclose(grouped_delays["group"], individual_delays["task-0"])
+    assert np.isclose(grouped_total, individual_total)
+
+
 def test_environment_constraints_and_rollout():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
@@ -60,15 +72,15 @@ def test_environment_constraints_and_rollout():
             num_edge_nodes=16,
             num_service_types=3,
             episode_hours=1,
-            mean_requests_per_minute=2.0,
-            request_aggregation_window_seconds=0.0,
+            mean_requests_per_minute=600.0,
         )
     )
     agent = build_baseline_agent()
+    agent.fast_policy.candidate_limit_per_stage = 2
     obs = env.reset()
     assert len(env.scenario.users) == 10_000
     assert max(len(service.stages) for service in env.scenario.services) <= 3
-    assert env.config.deployment_interval_minutes == 240
+    assert env.config.deployment_interval_minutes == 10
     assert obs["needs_deployment_update"] is True
 
     agent.maybe_update_deployment(env)
@@ -77,8 +89,8 @@ def test_environment_constraints_and_rollout():
     assert feasible, reason
 
     for _ in range(5):
-        action = agent.act(env)
-        obs, reward, done, info = env.step(action)
+        actions = agent.act_batch(env)
+        obs, reward, done, info = env.step(actions)
         assert info["valid"], info["violations"]
         assert np.isfinite(reward)
         assert info["latency_s"] >= 0
@@ -94,23 +106,23 @@ def test_migration_change_is_logged_without_default_penalty():
             num_edge_nodes=16,
             num_service_types=3,
             episode_hours=1,
-            mean_requests_per_minute=2.0,
-            request_aggregation_window_seconds=0.0,
+            mean_requests_per_minute=600.0,
         )
     )
     agent = build_baseline_agent()
+    agent.fast_policy.candidate_limit_per_stage = 2
     env.reset()
     agent.maybe_update_deployment(env)
     assert env.last_migration_cost > 0
 
-    first_action = agent.act(env)
-    _, _, _, first_info = env.step(first_action)
+    first_actions = agent.act_batch(env)
+    _, _, _, first_info = env.step(first_actions)
     assert first_info["migration_cost"] > 0
     assert first_info["migration_penalty"] == 0
     assert env.last_migration_cost == 0
 
-    second_action = agent.act(env)
-    _, _, _, second_info = env.step(second_action)
+    second_actions = agent.act_batch(env)
+    _, _, _, second_info = env.step(second_actions)
     assert second_info["migration_cost"] == 0
 
 
@@ -262,20 +274,21 @@ def test_default_single_task_latency_is_mec_scale():
             num_edge_nodes=16,
             num_service_types=3,
             episode_hours=1,
-            request_aggregation_window_seconds=10.0,
-            max_representative_groups_per_window=8,
+            request_aggregation_window_seconds=1.0,
         )
     )
     agent = build_baseline_agent()
+    agent.fast_policy.candidate_limit_per_stage = 2
     env.reset()
     agent.maybe_update_deployment(env)
     latencies = []
     weights = []
-    while not env.done and env.metrics["requests"] < 20_000:
-        action = agent.act(env)
-        _, _, _, info = env.step(action)
-        latencies.append(float(info["latency_s"]))
-        weights.append(float(info["request_count"]))
+    while not env.done and env.metrics["requests"] < 500:
+        requests = list(env.current_requests)
+        actions = agent.act_batch(env)
+        _, _, _, info = env.step(actions)
+        latencies.extend(float(group["latency_s"]) for group in info["group_infos"])
+        weights.extend(float(request.request_count) for request in requests)
 
     avg_latency_s = float(np.average(np.asarray(latencies), weights=np.asarray(weights)))
     p95_latency_s = float(np.percentile(latencies, 95))
@@ -297,21 +310,56 @@ def test_request_aggregation_counts_underlying_requests():
         )
     )
     agent = build_baseline_agent()
+    agent.fast_policy.candidate_limit_per_stage = 2
     env.reset()
     agent.maybe_update_deployment(env)
-    request = env.current_request
-    assert request is not None
-    assert request.request_count > 1
+    requests = list(env.current_requests)
+    start_time = env.current_time_minute
+    expected_count = sum(request.request_count for request in requests)
+    assert expected_count > 1
 
-    action = agent.act(env)
-    _, _, _, info = env.step(action)
+    actions = agent.act_batch(env)
+    _, _, _, info = env.step(actions)
 
-    assert info["request_count"] == request.request_count
-    assert env.metrics["aggregate_events"] == 1
-    assert env.metrics["requests"] == request.request_count
+    assert info["request_count"] == expected_count
+    assert env.metrics["time_steps"] == 1
+    assert env.metrics["aggregate_events"] == len(requests)
+    assert env.metrics["requests"] == expected_count
+    assert np.isclose(env.current_time_minute - start_time, 1.0 / 60.0)
 
 
-def test_aggregation_does_not_inflate_single_task_latency():
+def test_joint_settlement_is_independent_of_group_order():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=44,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=1_800.0,
+        )
+    )
+    agent = build_baseline_agent()
+    agent.fast_policy.candidate_limit_per_stage = 2
+    env.reset()
+    agent.maybe_update_deployment(env)
+    requests = list(env.current_requests)
+    actions = [agent.fast_policy.act(env, request) for request in requests]
+
+    forward = env.evaluate_batch_schedules(requests, actions)
+    reverse = env.evaluate_batch_schedules(list(reversed(requests)), list(reversed(actions)))
+    forward_latency = {request.request_id: info["latency_s"] for request, info in zip(requests, forward)}
+    reverse_latency = {
+        request.request_id: info["latency_s"]
+        for request, info in zip(reversed(requests), reverse)
+    }
+
+    assert forward_latency.keys() == reverse_latency.keys()
+    for request_id in forward_latency:
+        assert np.isclose(forward_latency[request_id], reverse_latency[request_id])
+
+
+def test_joint_allocation_reflects_group_concurrency():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=45,
@@ -331,12 +379,12 @@ def test_aggregation_does_not_inflate_single_task_latency():
 
     single_request = replace(request, request_count=1)
     grouped_request = replace(request, request_count=100)
-    action = agent.act(env)
+    action = agent.fast_policy.act(env, request)
 
     single_info = env.evaluate_schedule(single_request, action)
     grouped_info = env.evaluate_schedule(grouped_request, action)
 
-    assert np.isclose(single_info["latency_s"], grouped_info["latency_s"])
+    assert grouped_info["latency_s"] > single_info["latency_s"]
     assert single_info["compute_demands"][0].compute_gcycles == grouped_info["compute_demands"][0].compute_gcycles
 
 
@@ -348,7 +396,7 @@ def test_task_load_scales_request_compute_and_data():
             num_edge_nodes=16,
             num_service_types=3,
             episode_hours=1,
-            request_aggregation_window_seconds=0.0,
+            mean_requests_per_minute=6_000.0,
         )
     )
     heavy_env = EdgeComputingEnv(
@@ -358,7 +406,7 @@ def test_task_load_scales_request_compute_and_data():
             num_edge_nodes=16,
             num_service_types=3,
             episode_hours=1,
-            request_aggregation_window_seconds=0.0,
+            mean_requests_per_minute=6_000.0,
             task_compute_scale=2.0,
             task_data_scale=3.0,
         )
@@ -436,7 +484,7 @@ def test_service_resource_fraction_preserves_physical_nodes_but_limits_placement
     np.testing.assert_allclose(env.service_storage_capacities(), physical_storage * 0.4)
 
 
-def test_representative_group_sampling_preserves_window_request_count():
+def test_all_nonempty_node_service_groups_are_preserved():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=47,
@@ -445,13 +493,13 @@ def test_representative_group_sampling_preserves_window_request_count():
             num_service_types=3,
             episode_hours=1,
             mean_requests_per_minute=1_800.0,
-            request_aggregation_window_seconds=10.0,
-            max_representative_groups_per_window=4,
+            request_aggregation_window_seconds=1.0,
         )
     )
     env.reset()
     window_time = env.current_time_minute
-    requests = [env.current_request, *env.pending_requests]
-    assert len(requests) <= 4
+    requests = env.current_requests
+    assert len(requests) > 4
     assert all(request.arrival_minute == window_time for request in requests)
+    assert len({(request.home_node, request.service_id) for request in requests}) == len(requests)
     assert sum(request.request_count for request in requests) > 0

@@ -9,14 +9,15 @@ scenario:
   num_edge_nodes: 32
   num_service_types: 10
   max_service_stages: 3
-  episode_hours: 24
+  episode_hours: 4
   scenario_refresh_episodes: 20
   scenario_refresh_scope: demand_only
   demand_sampling_mode: episode
 
 time_scales:
-  slow_deployment_interval_minutes: 240
-  fast_scheduling_epoch: per_task_arrival
+  slow_deployment_interval_minutes: 10
+  environment_step_seconds: 1
+  fast_scheduling_epoch: all_nonempty_groups_per_second
 
 traffic:
   # By default the environment derives aggregate arrivals from user behavior:
@@ -35,8 +36,7 @@ traffic:
   node_compute_capacity_scale: 1.0
   wired_link_bandwidth_scale: 1.0
   service_resource_fraction: 0.5
-  request_aggregation_window_seconds: 10.0
-  max_representative_groups_per_window: 16
+  request_aggregation_window_seconds: 1.0
   load_ewma_tau_minutes: 1.0
   wireless_uplink_mbps: 150.0
   radio_rtt_ms: 10.0
@@ -46,9 +46,9 @@ latency_calibration:
   task_input_mb_range: [0.05, 1.5]
   stage_compute_gcycles_range: [0.4, 4.0]
   note: >
-    Aggregated requests represent multiple same-class arrivals for sampling and
-    load accounting. Per-task latency is computed with one task's input and CPU
-    demand, then weighted by request_count for metrics.
+    Every non-empty node-service group is preserved. All groups in one second
+    compete jointly for compute and link resources, then the environment advances
+    by exactly one second.
 
 agent:
   reference_project: DRL-AC-Allocation
@@ -60,8 +60,8 @@ agent:
     type: dual_agent_ppo
     optimizer_reward_scale: 10.0
     rollouts_per_update: 1
-    slow_agent_decision: every_240_minutes
-    fast_agent_decision: per_task_request
+    slow_agent_decision: every_10_minutes
+    fast_agent_decision: per_node_service_group
     optimizer_update: after_rollout_batch
     max_replicas_per_stage: null
     actual_replica_count: learned_by_count_ppo
@@ -72,7 +72,7 @@ agent:
     slow_value_coef: 0.5
     slow_critic_lr: 0.0003
     slow_critic_k_epochs: 4
-    slow_composite_action_return: one_return_per_4h_window
+    slow_composite_action_return: one_return_per_10min_window
     slow_deployment_memory_coef: 0.03
     slow_deployment_storage_coef: 0.01
     slow_migration_coef: 0.02

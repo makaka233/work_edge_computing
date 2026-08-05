@@ -14,20 +14,20 @@ kept thin. The problem model is different, so the code is specialized for:
 - 10 realistic service classes: speech, AR, video analytics, industrial
   inspection, traffic perception, retail events, robot control, medical vital
   anomaly detection, drone inspection, and connected-vehicle planning.
-- Slow service-stage deployment every 4 hours.
-- Fast request-level scheduling when each task request arrives.
+- Slow service-stage deployment every 10 minutes.
+- Fast scheduling for every non-empty node-service group in each one-second step.
 - KKT closed-form allocation for continuous compute and link bandwidth.
 - MEC-scale task latency calibration: service requests use small input payloads,
   single-digit Gcycle staged compute demand, 150 Mbps uplink, and 10 ms radio
   RTT so average single-task latency is expected to fall in the tens to hundreds
   of milliseconds range.
 - City-scale traffic derived from active users. The default training episode is
-  one stationary 4-hour deployment window; the legacy daily
+  a stationary 4-hour trajectory containing 24 slow-deployment windows; the legacy daily
   morning/lunch/evening curve remains available with `--arrival-profile daily`.
   Use `--traffic-scale` above 1.0 to create heavier congestion.
 - Demand pressure can be deliberately batched across PPO rollouts with
   `--load-multipliers`, so one update can cover multiple traffic levels and
-  independent 4-hour episodes.
+  independent rollouts.
 - Fully connected wired metro links between edge nodes, with heterogeneous
   bottleneck, ordinary metro, and backbone-like bandwidth classes so placement
   and scheduling still have visible network tradeoffs.
@@ -37,13 +37,15 @@ kept thin. The problem model is different, so the code is specialized for:
 - The physical edge infrastructure is fixed by `--physical-seed`: edge-node
   positions, compute capacity, memory, storage, service catalogue, and wired
   link bandwidth/propagation do not change during scenario refresh.
-- Request aggregation is enabled by default. The environment groups arrivals
-  within a short time window by `(home_node, service_id)` and stores the number
-  of underlying requests in `request_count`. Per-task latency is evaluated with
-  one task's compute and data demand, while metrics and dynamic load updates are
-  weighted by `request_count`.
-- Representative group sampling caps the number of aggregate events per window
-  while rescaling selected groups so the underlying request count is preserved.
+- One `env.step` equals one simulated second. Arrivals are grouped by
+  `(home_node, service_id)`, every non-empty group is preserved, and no
+  representative-group sampling or count reassignment is performed.
+- The fast policy schedules every group before settlement. Compute and link
+  demands from all groups then enter one joint KKT allocation, metrics are
+  weighted by `request_count`, loads update once, and time advances one second.
+- Fast-policy state includes the current second's total request count, group
+  count, service share, and per-access-node demand share, so each factored group
+  action can respond to the batch it will compete with.
 
 ## Current Modules
 
@@ -60,18 +62,19 @@ kept thin. The problem model is different, so the code is specialized for:
 ## Run
 
 ```powershell
-python train_dual_ppo.py --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --arrival-profile stationary --demand-sampling-mode rollout --rollouts-per-update 4 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 4.0 --load-multipliers 1.0,1.35,1.7,2.1 --eval-rollout-unit window --eval-rollout-start-mode same --task-compute-scale 2.8 --task-data-scale 5.0 --node-compute-capacity-scale 0.45 --wired-link-bandwidth-scale 0.10 --eval-interval 10 --eval-seeds 4 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --max-representative-groups-per-window 8 --compute-hotspot-threshold 0.45 --link-hotspot-threshold 0.35 --compute-hotspot-coef 0.12 --link-hotspot-coef 0.08 --compute-imbalance-coef 0.04 --link-imbalance-coef 0.03 --idle-deployed-node-coef 0.04 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --fast-minibatch-size 1024 --device cuda --run-name joint_gat_city32_svc10_strong_pressure --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
+python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --arrival-profile stationary --demand-sampling-mode rollout --rollouts-per-update 4 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 4.0 --load-multipliers 1.0,1.35,1.7,2.1 --eval-rollout-unit window --eval-rollout-start-mode same --task-compute-scale 2.8 --task-data-scale 5.0 --node-compute-capacity-scale 0.45 --wired-link-bandwidth-scale 0.10 --eval-interval 10 --eval-seeds 4 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --compute-hotspot-threshold 0.45 --link-hotspot-threshold 0.35 --compute-hotspot-coef 0.12 --link-hotspot-coef 0.08 --compute-imbalance-coef 0.04 --link-imbalance-coef 0.03 --idle-deployed-node-coef 0.04 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --fast-minibatch-size 1024 --device cuda --run-name joint_gat_city32_svc10_joint_second --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
 python -m pytest tests
 ```
 
-For the current convergence experiments, one 4-hour slow-deployment window is
-one complete episode. Prefer `--rollout-unit window --episode-hours 4` with
-`--demand-sampling-mode rollout`: each rollout samples an independent episode
-while the physical edge network stays fixed. `train_dual_ppo.py` prints
+For the current convergence experiments, one 4-hour episode contains 14,400
+one-second steps and 24 ten-minute slow-deployment windows. Prefer
+`--rollout-unit window --episode-hours 4` with `--demand-sampling-mode rollout`:
+each rollout samples one independent ten-minute demand window while the physical
+edge network stays fixed. `train_dual_ppo.py` prints
 in-rollout terminal progress by default every 10 seconds. The progress line
 reports update progress, real request count, aggregate event count, simulated
 hours, deployment updates, average latency, elapsed time, and ETA. Use
@@ -93,13 +96,13 @@ edge nodes because duplicate placement on the same node is masked. Continuous
 compute and bandwidth allocation remains outside the neural policy and is solved
 by the KKT module.
 
-Slow deployment is trained as one composite action per 4-hour window. Count and
+Slow deployment is trained as one composite action per 10-minute window. Count and
 placement actors share a window-level advantage and a dedicated window critic;
 the component choices are not treated as consecutive GAE steps. Fast PPO is
 optimized only against physical task latency. The slow window return combines
 request-weighted physical latency with deployment memory/storage costs. Migration
-changes remain logged, but `--slow-migration-coef` defaults to zero because
-independent 4-hour episodes have no inherited previous deployment.
+changes remain logged, but `--slow-migration-coef` defaults to zero for the
+current convergence experiments.
 `--service-resource-fraction` fixes the share of each physical
 node's memory/storage available to this controller, representing system and
 co-tenant reservations without imposing a per-service replica-count cap.
@@ -109,7 +112,7 @@ ways while the physical edge network remains fixed by `--physical-seed`.
 `--demand-sampling-mode episode` reuses one demand scenario for
 `--scenario-refresh-episodes N` training episodes. `--demand-sampling-mode
 rollout` samples a new demand scenario for every PPO rollout. With the default
-4-hour horizon, a rollout is a complete episode. In both modes, only user
+4-hour horizon, an episode contains multiple rollout windows. In both modes, only user
 locations, home-node assignment, and service
 preferences may change; nodes, capacities, service catalogue, and wired links do
 not change. Request samples still change every rollout. Eval seeds therefore
@@ -154,7 +157,7 @@ This separates optimization on familiar demand profiles from demand
 generalization on unseen profiles.
 
 For high-variance demand-randomized PPO, `--rollouts-per-update K` can collect
-multiple independent 4h episodes before one optimizer update. This is
+multiple independent 10-minute windows before one optimizer update. This is
 closer to batched PPO sampling than updating after a single demand seed, and it
 makes the logged training latency less dominated by one sampled demand profile.
 Slow deployment exploration can also be controlled separately with
