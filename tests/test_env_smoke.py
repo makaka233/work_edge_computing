@@ -328,6 +328,37 @@ def test_request_aggregation_counts_underlying_requests():
     assert np.isclose(env.current_time_minute - start_time, 1.0 / 60.0)
 
 
+def test_representative_step_advances_weighted_time_without_changing_instantaneous_batch():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=143,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=6_000.0,
+        )
+    )
+    agent = build_baseline_agent()
+    env.reset()
+    agent.maybe_update_deployment(env)
+    requests = list(env.current_requests)
+    sampled_request_count = sum(request.request_count for request in requests)
+    actions = agent.act_batch(env)
+    start_time = env.current_time_minute
+
+    _, _, _, info = env.step(actions, represented_seconds=10.0)
+
+    assert info["request_count"] == sampled_request_count * 10
+    assert info["group_count"] == len(requests)
+    assert info["represented_seconds"] == 10.0
+    assert env.metrics["requests"] == sampled_request_count * 10
+    assert env.metrics["aggregate_events"] == len(requests) * 10
+    assert env.metrics["time_steps"] == 10
+    assert env.metrics["settlement_steps"] == 1
+    assert np.isclose(env.current_time_minute - start_time, 10.0 / 60.0)
+
+
 def test_joint_settlement_is_independent_of_group_order():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

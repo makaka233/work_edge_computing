@@ -493,6 +493,55 @@ def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
     assert rows[0]["seen_eval_avg_latency_s"] == "nan"
 
 
+def test_training_samples_window_but_eval_runs_full_window(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--rollout-unit",
+        "window",
+        "--deployment-interval-minutes",
+        "10",
+        "--sampled-seconds-per-window",
+        "6",
+        "--eval-interval",
+        "1",
+        "--eval-rollout-unit",
+        "window",
+        "--eval-seeds",
+        "1",
+        "--mean-requests-per-minute",
+        "60",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "temporal_sampling train=6/600s (1.0%) eval=full" in result.stdout
+    assert "sampled_steps=6/600" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["settlement_steps"] == "6"
+    assert row["logical_steps"] == "600"
+    assert float(row["temporal_sampling_fraction"]) == 0.01
+    assert float(row["eval_settlement_steps"]) == 600.0
+    assert float(row["eval_logical_steps"]) == 600.0
+    assert float(row["eval_temporal_sampling_fraction"]) == 1.0
+
+
 def test_fast_and_slow_ppo_use_independent_window_update_periods(tmp_path):
     log_dir = tmp_path / "logs"
     save_dir = tmp_path / "savedModels"

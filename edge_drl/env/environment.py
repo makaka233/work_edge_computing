@@ -152,6 +152,7 @@ class EdgeComputingEnv:
             "requests": 0.0,
             "aggregate_events": 0.0,
             "time_steps": 0.0,
+            "settlement_steps": 0.0,
             "invalid_actions": 0.0,
             "total_latency_s": 0.0,
             "valid_requests": 0.0,
@@ -248,10 +249,15 @@ class EdgeComputingEnv:
     def step(
         self,
         batch_stage_nodes: list[list[int] | tuple[int, ...] | np.ndarray],
+        *,
+        represented_seconds: float = 1.0,
     ) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
-        """Schedule and settle every aggregate request group in one simulated second."""
+        """Settle one sampled second that may represent a longer logical interval."""
 
         self._require_ready()
+        if represented_seconds < 1.0 - 1e-9:
+            raise ValueError("represented_seconds must be >= 1")
+        represented_seconds = max(float(represented_seconds), 1.0)
         requests = list(self.current_requests)
         schedules = list(batch_stage_nodes)
         if len(schedules) != len(requests):
@@ -263,9 +269,10 @@ class EdgeComputingEnv:
         self.last_migration_cost = 0.0
 
         group_rewards: list[float] = []
-        counts = np.asarray([request.request_count for request in requests], dtype=np.float64)
+        counts = np.asarray([request.request_count for request in requests], dtype=np.float64) * represented_seconds
         for request, group_info in zip(requests, group_infos):
-            request_count = float(request.request_count)
+            sampled_request_count = float(request.request_count)
+            request_count = sampled_request_count * represented_seconds
             reward = -float(group_info["latency_s"])
             reward -= self.config.load_penalty_weight * float(group_info["load_penalty"])
             if not group_info["valid"]:
@@ -284,15 +291,16 @@ class EdgeComputingEnv:
             if float(group_info["latency_s"]) > request.deadline_s:
                 self.metrics["deadline_violations"] += request_count
 
-        self.metrics["aggregate_events"] += float(len(requests))
-        self.metrics["time_steps"] += 1.0
-        self._update_dynamic_loads_batch(group_infos, requests)
+        self.metrics["aggregate_events"] += float(len(requests)) * represented_seconds
+        self.metrics["time_steps"] += represented_seconds
+        self.metrics["settlement_steps"] += 1.0
+        self._update_dynamic_loads_batch(group_infos, requests, represented_seconds=represented_seconds)
 
         total_count = float(counts.sum())
         weighted_reward = self._weighted_group_mean(group_rewards, counts)
         if total_count > 0.0:
             weighted_reward -= migration_penalty
-        self.current_time_minute += self.config.request_aggregation_window_seconds / 60.0
+        self.current_time_minute += represented_seconds / 60.0
         if self.done:
             self.current_requests = []
         else:
@@ -305,6 +313,7 @@ class EdgeComputingEnv:
                 "group_infos": group_infos,
                 "group_count": len(group_infos),
                 "request_count": total_count,
+                "represented_seconds": represented_seconds,
                 "migration_cost": migration_cost,
                 "migration_penalty": migration_penalty,
             }
@@ -607,26 +616,30 @@ class EdgeComputingEnv:
         self,
         group_infos: list[dict[str, Any]],
         requests: list[TaskRequest],
+        *,
+        represented_seconds: float = 1.0,
     ) -> None:
-        elapsed_minutes = self.config.request_aggregation_window_seconds / 60.0
+        elapsed_minutes = represented_seconds / 60.0
         decay = float(np.exp(-elapsed_minutes / self.config.load_ewma_tau_minutes))
         self.node_compute_load *= decay
         self.link_load *= decay
         self.last_load_update_minute = self.current_time_minute + elapsed_minutes
         ewma_window_s = self.config.load_ewma_tau_minutes * 60.0
+        one_second_decay = float(np.exp(-1.0 / ewma_window_s))
+        repeat_factor = (1.0 - decay) / max(1.0 - one_second_decay, 1e-12)
         for info, request in zip(group_infos, requests):
             request_count = float(request.request_count)
             for demand in info["compute_demands"]:
                 node_capacity = self.scenario.nodes[demand.node_id].compute_gcycles_per_s if self.scenario else 1.0
                 service_time_s = demand.compute_gcycles * request_count / max(node_capacity, 1e-9)
-                increment = min(service_time_s / ewma_window_s, 1.0)
+                increment = min(service_time_s / ewma_window_s * repeat_factor, 1.0)
                 self.node_compute_load[demand.node_id] = min(1.0, self.node_compute_load[demand.node_id] + increment)
             for demand in info["link_demands"]:
                 if self.scenario is None or not self.scenario.adjacency[demand.src_node, demand.dst_node]:
                     continue
                 capacity = self.scenario.bandwidth_mb_s[demand.src_node, demand.dst_node]
                 transfer_time_s = demand.data_mb * request_count / max(capacity, 1e-9)
-                increment = min(transfer_time_s / ewma_window_s, 1.0)
+                increment = min(transfer_time_s / ewma_window_s * repeat_factor, 1.0)
                 self.link_load[demand.src_node, demand.dst_node] = min(
                     1.0,
                     self.link_load[demand.src_node, demand.dst_node] + increment,

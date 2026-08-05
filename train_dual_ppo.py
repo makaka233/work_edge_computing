@@ -114,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Fixed at 1 second: one env.step jointly settles all non-empty node-service groups in that second.",
     )
+    parser.add_argument(
+        "--sampled-seconds-per-window",
+        type=int,
+        default=60,
+        help=(
+            "Training-only temporal sampling budget for each deployment window. "
+            "Default 60 represents a 10-minute window with 60 weighted settlement steps; use 0 for a full rollout."
+        ),
+    )
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
     parser.add_argument("--wireless-uplink-mbps", type=float, default=150.0)
     parser.add_argument("--radio-rtt-ms", type=float, default=10.0)
@@ -244,6 +253,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--deployment-interval-minutes must be >= 1")
     if not np.isclose(args.request_aggregation_window_seconds, 1.0):
         parser.error("--request-aggregation-window-seconds must be exactly 1.0")
+    if args.sampled_seconds_per_window < 0:
+        parser.error("--sampled-seconds-per-window must be >= 0")
     if args.train_mode == "joint" and args.rollout_unit == "requests":
         parser.error("joint training requires --rollout-unit window or episode so each slow action receives a complete return")
     try:
@@ -675,6 +686,12 @@ def rollout(
             rollout_start_minute + float(env.config.deployment_interval_minutes),
             float(env.config.episode_hours * 60),
         )
+    represented_seconds = 1.0
+    if record and rollout_unit == "window":
+        sampled_seconds = int(getattr(args, "sampled_seconds_per_window", 0))
+        window_seconds = float(env.config.deployment_interval_minutes * 60)
+        if 0 < sampled_seconds < window_seconds:
+            represented_seconds = window_seconds / float(sampled_seconds)
     if rollout_unit == "requests":
         target_requests = max_requests
     elif rollout_unit == "window":
@@ -696,6 +713,13 @@ def rollout(
         start_aggregate_events=float(start_metrics.get("aggregate_events", 0.0)),
     )
     while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit, stop_time_minute=stop_time_minute):
+        step_represented_seconds = represented_seconds
+        if stop_time_minute is not None:
+            remaining_seconds = max((stop_time_minute - env.current_time_minute) * 60.0, 0.0)
+            if remaining_seconds < 1.0 - 1e-9:
+                env.current_time_minute = stop_time_minute
+                break
+            step_represented_seconds = min(step_represented_seconds, remaining_seconds)
         requests = list(env.current_requests)
         if train_mode == "fast-only":
             if env.needs_deployment_update:
@@ -707,7 +731,7 @@ def rollout(
         else:
             actions = agent.act_batch(env, deterministic=deterministic, record=record)
         deployment_window = int(env.metrics["deployment_updates"])
-        _, _, done, batch_info = env.step(actions)
+        _, _, done, batch_info = env.step(actions, represented_seconds=step_represented_seconds)
         group_infos = batch_info["group_infos"]
         for group_idx, (request, info) in enumerate(zip(requests, group_infos)):
             request_count = float(info.get("request_count", request.request_count))
@@ -795,10 +819,15 @@ def rollout(
     rollout_valid_requests = float(env.metrics["valid_requests"] - start_metrics.get("valid_requests", 0.0))
     rollout_deadline_violations = float(env.metrics["deadline_violations"] - start_metrics.get("deadline_violations", 0.0))
     rollout_deployment_updates = float(env.metrics["deployment_updates"] - start_metrics.get("deployment_updates", 0.0))
+    rollout_settlement_steps = float(env.metrics["settlement_steps"] - start_metrics.get("settlement_steps", 0.0))
+    rollout_logical_steps = float(env.metrics["time_steps"] - start_metrics.get("time_steps", 0.0))
     rollout_duration_minutes = max(env.current_time_minute - rollout_start_minute, 0.0)
     return {
         "requests": rollout_requests,
         "aggregate_events": rollout_aggregate_events,
+        "settlement_steps": rollout_settlement_steps,
+        "logical_steps": rollout_logical_steps,
+        "temporal_sampling_fraction": float(rollout_settlement_steps / max(rollout_logical_steps, 1.0)),
         "simulated_hours": float(rollout_duration_minutes / 60.0),
         "episode_fraction": float(env.current_time_minute / max(env.config.episode_hours * 60.0, 1e-9)),
         "episode_complete": float(env.done),
@@ -1138,12 +1167,17 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
     aggregated: dict[str, float] = {
         "requests": float(requests.sum()),
         "aggregate_events": float(aggregate_events.sum()),
+        "settlement_steps": float(sum(r["settlement_steps"] for r in rollouts)),
+        "logical_steps": float(sum(r["logical_steps"] for r in rollouts)),
         "simulated_hours": float(sum(r["simulated_hours"] for r in rollouts)),
         "episode_complete": float(rollouts[-1]["episode_complete"]),
         "valid_requests": float(valid_requests.sum()),
         "invalid_actions": float(sum(r["invalid_actions"] for r in rollouts)),
         "deployment_updates": float(deployment_updates.sum()),
     }
+    aggregated["temporal_sampling_fraction"] = float(
+        aggregated["settlement_steps"] / max(aggregated["logical_steps"], 1.0)
+    )
     for key in request_weighted:
         values = np.asarray([r[key] for r in rollouts], dtype=np.float64)
         finite = np.isfinite(values)
@@ -1279,6 +1313,8 @@ def evaluate_agent(
     violation_rates = np.array([r["deadline_violation_rate"] for r in runs], dtype=np.float64)
     deployment_updates = np.array([r["deployment_updates"] for r in runs], dtype=np.float64)
     aggregate_events = np.array([r["aggregate_events"] for r in runs], dtype=np.float64)
+    settlement_steps = np.array([r["settlement_steps"] for r in runs], dtype=np.float64)
+    logical_steps = np.array([r["logical_steps"] for r in runs], dtype=np.float64)
     avg_replicas = np.array([r["avg_replicas_per_stage"] for r in runs], dtype=np.float64)
     single_replica_rates = np.array([r["single_replica_stage_rate"] for r in runs], dtype=np.float64)
     total_replicas = np.array([r["total_deployed_replicas"] for r in runs], dtype=np.float64)
@@ -1322,6 +1358,9 @@ def evaluate_agent(
         "eval_deadline_violation_rate": float(violation_rates.mean()),
         "eval_deployment_updates": float(deployment_updates.mean()),
         "eval_aggregate_events": float(aggregate_events.mean()),
+        "eval_settlement_steps": float(settlement_steps.mean()),
+        "eval_logical_steps": float(logical_steps.mean()),
+        "eval_temporal_sampling_fraction": float(settlement_steps.sum() / max(logical_steps.sum(), 1.0)),
         "eval_avg_replicas_per_stage": float(avg_replicas.mean()),
         "eval_single_replica_stage_rate": float(single_replica_rates.mean()),
         "eval_total_deployed_replicas": float(total_replicas.mean()),
@@ -1369,6 +1408,9 @@ EVAL_STAT_KEYS = [
     "eval_deadline_violation_rate",
     "eval_deployment_updates",
     "eval_aggregate_events",
+    "eval_settlement_steps",
+    "eval_logical_steps",
+    "eval_temporal_sampling_fraction",
     "eval_avg_replicas_per_stage",
     "eval_single_replica_stage_rate",
     "eval_total_deployed_replicas",
@@ -1753,6 +1795,16 @@ def main() -> None:
     )
     print(f"  episode_horizon={args.episode_hours}h deployment_windows={deployment_windows}")
     print("  environment_step=1s representative_group_sampling=disabled")
+    window_seconds = args.deployment_interval_minutes * 60
+    effective_sampled_seconds = (
+        window_seconds
+        if args.sampled_seconds_per_window == 0
+        else min(args.sampled_seconds_per_window, window_seconds)
+    )
+    print(
+        f"  temporal_sampling train={effective_sampled_seconds}/{window_seconds}s "
+        f"({effective_sampled_seconds / window_seconds:.1%}) eval=full"
+    )
     print(f"  arrival_profile={args.arrival_profile}")
     if args.arrival_profile == "stationary":
         print("  rollout_start_mode=beginning (stationary demand; requested start modes have no effect)")
@@ -1861,6 +1913,9 @@ def main() -> None:
             "window_in_episode": 0,
             "requests": 0,
             "aggregate_events": 0,
+            "settlement_steps": 0,
+            "logical_steps": 0,
+            "temporal_sampling_fraction": np.nan,
             "simulated_hours": np.nan,
             "episode_fraction": np.nan,
             "episode_complete": 0,
@@ -1965,6 +2020,9 @@ def main() -> None:
             "eval_deadline_violation_rate": eval_stats["eval_deadline_violation_rate"],
             "eval_deployment_updates": eval_stats["eval_deployment_updates"],
             "eval_aggregate_events": eval_stats["eval_aggregate_events"],
+            "eval_settlement_steps": eval_stats["eval_settlement_steps"],
+            "eval_logical_steps": eval_stats["eval_logical_steps"],
+            "eval_temporal_sampling_fraction": eval_stats["eval_temporal_sampling_fraction"],
             "eval_avg_replicas_per_stage": eval_stats["eval_avg_replicas_per_stage"],
             "eval_single_replica_stage_rate": eval_stats["eval_single_replica_stage_rate"],
             "eval_total_deployed_replicas": eval_stats["eval_total_deployed_replicas"],
@@ -2161,6 +2219,9 @@ def main() -> None:
             "window_in_episode": window_in_episode,
             "requests": int(stats["requests"]),
             "aggregate_events": int(stats["aggregate_events"]),
+            "settlement_steps": int(stats["settlement_steps"]),
+            "logical_steps": int(round(stats["logical_steps"])),
+            "temporal_sampling_fraction": stats["temporal_sampling_fraction"],
             "simulated_hours": stats["simulated_hours"],
             "episode_fraction": stats["episode_fraction"],
             "episode_complete": int(stats["episode_complete"]),
@@ -2265,6 +2326,9 @@ def main() -> None:
             "eval_deadline_violation_rate": eval_stats.get("eval_deadline_violation_rate", np.nan),
             "eval_deployment_updates": eval_stats.get("eval_deployment_updates", np.nan),
             "eval_aggregate_events": eval_stats.get("eval_aggregate_events", np.nan),
+            "eval_settlement_steps": eval_stats.get("eval_settlement_steps", np.nan),
+            "eval_logical_steps": eval_stats.get("eval_logical_steps", np.nan),
+            "eval_temporal_sampling_fraction": eval_stats.get("eval_temporal_sampling_fraction", np.nan),
             "eval_avg_replicas_per_stage": eval_stats.get("eval_avg_replicas_per_stage", np.nan),
             "eval_single_replica_stage_rate": eval_stats.get("eval_single_replica_stage_rate", np.nan),
             "eval_total_deployed_replicas": eval_stats.get("eval_total_deployed_replicas", np.nan),
@@ -2311,7 +2375,7 @@ def main() -> None:
             else f"episodes={episode_start_number:03d}-{episode_number:03d}"
         )
         print(
-            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sampled_steps={}/{} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} diag_res={:.4f} slowR={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
@@ -2330,6 +2394,8 @@ def main() -> None:
                 window_in_episode,
                 int(stats["requests"]),
                 int(stats["aggregate_events"]),
+                int(stats["settlement_steps"]),
+                int(round(stats["logical_steps"])),
                 stats["simulated_hours"],
                 stats["episode_fraction"],
                 stats["avg_reward"],
