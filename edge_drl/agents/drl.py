@@ -243,7 +243,7 @@ class SlowDeploymentPPOAgent:
         if self.pending_window_id is not None:
             raise ValueError("slow deployment buffer contains a window without a return")
         if not self.window_returns:
-            return self._empty_update_metrics()
+            return self.empty_update_metrics()
         if len(self.window_states) != len(self.window_returns):
             raise ValueError("slow deployment window states and returns are misaligned")
 
@@ -302,7 +302,7 @@ class SlowDeploymentPPOAgent:
             "placement_approx_kl": placement_metrics.get("approx_kl", 0.0),
         }
 
-    def _empty_update_metrics(self) -> dict[str, float]:
+    def empty_update_metrics(self) -> dict[str, float]:
         return {
             "loss": 0.0,
             "policy_loss": 0.0,
@@ -867,12 +867,28 @@ class HierarchicalPPOAgent:
 
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, dict[str, float]]:
         return {
-            "slow": self.slow_agent.update(
+            "slow": self.update_slow(
                 progress_label=f"{progress_label} slow PPO",
                 progress_interval_seconds=progress_interval_seconds,
             ),
-            "fast": self.fast_agent.update(
+            "fast": self.update_fast(
                 progress_label=f"{progress_label} fast PPO",
                 progress_interval_seconds=progress_interval_seconds,
             ),
         }
+
+    @property
+    def completed_slow_windows(self) -> int:
+        return len(self.slow_agent.window_returns)
+
+    def update_slow(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
+        return self.slow_agent.update(
+            progress_label=progress_label,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+
+    def update_fast(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
+        return self.fast_agent.update(
+            progress_label=progress_label,
+            progress_interval_seconds=progress_interval_seconds,
+        )

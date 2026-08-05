@@ -63,7 +63,7 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --arrival-profile stationary --demand-sampling-mode rollout --rollouts-per-update 4 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 4.0 --load-multipliers 1.0,1.35,1.7,2.1 --eval-rollout-unit window --eval-rollout-start-mode same --task-compute-scale 2.8 --task-data-scale 5.0 --node-compute-capacity-scale 0.45 --wired-link-bandwidth-scale 0.10 --eval-interval 10 --eval-seeds 4 --reward-mode latency --reward-scale 20 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --compute-hotspot-threshold 0.45 --link-hotspot-threshold 0.35 --compute-hotspot-coef 0.12 --link-hotspot-coef 0.08 --compute-imbalance-coef 0.04 --link-imbalance-coef 0.03 --idle-deployed-node-coef 0.04 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --slow-value-coef 0.25 --fast-k-epochs 1 --fast-minibatch-size 1024 --device cuda --run-name joint_gat_city32_svc10_joint_second --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --arrival-profile stationary --demand-sampling-mode episode --fast-windows-per-update 1 --slow-windows-per-update 12 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 1.0 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_decoupled_updates --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
@@ -103,6 +103,11 @@ optimized only against physical task latency. The slow window return combines
 request-weighted physical latency with deployment memory/storage costs. Migration
 changes remain logged, but `--slow-migration-coef` defaults to zero for the
 current convergence experiments.
+Fast and Slow PPO have independent optimizer schedules. By default,
+`--fast-windows-per-update 1` updates Fast PPO after every ten-minute rollout,
+while `--slow-windows-per-update 12` keeps the Slow PPO policy fixed until twelve
+complete window returns have accumulated. The log fields `slow_updated`,
+`slow_windows_available`, and `slow_windows_buffered` make this cadence explicit.
 `--service-resource-fraction` fixes the share of each physical
 node's memory/storage available to this controller, representing system and
 co-tenant reservations without imposing a per-service replica-count cap.
@@ -137,9 +142,9 @@ in CPU cycles or transferred data. Use `--node-compute-capacity-scale` and
 `--wired-link-bandwidth-scale` below 1.0 when the fixed physical environment is
 too over-provisioned for the desired experiment. These capacity scales are part
 of the fixed physical scenario for a run and remain tied to `--physical-seed`.
-For convergence experiments, prefer a four-value `--load-multipliers` list when
-`--rollouts-per-update 4`; this makes each PPO update see several pressure
-levels. The stationary profile ignores rollout start modes. Use
+For demand-randomized convergence experiments, load multipliers can still be
+cycled across consecutive Fast windows. The stationary profile ignores rollout
+start modes. Use
 `--arrival-profile daily --episode-hours 24 --rollout-start-mode cycle-window`
 only for legacy experiments that intentionally model within-day timing.
 
@@ -151,15 +156,14 @@ explicit coefficients:
 `--idle-deployed-node-coef`. These terms penalize hotspots, imbalance, and idle
 deployed nodes instead of directly rewarding more replicas.
 
-At each eval interval, `eval_*` fields report held-out demand seeds, while
-`seen_eval_*` fields report fixed demand seeds from the training distribution.
-This separates optimization on familiar demand profiles from demand
-generalization on unseen profiles.
+At each eval interval, `eval_*` fields report one held-out deterministic rollout
+by default. Set `--eval-seeds` above 1 only when an explicit multi-seed sweep is
+needed. Periodic training no longer launches separate seen-demand and policy
+diagnostic rollouts.
 
-For high-variance demand-randomized PPO, `--rollouts-per-update K` can collect
-multiple independent 10-minute windows before one optimizer update. This is
-closer to batched PPO sampling than updating after a single demand seed, and it
-makes the logged training latency less dominated by one sampled demand profile.
+For high-variance demand-randomized PPO, `--fast-windows-per-update K` can still
+collect multiple independent ten-minute windows before one Fast optimizer
+update. `--rollouts-per-update` remains a compatibility alias.
 Slow deployment exploration can also be controlled separately with
 `--slow-count-entropy-coef` and `--slow-placement-entropy-coef`; the count policy
 is especially sensitive because its action space is only the replica count.

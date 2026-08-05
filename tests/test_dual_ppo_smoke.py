@@ -89,6 +89,33 @@ def test_deterministic_eval_does_not_write_rollout_buffers():
     assert len(agent.fast_agent.ppo.buffer) == 0
 
 
+def test_fast_update_preserves_slow_window_buffer():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=17,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            deployment_interval_minutes=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    rollout(env, agent, max_requests=1, rollout_unit="window")
+
+    assert agent.completed_slow_windows == 1
+    assert len(agent.fast_agent.ppo.buffer) > 0
+    fast_metrics = agent.update_fast()
+    assert np.isfinite(fast_metrics["loss"])
+    assert len(agent.fast_agent.ppo.buffer) == 0
+    assert agent.completed_slow_windows == 1
+
+    slow_metrics = agent.update_slow()
+    assert slow_metrics["window_count"] == 1
+    assert agent.completed_slow_windows == 0
+
+
 def test_fast_only_rollout_records_only_fast_buffer():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

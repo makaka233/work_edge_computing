@@ -377,7 +377,8 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
         str(save_dir),
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
-    assert "rollouts_per_update=2" in result.stdout
+    assert "fast_windows_per_update=2" in result.stdout
+    assert "slow_windows_per_update=12" in result.stdout
     assert "episode_horizon=4h deployment_windows=24" in result.stdout
     assert "arrival_profile=stationary" in result.stdout
     assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=0 window=01" in result.stdout
@@ -489,7 +490,52 @@ def test_eval_interval_does_not_run_initial_eval_by_default(tmp_path):
         rows = list(csv.DictReader(handle))
     assert [row["update"] for row in rows] == ["1"]
     assert rows[0]["eval_avg_latency_s"] != "nan"
-    assert rows[0]["seen_eval_avg_latency_s"] != "nan"
+    assert rows[0]["seen_eval_avg_latency_s"] == "nan"
+
+
+def test_fast_and_slow_ppo_use_independent_window_update_periods(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "3",
+        "--rollout-unit",
+        "window",
+        "--fast-windows-per-update",
+        "1",
+        "--slow-windows-per-update",
+        "2",
+        "--episode-hours",
+        "1",
+        "--deployment-interval-minutes",
+        "1",
+        "--mean-requests-per-minute",
+        "60",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "slow_update=0 slow_buffer=1/2" in result.stdout
+    assert "slow_update=1 slow_buffer=0/2" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["slow_updated"] for row in rows] == ["0", "1", "0"]
+    assert [row["slow_windows_available"] for row in rows] == ["1", "2", "1"]
+    assert [row["slow_windows_buffered"] for row in rows] == ["1", "0", "1"]
+    assert [row["slow_window_count"] for row in rows] == ["0.0", "2.0", "0.0"]
 
 
 def test_convergence_analyzer_reads_training_log(tmp_path):

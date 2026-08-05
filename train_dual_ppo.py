@@ -172,10 +172,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-minibatch-size", type=int, default=2048)
     parser.add_argument("--fast-minibatch-size", type=int, default=512)
     parser.add_argument(
+        "--fast-windows-per-update",
         "--rollouts-per-update",
+        dest="fast_windows_per_update",
         type=int,
         default=1,
-        help="Collect this many independent rollouts before each PPO optimizer update.",
+        help=(
+            "Collect this many windows before each Fast PPO update. "
+            "--rollouts-per-update is retained as a compatibility alias."
+        ),
+    )
+    parser.add_argument(
+        "--slow-windows-per-update",
+        type=int,
+        default=12,
+        help="Accumulate this many completed deployment windows before each Slow PPO update.",
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--load-checkpoint", type=str, default="")
@@ -194,7 +205,12 @@ def parse_args() -> argparse.Namespace:
         default="requests",
         help="Use request-count eval, full-episode eval, or the same unit as training.",
     )
-    parser.add_argument("--eval-seeds", type=int, default=3)
+    parser.add_argument(
+        "--eval-seeds",
+        type=int,
+        default=1,
+        help="Number of held-out demand seeds per eval point. Default 1 performs one eval rollout.",
+    )
     parser.add_argument("--fast-bc-requests", type=int, default=0)
     parser.add_argument("--fast-bc-epochs", type=int, default=3)
     parser.add_argument("--run-root", type=str, default="runs")
@@ -210,8 +226,12 @@ def parse_args() -> argparse.Namespace:
         help="Print in-rollout terminal progress every N seconds. Use 0 to disable.",
     )
     args = parser.parse_args()
-    if args.rollouts_per_update < 1:
-        parser.error("--rollouts-per-update must be >= 1")
+    if args.fast_windows_per_update < 1:
+        parser.error("--fast-windows-per-update must be >= 1")
+    if args.slow_windows_per_update < 1:
+        parser.error("--slow-windows-per-update must be >= 1")
+    if args.eval_seeds < 1:
+        parser.error("--eval-seeds must be >= 1")
     if args.replicas_per_stage < 0:
         parser.error("--replicas-per-stage must be >= 0")
     if not 0.0 < args.service_resource_fraction <= 1.0:
@@ -1725,7 +1745,8 @@ def main() -> None:
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
-    print(f"  rollouts_per_update={args.rollouts_per_update}")
+    print(f"  fast_windows_per_update={args.fast_windows_per_update}")
+    print(f"  slow_windows_per_update={args.slow_windows_per_update}")
     deployment_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
         1,
@@ -1801,7 +1822,6 @@ def main() -> None:
         log_path.unlink()
     write_metadata(run_dir, args, bc_metrics, loaded_metadata)
     best_latency = float("inf")
-    previous_eval_actions: list[int] | None = None
 
     if args.eval_baseline:
         baseline_env = build_env(args, seed_offset=20_000)
@@ -1818,14 +1838,6 @@ def main() -> None:
         )
 
     if args.eval_before_training and args.eval_interval:
-        seen_eval_stats = evaluate_agent(
-            args,
-            agent,
-            seed_base=0,
-            max_requests=args.eval_requests,
-            train_mode=args.train_mode,
-            rollout_unit=eval_rollout_unit,
-        )
         eval_stats = evaluate_agent(
             args,
             agent,
@@ -1834,15 +1846,8 @@ def main() -> None:
             train_mode=args.train_mode,
             rollout_unit=eval_rollout_unit,
         )
-        diagnostic_stats, previous_eval_actions = evaluate_policy_diagnostics(
-            args,
-            agent,
-            seed_base=30_000,
-            max_requests=args.eval_requests,
-            train_mode=args.train_mode,
-            previous_actions=None,
-            rollout_unit=eval_rollout_unit,
-        )
+        seen_eval_stats: dict[str, float] = {}
+        diagnostic_stats: dict[str, float] = {}
         initial_row = {
             "update": 0,
             "episode": 0,
@@ -1926,6 +1931,9 @@ def main() -> None:
             "slow_deployment_storage_fraction": np.nan,
             "slow_migration_fraction": np.nan,
             "slow_loss": 0.0,
+            "slow_updated": 0,
+            "slow_windows_available": 0,
+            "slow_windows_buffered": 0,
             "slow_policy_loss": 0.0,
             "slow_value_loss": 0.0,
             "slow_approx_kl": 0.0,
@@ -2027,11 +2035,15 @@ def main() -> None:
         start_minutes: list[float] = []
         episode_numbers: list[int] = []
         window_numbers: list[int] = []
-        for rollout_in_update in range(max(args.rollouts_per_update, 1)):
-            rollout_idx = update * max(args.rollouts_per_update, 1) + rollout_in_update
+        for rollout_in_update in range(args.fast_windows_per_update):
+            rollout_idx = update * args.fast_windows_per_update + rollout_in_update
             start_minute = rollout_start_minute(args, rollout_idx)
             load_multiplier = load_multiplier_for_rollout(args, rollout_idx)
-            batch_suffix = "" if args.rollouts_per_update <= 1 else f" rollout={rollout_in_update + 1:02d}/{args.rollouts_per_update:02d}"
+            batch_suffix = (
+                ""
+                if args.fast_windows_per_update <= 1
+                else f" rollout={rollout_in_update + 1:02d}/{args.fast_windows_per_update:02d}"
+            )
             if args.rollout_unit == "window":
                 if args.demand_sampling_mode == "rollout":
                     train_env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
@@ -2101,34 +2113,32 @@ def main() -> None:
         load_multiplier_end = load_multipliers[-1]
         start_minute = start_minutes[0]
         start_minute_end = start_minutes[-1]
+        fast_metrics = agent.update_fast(
+            progress_label=f"update={update + 1:03d}/{args.updates:03d} fast PPO",
+            progress_interval_seconds=args.progress_interval_seconds,
+        )
+        slow_updated = False
+        slow_windows_available = agent.completed_slow_windows
         if args.train_mode == "fast-only":
-            losses = {
-                "slow": {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0},
-                "fast": agent.fast_agent.update(
-                    progress_label=f"update={update + 1:03d}/{args.updates:03d} fast PPO",
-                    progress_interval_seconds=args.progress_interval_seconds,
-                ),
-            }
+            slow_metrics = agent.slow_agent.empty_update_metrics()
             agent.slow_agent.count_ppo.buffer.clear()
             agent.slow_agent.placement_ppo.buffer.clear()
             agent.window_reward = 0.0
             agent.window_steps = 0
-        else:
-            losses = agent.update(
-                progress_label=f"update={update + 1:03d}/{args.updates:03d}",
+        elif slow_windows_available >= args.slow_windows_per_update:
+            slow_metrics = agent.update_slow(
+                progress_label=f"update={update + 1:03d}/{args.updates:03d} slow PPO",
                 progress_interval_seconds=args.progress_interval_seconds,
             )
+            slow_updated = True
+        else:
+            slow_metrics = agent.slow_agent.empty_update_metrics()
+        losses = {"slow": slow_metrics, "fast": fast_metrics}
+        slow_windows_buffered = agent.completed_slow_windows
+
         eval_stats = {}
         seen_eval_stats = {}
         if args.eval_interval and (update + 1) % args.eval_interval == 0:
-            seen_eval_stats = evaluate_agent(
-                args,
-                agent,
-                seed_base=0,
-                max_requests=args.eval_requests,
-                train_mode=args.train_mode,
-                rollout_unit=eval_rollout_unit,
-            )
             eval_stats = evaluate_agent(
                 args,
                 agent,
@@ -2137,17 +2147,7 @@ def main() -> None:
                 train_mode=args.train_mode,
                 rollout_unit=eval_rollout_unit,
             )
-            diagnostic_stats, previous_eval_actions = evaluate_policy_diagnostics(
-                args,
-                agent,
-                seed_base=30_000,
-                max_requests=args.eval_requests,
-                train_mode=args.train_mode,
-                previous_actions=previous_eval_actions,
-                rollout_unit=eval_rollout_unit,
-            )
-        else:
-            diagnostic_stats = {}
+        diagnostic_stats = {}
         log_row = {
             "update": update + 1,
             "episode": episode_number,
@@ -2231,6 +2231,9 @@ def main() -> None:
             "slow_deployment_storage_fraction": stats["slow_deployment_storage_fraction"],
             "slow_migration_fraction": stats["slow_migration_fraction"],
             "slow_loss": losses["slow"]["loss"],
+            "slow_updated": int(slow_updated),
+            "slow_windows_available": int(slow_windows_available),
+            "slow_windows_buffered": int(slow_windows_buffered),
             "slow_policy_loss": losses["slow"]["policy_loss"],
             "slow_value_loss": losses["slow"]["value_loss"],
             "slow_approx_kl": losses["slow"].get("approx_kl", 0.0),
@@ -2313,7 +2316,7 @@ def main() -> None:
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
             "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} service_mem={:.1%}/{:.1%} service_storage={:.1%}/{:.1%} idle_deployed={:.1%} "
-            "slow_loss={:.4f} slow_windows={:.0f} critic_ev={:.3f} fast_loss={:.4f}".format(
+            "slow_update={} slow_buffer={}/{} slow_loss={:.4f} slow_windows={:.0f} critic_ev={:.3f} fast_loss={:.4f}".format(
                 update + 1,
                 episode_label,
                 demand_seed,
@@ -2365,6 +2368,9 @@ def main() -> None:
                 stats["avg_service_storage_util"],
                 stats["max_service_storage_util"],
                 stats["idle_deployed_node_rate"],
+                int(slow_updated),
+                int(slow_windows_buffered),
+                args.slow_windows_per_update,
                 losses["slow"]["loss"],
                 losses["slow"].get("window_count", 0.0),
                 losses["slow"].get("critic_explained_variance", 0.0),
@@ -2375,7 +2381,7 @@ def main() -> None:
             print(
                 "  eval_mean_latency={:.4f}s eval_valid_latency={:.4f}s eval_penalty_latency={:.4f}s eval_std={:.4f}s eval_p95={:.4f}s invalid={:.2f} "
                 "eval_replicas={:.2f} single={:.1%} used_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
-                "node_load={:.1%}/{:.1%} hot={:.1%} link_load={:.2%}/{:.1%} hot_link={:.1%} entropy={:.4f} action_change={:.4f}".format(
+                "node_load={:.1%}/{:.1%} hot={:.1%} link_load={:.2%}/{:.1%} hot_link={:.1%}".format(
                     eval_stats["eval_avg_latency_s"],
                     eval_stats["eval_avg_valid_latency_s"],
                     eval_stats["eval_avg_penalty_latency_s"],
@@ -2394,17 +2400,6 @@ def main() -> None:
                     eval_stats["eval_avg_link_load"],
                     eval_stats["eval_max_link_load"],
                     eval_stats["eval_hot_link_rate"],
-                    diagnostic_stats.get("eval_policy_entropy", np.nan),
-                    diagnostic_stats.get("eval_action_change_rate", np.nan),
-                )
-            )
-            print(
-                "  seen_eval_mean_latency={:.4f}s seen_eval_p95={:.4f}s seen_eval_replicas={:.2f} seen_eval_node_load={:.1%}/{:.1%}".format(
-                    seen_eval_stats["eval_avg_latency_s"],
-                    seen_eval_stats["eval_p95_latency_s"],
-                    seen_eval_stats["eval_avg_replicas_per_stage"],
-                    seen_eval_stats["eval_avg_node_compute_load"],
-                    seen_eval_stats["eval_max_node_compute_load"],
                 )
             )
         selection_latency = eval_stats.get("eval_avg_latency_s", stats["avg_latency_s"])
