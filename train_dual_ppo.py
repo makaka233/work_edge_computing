@@ -5,6 +5,7 @@ import csv
 import json
 import sys
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -38,12 +39,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--demand-sampling-mode",
-        choices=["episode", "rollout"],
+        choices=["episode", "rollout", "pool"],
         default="episode",
         help=(
             "episode keeps the demand scenario for --scenario-refresh-episodes training episodes; "
-            "rollout samples a new demand scenario for every PPO rollout while keeping physical_seed fixed."
+            "rollout samples a new demand scenario for every PPO rollout; pool revisits a fixed, shuffled "
+            "set of demand scenarios while keeping physical_seed fixed."
         ),
+    )
+    parser.add_argument(
+        "--train-demand-pool-size",
+        type=int,
+        default=16,
+        help="Number of fixed demand scenarios used by --demand-sampling-mode pool.",
+    )
+    parser.add_argument(
+        "--train-demand-seed-base",
+        type=int,
+        default=None,
+        help="First absolute demand seed in the training pool. Defaults to --seed.",
     )
     parser.add_argument("--num-users", type=int, default=10_000)
     parser.add_argument("--num-edge-nodes", type=int, default=32)
@@ -170,6 +184,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-deployment-memory-coef", type=float, default=0.03)
     parser.add_argument("--slow-deployment-storage-coef", type=float, default=0.01)
     parser.add_argument(
+        "--slow-cvar-coef",
+        type=float,
+        default=0.25,
+        help="Coefficient on the slow window's worst 5%% mean physical latency.",
+    )
+    parser.add_argument(
+        "--slow-deadline-excess-coef",
+        type=float,
+        default=0.5,
+        help="Coefficient on mean physical deadline excess in the slow window return.",
+    )
+    parser.add_argument(
         "--slow-migration-coef",
         type=float,
         default=0.0,
@@ -220,6 +246,24 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of held-out demand seeds per eval point. Default 1 performs one eval rollout.",
     )
+    parser.add_argument(
+        "--heldout-eval-seed-base",
+        type=int,
+        default=None,
+        help="First absolute held-out demand seed. Defaults to --seed + 30000.",
+    )
+    parser.add_argument(
+        "--seen-eval-seeds",
+        type=int,
+        default=0,
+        help="Number of training-pool demand seeds evaluated separately at each eval point.",
+    )
+    parser.add_argument(
+        "--fast-warmup-updates",
+        type=int,
+        default=0,
+        help="Initial updates that train only Fast PPO under a fixed feasible greedy deployment.",
+    )
     parser.add_argument("--fast-bc-requests", type=int, default=0)
     parser.add_argument("--fast-bc-epochs", type=int, default=3)
     parser.add_argument("--run-root", type=str, default="runs")
@@ -241,6 +285,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-windows-per-update must be >= 1")
     if args.eval_seeds < 1:
         parser.error("--eval-seeds must be >= 1")
+    if args.seen_eval_seeds < 0:
+        parser.error("--seen-eval-seeds must be >= 0")
+    if args.train_demand_pool_size < 1:
+        parser.error("--train-demand-pool-size must be >= 1")
+    if args.seen_eval_seeds > args.train_demand_pool_size:
+        parser.error("--seen-eval-seeds cannot exceed --train-demand-pool-size")
+    if args.fast_warmup_updates < 0:
+        parser.error("--fast-warmup-updates must be >= 0")
+    if args.slow_cvar_coef < 0 or args.slow_deadline_excess_coef < 0:
+        parser.error("slow physical-latency coefficients must be >= 0")
     if args.replicas_per_stage < 0:
         parser.error("--replicas-per-stage must be >= 0")
     if not 0.0 < args.service_resource_fraction <= 1.0:
@@ -285,6 +339,27 @@ def load_multiplier_for_rollout(args: argparse.Namespace, rollout_idx: int) -> f
     return multipliers[int(rollout_idx) % len(multipliers)]
 
 
+def training_demand_pool(args: argparse.Namespace) -> tuple[int, ...]:
+    base = args.seed if args.train_demand_seed_base is None else args.train_demand_seed_base
+    return tuple(int(base + offset) for offset in range(args.train_demand_pool_size))
+
+
+def shuffled_training_demand_seed(args: argparse.Namespace, context_idx: int) -> int:
+    pool = np.asarray(training_demand_pool(args), dtype=np.int64)
+    cycle_idx, position = divmod(int(context_idx), len(pool))
+    rng = np.random.default_rng(int(args.seed) + 700_001 + cycle_idx)
+    return int(rng.permutation(pool)[position])
+
+
+def heldout_eval_demand_seeds(args: argparse.Namespace) -> tuple[int, ...]:
+    base = args.seed + 30_000 if args.heldout_eval_seed_base is None else args.heldout_eval_seed_base
+    return tuple(int(base + offset) for offset in range(args.eval_seeds))
+
+
+def seen_eval_demand_seeds(args: argparse.Namespace) -> tuple[int, ...]:
+    return training_demand_pool(args)[: args.seen_eval_seeds]
+
+
 def rollout_start_minute(args: argparse.Namespace, rollout_idx: int, *, eval_mode: bool = False) -> float:
     if getattr(args, "arrival_profile", "daily") == "stationary":
         return 0.0
@@ -324,17 +399,29 @@ def scenario_seed_for_offset(args: argparse.Namespace, seed_offset: int = 0, *, 
 
 
 def demand_seed_for_training_rollout(args: argparse.Namespace, rollout_idx: int, episode_idx: int) -> int:
+    if getattr(args, "demand_sampling_mode", "episode") == "pool":
+        return shuffled_training_demand_seed(args, rollout_idx)
     if getattr(args, "demand_sampling_mode", "episode") == "rollout":
         return scenario_seed_for_offset(args, rollout_idx, group_by_refresh=False)
     return scenario_seed_for_offset(args, episode_idx, group_by_refresh=True)
 
 
-def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_by_refresh: bool = False) -> EdgeComputingEnv:
+def build_env(
+    args: argparse.Namespace,
+    seed_offset: int = 0,
+    *,
+    group_scenario_by_refresh: bool = False,
+    demand_seed: int | None = None,
+) -> EdgeComputingEnv:
     return EdgeComputingEnv(
         EdgeEnvConfig(
             seed=args.seed + seed_offset,
             physical_seed=args.seed if args.physical_seed is None else args.physical_seed,
-            scenario_seed=scenario_seed_for_offset(args, seed_offset, group_by_refresh=group_scenario_by_refresh),
+            scenario_seed=(
+                scenario_seed_for_offset(args, seed_offset, group_by_refresh=group_scenario_by_refresh)
+                if demand_seed is None
+                else int(demand_seed)
+            ),
             num_users=args.num_users,
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
@@ -359,8 +446,15 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
     )
 
 
-def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_idx: int) -> EdgeComputingEnv:
-    demand_seed = demand_seed_for_training_rollout(args, rollout_idx, episode_idx)
+def build_training_env(
+    args: argparse.Namespace,
+    *,
+    rollout_idx: int,
+    episode_idx: int,
+    demand_seed: int | None = None,
+) -> EdgeComputingEnv:
+    if demand_seed is None:
+        demand_seed = demand_seed_for_training_rollout(args, rollout_idx, episode_idx)
     return EdgeComputingEnv(
         EdgeEnvConfig(
             seed=args.seed + rollout_idx,
@@ -655,6 +749,7 @@ def rollout(
         )
     if reset_env:
         env.reset()
+    agent.feedback_env = env
     if record:
         agent.last_slow_window_metrics = {}
     if frozen_slow_policy is None:
@@ -744,6 +839,11 @@ def rollout(
                     done=bool(done and group_idx == len(group_infos) - 1),
                     weight=request_count,
                     slow_reward=-float(info["latency_s"]) * reward_scale,
+                    home_node=request.home_node,
+                    service_id=request.service_id,
+                    latency_s=float(info["latency_s"]),
+                    deadline_s=request.deadline_s,
+                    stage_nodes=info.get("stage_nodes", ()),
                 )
             rewards.append(float(info["reward"]))
             train_rewards.append(float(train_reward))
@@ -773,7 +873,7 @@ def rollout(
             weights.append(request_count)
             window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
         if record and done and not group_infos:
-            agent.flush_slow_window_reward(done=True)
+            agent.flush_slow_window_reward(done=True, env=env)
         if progress.should_print():
             progress.maybe_print(
                 env,
@@ -792,10 +892,15 @@ def rollout(
         avg_penalty_latency_s=_weighted_mean(penalty_latencies, weights),
     )
     if record and (env.done or env.needs_deployment_update):
-        agent.flush_slow_window_reward(done=env.done)
+        agent.flush_slow_window_reward(done=env.done, env=env)
     slow_window_metrics = {
         "slow_window_return": float("nan"),
         "slow_window_latency_return": float("nan"),
+        "slow_window_physical_cost_s": float("nan"),
+        "slow_window_mean_latency_s": float("nan"),
+        "slow_window_cvar95_latency_s": float("nan"),
+        "slow_window_deadline_excess_s": float("nan"),
+        "slow_window_deadline_violation_rate": float("nan"),
         "slow_deployment_memory_cost": float("nan"),
         "slow_deployment_storage_cost": float("nan"),
         "slow_migration_cost": float("nan"),
@@ -1156,6 +1261,11 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "cross_node_stage_transition_rate",
         "slow_window_return",
         "slow_window_latency_return",
+        "slow_window_physical_cost_s",
+        "slow_window_mean_latency_s",
+        "slow_window_cvar95_latency_s",
+        "slow_window_deadline_excess_s",
+        "slow_window_deadline_violation_rate",
         "slow_deployment_memory_cost",
         "slow_deployment_storage_cost",
         "slow_migration_cost",
@@ -1278,10 +1388,23 @@ def evaluate_agent(
     max_requests: int,
     train_mode: str,
     rollout_unit: str = "requests",
+    demand_seeds: tuple[int, ...] | list[int] | None = None,
+    label: str = "eval",
 ) -> dict[str, float]:
+    selected_demand_seeds = (
+        tuple(int(seed) for seed in demand_seeds)
+        if demand_seeds is not None
+        else tuple(scenario_seed_for_offset(args, seed_base + idx) for idx in range(args.eval_seeds))
+    )
+    if not selected_demand_seeds:
+        raise ValueError("evaluation requires at least one demand seed")
     runs = []
-    for seed_idx in range(args.eval_seeds):
-        eval_env = build_env(args, seed_offset=seed_base + seed_idx)
+    for seed_idx, demand_seed in enumerate(selected_demand_seeds):
+        eval_env = build_env(
+            args,
+            seed_offset=seed_base + seed_idx,
+            demand_seed=demand_seed,
+        )
         reset_env = True
         if rollout_unit == "window":
             eval_env.reset()
@@ -1296,7 +1419,7 @@ def evaluate_agent(
                 deterministic=True,
                 record=False,
                 train_mode=train_mode,
-                progress_label=f"eval seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
+                progress_label=f"{label} seed={seed_idx + 1:02d}/{len(selected_demand_seeds):02d}",
                 progress_interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
                 rollout_unit=rollout_unit,
                 reset_env=reset_env,
@@ -1662,20 +1785,41 @@ def save_checkpoint(agent: HierarchicalPPOAgent, path: Path, metadata: dict[str,
 
 def load_checkpoint(agent: HierarchicalPPOAgent, path: Path) -> dict[str, object]:
     checkpoint = torch.load(path, map_location=agent.fast_agent.ppo.device)
-    if "slow_count_agent" in checkpoint:
-        agent.slow_agent.count_ppo.policy.load_state_dict(checkpoint["slow_count_agent"])
-    if "slow_placement_agent" in checkpoint:
-        agent.slow_agent.placement_ppo.policy.load_state_dict(checkpoint["slow_placement_agent"])
-    elif "slow_agent" in checkpoint:
-        agent.slow_agent.placement_ppo.policy.load_state_dict(checkpoint["slow_agent"])
-    if "slow_window_critic" in checkpoint:
-        agent.slow_agent.window_critic.load_state_dict(checkpoint["slow_window_critic"])
+    count_state = checkpoint.get("slow_count_agent")
+    placement_state = checkpoint.get("slow_placement_agent", checkpoint.get("slow_agent"))
+    critic_state = checkpoint.get("slow_window_critic")
+
+    def compatible(module: torch.nn.Module, state: object) -> bool:
+        if not isinstance(state, dict):
+            return False
+        current = module.state_dict()
+        return current.keys() == state.keys() and all(current[key].shape == state[key].shape for key in current)
+
+    slow_states_present = any(state is not None for state in (count_state, placement_state, critic_state))
+    slow_compatible = (
+        compatible(agent.slow_agent.count_ppo.policy, count_state)
+        and compatible(agent.slow_agent.placement_ppo.policy, placement_state)
+        and compatible(agent.slow_agent.window_critic, critic_state)
+    )
+    skipped_slow = slow_states_present and not slow_compatible
+    if slow_compatible:
+        agent.slow_agent.count_ppo.policy.load_state_dict(count_state)
+        agent.slow_agent.placement_ppo.policy.load_state_dict(placement_state)
+        agent.slow_agent.window_critic.load_state_dict(critic_state)
     if "fast_agent" in checkpoint:
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
-    return checkpoint.get("metadata", {})
+    if skipped_slow:
+        warnings.warn(
+            "Slow checkpoint tensors do not match the current feedback-aware observation; "
+            "Slow policies were reinitialized while compatible Fast weights were loaded.",
+            stacklevel=2,
+        )
+    metadata = dict(checkpoint.get("metadata", {}))
+    metadata["slow_checkpoint_skipped"] = skipped_slow
+    return metadata
 
 
-def append_log(path: Path, row: dict[str, float | int]) -> None:
+def append_log(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as handle:
@@ -1685,7 +1829,7 @@ def append_log(path: Path, row: dict[str, float | int]) -> None:
         writer.writerow(row)
 
 
-def write_single_row_csv(path: Path, row: dict[str, float | int]) -> None:
+def write_single_row_csv(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
@@ -1758,6 +1902,8 @@ def main() -> None:
         slow_deployment_memory_coef=args.slow_deployment_memory_coef,
         slow_deployment_storage_coef=args.slow_deployment_storage_coef,
         slow_migration_coef=args.slow_migration_coef,
+        slow_cvar_coef=args.slow_cvar_coef,
+        slow_deadline_excess_coef=args.slow_deadline_excess_coef,
     )
     loaded_metadata: dict[str, object] = {}
     if args.load_checkpoint:
@@ -1787,8 +1933,21 @@ def main() -> None:
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
+    if args.demand_sampling_mode == "pool":
+        pool = training_demand_pool(args)
+        print(
+            f"  train_demand_pool=size{len(pool)} seeds={pool[0]}-{pool[-1]} "
+            "order=deterministic_shuffled_cycles"
+        )
+    heldout_seeds = heldout_eval_demand_seeds(args)
+    seen_seeds = seen_eval_demand_seeds(args)
+    print(
+        f"  eval_demand heldout={len(heldout_seeds)} seeds={heldout_seeds[0]}-{heldout_seeds[-1]} "
+        f"seen={len(seen_seeds)}"
+    )
     print(f"  fast_windows_per_update={args.fast_windows_per_update}")
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
+    print(f"  fast_warmup_updates={args.fast_warmup_updates}")
     deployment_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
         1,
@@ -1837,7 +1996,9 @@ def main() -> None:
         )
     )
     print(
-        "  slow_window_cost memory_coef={} storage_coef={} migration_coef={} critic_lr={} critic_epochs={}".format(
+        "  slow_window_cost mean_latency=1 cvar95_coef={} deadline_excess_coef={} memory_coef={} storage_coef={} migration_coef={} critic_lr={} critic_epochs={}".format(
+            args.slow_cvar_coef,
+            args.slow_deadline_excess_coef,
             args.slow_deployment_memory_coef,
             args.slow_deployment_storage_coef,
             args.slow_migration_coef,
@@ -1897,14 +2058,30 @@ def main() -> None:
             max_requests=args.eval_requests,
             train_mode=args.train_mode,
             rollout_unit=eval_rollout_unit,
+            demand_seeds=heldout_eval_demand_seeds(args),
+            label="heldout eval",
         )
-        seen_eval_stats: dict[str, float] = {}
+        seen_eval_stats = (
+            evaluate_agent(
+                args,
+                agent,
+                seed_base=40_000,
+                max_requests=args.eval_requests,
+                train_mode=args.train_mode,
+                rollout_unit=eval_rollout_unit,
+                demand_seeds=seen_eval_demand_seeds(args),
+                label="seen eval",
+            )
+            if args.seen_eval_seeds > 0
+            else {}
+        )
         diagnostic_stats: dict[str, float] = {}
         initial_row = {
             "update": 0,
             "episode": 0,
-            "demand_seed": scenario_seed_for_offset(args, 0),
-            "demand_seed_end": scenario_seed_for_offset(args, 0),
+            "training_phase": "pretrain",
+            "demand_seed": demand_seed_for_training_rollout(args, 0, 0),
+            "demand_seed_end": demand_seed_for_training_rollout(args, 0, 0),
             "load_multiplier": load_multiplier_for_rollout(args, 0),
             "load_multiplier_end": load_multiplier_for_rollout(args, 0),
             "start_minute": rollout_start_minute(args, 0),
@@ -1979,6 +2156,11 @@ def main() -> None:
             "window_latency_delta_s": np.nan,
             "slow_window_return": np.nan,
             "slow_window_latency_return": np.nan,
+            "slow_window_physical_cost_s": np.nan,
+            "slow_window_mean_latency_s": np.nan,
+            "slow_window_cvar95_latency_s": np.nan,
+            "slow_window_deadline_excess_s": np.nan,
+            "slow_window_deadline_violation_rate": np.nan,
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
@@ -2081,12 +2263,18 @@ def main() -> None:
             )
 
     train_env: EdgeComputingEnv | None = None
+    pooled_train_envs: dict[tuple[int, float], EdgeComputingEnv] = {}
     train_episode_idx = 0
     total_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
         1,
     )
     for update in range(args.updates):
+        effective_train_mode = (
+            "fast-only"
+            if args.train_mode == "joint" and update < args.fast_warmup_updates
+            else args.train_mode
+        )
         rollout_stats: list[dict[str, float]] = []
         demand_seeds: list[int] = []
         load_multipliers: list[float] = []
@@ -2103,7 +2291,28 @@ def main() -> None:
                 else f" rollout={rollout_in_update + 1:02d}/{args.fast_windows_per_update:02d}"
             )
             if args.rollout_unit == "window":
-                if args.demand_sampling_mode == "rollout":
+                demand_seed = demand_seed_for_training_rollout(
+                    args,
+                    rollout_idx,
+                    train_episode_idx if args.demand_sampling_mode == "episode" else rollout_idx,
+                )
+                if args.demand_sampling_mode == "pool":
+                    pool_key = (demand_seed, float(load_multiplier))
+                    pooled_env = pooled_train_envs.get(pool_key)
+                    if pooled_env is None or pooled_env.done:
+                        if pooled_env is not None and pooled_env.done:
+                            train_episode_idx += 1
+                        pooled_env = build_training_env(
+                            args,
+                            rollout_idx=rollout_idx,
+                            episode_idx=train_episode_idx,
+                            demand_seed=demand_seed,
+                        )
+                        pooled_env.reset()
+                        pooled_train_envs[pool_key] = pooled_env
+                    train_env = pooled_env
+                    episode_number = train_episode_idx + 1
+                elif args.demand_sampling_mode == "rollout":
                     train_env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
                     train_env.reset()
                     start_env_at_minute(train_env, start_minute)
@@ -2115,11 +2324,6 @@ def main() -> None:
                     episode_number = train_episode_idx + 1
                 env = train_env
                 window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
-                demand_seed = demand_seed_for_training_rollout(
-                    args,
-                    rollout_idx,
-                    train_episode_idx if args.demand_sampling_mode == "episode" else rollout_idx,
-                )
                 progress_label = (
                     f"update={update + 1:03d}/{args.updates:03d}{batch_suffix} "
                     f"ep={episode_number:03d} win={window_in_episode:02d}/{total_windows:02d}"
@@ -2130,13 +2334,17 @@ def main() -> None:
                     args.requests_per_update,
                     args=args,
                     reward_scale=args.reward_scale,
-                    train_mode=args.train_mode,
+                    train_mode=effective_train_mode,
                     progress_label=progress_label,
                     progress_interval_seconds=args.progress_interval_seconds,
                     rollout_unit=args.rollout_unit,
                     reset_env=False,
                 )
-                if args.rollout_unit == "window" and one_stats["episode_complete"]:
+                if (
+                    args.rollout_unit == "window"
+                    and one_stats["episode_complete"]
+                    and args.demand_sampling_mode != "pool"
+                ):
                     train_episode_idx += 1
             else:
                 env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
@@ -2148,7 +2356,7 @@ def main() -> None:
                     args.requests_per_update,
                     args=args,
                     reward_scale=args.reward_scale,
-                    train_mode=args.train_mode,
+                    train_mode=effective_train_mode,
                     progress_label=f"update={update + 1:03d}/{args.updates:03d}{batch_suffix}",
                     progress_interval_seconds=args.progress_interval_seconds,
                     rollout_unit=args.rollout_unit,
@@ -2177,12 +2385,13 @@ def main() -> None:
         )
         slow_updated = False
         slow_windows_available = agent.completed_slow_windows
-        if args.train_mode == "fast-only":
+        if effective_train_mode == "fast-only":
             slow_metrics = agent.slow_agent.empty_update_metrics()
             agent.slow_agent.count_ppo.buffer.clear()
             agent.slow_agent.placement_ppo.buffer.clear()
             agent.window_reward = 0.0
             agent.window_steps = 0
+            agent.window_feedback_samples.clear()
         elif slow_windows_available >= args.slow_windows_per_update:
             slow_metrics = agent.update_slow(
                 progress_label=f"update={update + 1:03d}/{args.updates:03d} slow PPO",
@@ -2204,11 +2413,25 @@ def main() -> None:
                 max_requests=args.eval_requests,
                 train_mode=args.train_mode,
                 rollout_unit=eval_rollout_unit,
+                demand_seeds=heldout_eval_demand_seeds(args),
+                label="heldout eval",
             )
+            if args.seen_eval_seeds > 0:
+                seen_eval_stats = evaluate_agent(
+                    args,
+                    agent,
+                    seed_base=40_000,
+                    max_requests=args.eval_requests,
+                    train_mode=args.train_mode,
+                    rollout_unit=eval_rollout_unit,
+                    demand_seeds=seen_eval_demand_seeds(args),
+                    label="seen eval",
+                )
         diagnostic_stats = {}
         log_row = {
             "update": update + 1,
             "episode": episode_number,
+            "training_phase": "fast_warmup" if effective_train_mode == "fast-only" else args.train_mode,
             "demand_seed": demand_seed,
             "demand_seed_end": demand_seed_end,
             "load_multiplier": load_multiplier,
@@ -2285,6 +2508,11 @@ def main() -> None:
             "window_latency_delta_s": stats["window_latency_delta_s"],
             "slow_window_return": stats["slow_window_return"],
             "slow_window_latency_return": stats["slow_window_latency_return"],
+            "slow_window_physical_cost_s": stats["slow_window_physical_cost_s"],
+            "slow_window_mean_latency_s": stats["slow_window_mean_latency_s"],
+            "slow_window_cvar95_latency_s": stats["slow_window_cvar95_latency_s"],
+            "slow_window_deadline_excess_s": stats["slow_window_deadline_excess_s"],
+            "slow_window_deadline_violation_rate": stats["slow_window_deadline_violation_rate"],
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],
@@ -2375,8 +2603,9 @@ def main() -> None:
             else f"episodes={episode_start_number:03d}-{episode_number:03d}"
         )
         print(
-            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sampled_steps={}/{} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} phase={} requests={} aggregate_events={} sampled_steps={}/{} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} diag_res={:.4f} slowR={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
+            "slow_mean={:.1f}ms slow_cvar95={:.1f}ms deadline_excess={:.1f}ms "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
             "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} service_mem={:.1%}/{:.1%} service_storage={:.1%}/{:.1%} idle_deployed={:.1%} "
@@ -2392,6 +2621,7 @@ def main() -> None:
                 len(rollout_stats),
                 int(stats["episode_complete"]),
                 window_in_episode,
+                "fast_warmup" if effective_train_mode == "fast-only" else args.train_mode,
                 int(stats["requests"]),
                 int(stats["aggregate_events"]),
                 int(stats["settlement_steps"]),
@@ -2408,6 +2638,9 @@ def main() -> None:
                 int(stats["invalid_actions"]),
                 stats["invalid_action_rate"],
                 int(stats["deployment_updates"]),
+                stats["slow_window_mean_latency_s"] * 1000.0,
+                stats["slow_window_cvar95_latency_s"] * 1000.0,
+                stats["slow_window_deadline_excess_s"] * 1000.0,
                 stats["avg_replicas_per_stage"],
                 stats["min_replicas_per_stage"],
                 stats["max_replicas_per_stage"],
@@ -2503,6 +2736,8 @@ def main() -> None:
             max_requests=args.eval_requests,
             train_mode=args.train_mode,
             rollout_unit=eval_rollout_unit,
+            demand_seeds=heldout_eval_demand_seeds(args),
+            label="final eval",
         )
         print(
             "eval seeds={} requests_per_seed={} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s std={:.4f}s p95_latency={:.4f}s invalid={:.2f} violation_rate={:.4f} replicas={:.2f} single={:.1%}".format(

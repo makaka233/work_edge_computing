@@ -7,9 +7,12 @@ from pathlib import Path
 from train_dual_ppo import (
     demand_seed_for_training_rollout,
     effective_replicas_per_stage,
+    heldout_eval_demand_seeds,
     load_multiplier_for_rollout,
     rollout_start_minute,
     scenario_seed_for_offset,
+    seen_eval_demand_seeds,
+    training_demand_pool,
 )
 
 
@@ -30,6 +33,29 @@ def test_demand_sampling_mode_controls_training_demand_seed():
     assert demand_seed_for_training_rollout(episode_args, rollout_idx=20, episode_idx=1) == 2026
     assert demand_seed_for_training_rollout(rollout_args, rollout_idx=19, episode_idx=0) == 2045
     assert demand_seed_for_training_rollout(rollout_args, rollout_idx=20, episode_idx=1) == 2046
+
+
+def test_fixed_training_demand_pool_is_shuffled_reproducible_and_disjoint_from_eval():
+    args = Namespace(
+        seed=2026,
+        train_demand_seed_base=None,
+        train_demand_pool_size=8,
+        demand_sampling_mode="pool",
+        heldout_eval_seed_base=None,
+        eval_seeds=4,
+        seen_eval_seeds=3,
+    )
+
+    pool = training_demand_pool(args)
+    first_cycle = tuple(demand_seed_for_training_rollout(args, idx, 0) for idx in range(8))
+    second_cycle = tuple(demand_seed_for_training_rollout(args, idx, 0) for idx in range(8, 16))
+
+    assert set(first_cycle) == set(pool)
+    assert set(second_cycle) == set(pool)
+    assert first_cycle != second_cycle
+    assert first_cycle == tuple(demand_seed_for_training_rollout(args, idx, 999) for idx in range(8))
+    assert seen_eval_demand_seeds(args) == pool[:3]
+    assert set(heldout_eval_demand_seeds(args)).isdisjoint(pool)
 
 
 def test_zero_replica_cap_uses_node_count():

@@ -63,7 +63,8 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode episode --fast-windows-per-update 1 --slow-windows-per-update 8 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 1.0 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_decoupled_updates --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode pool --train-demand-pool-size 16 --fast-windows-per-update 4 --slow-windows-per-update 16 --fast-warmup-updates 10 --updates 120 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 0.85,1.0,1.15,1.3 --eval-rollout-unit window --eval-interval 40 --eval-seeds 5 --seen-eval-seeds 3 --reward-mode latency --reward-scale 10 --slow-cvar-coef 0.25 --slow-deadline-excess-coef 0.5 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.01 --slow-placement-entropy-coef 0.003 --fast-lr 0.0002 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_pool16_staged120 --save-best --progress-interval-seconds 10
+python scripts/calibrate_environment.py --seconds 120 --traffic-scales 1.0,1.3 --task-compute-scales 1.0 --task-data-scales 1.0,1.5 --node-capacity-scales 1.0 --link-bandwidth-scales 1.0,0.5
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
@@ -72,9 +73,9 @@ python -m pytest tests
 
 For the current convergence experiments, one 4-hour episode contains 14,400
 one-second steps and 24 ten-minute slow-deployment windows. Prefer
-`--rollout-unit window --episode-hours 4` with `--demand-sampling-mode rollout`:
-each rollout samples one independent ten-minute demand window while the physical
-edge network stays fixed. `train_dual_ppo.py` prints
+`--rollout-unit window --episode-hours 4` with `--demand-sampling-mode pool`:
+each PPO update can collect several ten-minute windows from a shuffled finite
+demand pool while the physical edge network stays fixed. `train_dual_ppo.py` prints
 in-rollout terminal progress by default every 10 seconds. The progress line
 reports update progress, real request count, aggregate event count, simulated
 hours, deployment updates, average latency, elapsed time, and ETA. Use
@@ -100,9 +101,14 @@ Slow deployment is trained as one composite action per 10-minute window. Count a
 placement actors share a window-level advantage and a dedicated window critic;
 the component choices are not treated as consecutive GAE steps. Fast PPO is
 optimized only against physical task latency. The slow window return combines
-request-weighted physical latency with deployment memory/storage costs. Migration
+mean physical latency, worst-5% CVaR latency, mean deadline excess, and small
+deployment memory/storage costs. The next Slow observation includes the previous
+window's node-service request rates and per-service latency, deadline, and
+replica-use feedback. Migration
 changes remain logged, but `--slow-migration-coef` defaults to zero for the
-current convergence experiments.
+current convergence experiments. This expanded Slow observation changes the
+Slow count/placement input dimension, so Slow checkpoints created before this
+change are intentionally incompatible; Fast-only weights remain reusable.
 Fast and Slow PPO have independent optimizer schedules. By default,
 `--fast-windows-per-update 1` updates Fast PPO after every ten-minute rollout,
 while `--slow-windows-per-update 8` keeps the Slow PPO policy fixed until eight
@@ -123,11 +129,14 @@ and `temporal_sampling_fraction`.
 node's memory/storage available to this controller, representing system and
 co-tenant reservations without imposing a per-service replica-count cap.
 
-When `--fixed-scenario` is omitted, demand-side variation can be sampled in two
+When `--fixed-scenario` is omitted, demand-side variation can be sampled in three
 ways while the physical edge network remains fixed by `--physical-seed`.
 `--demand-sampling-mode episode` reuses one demand scenario for
 `--scenario-refresh-episodes N` training episodes. `--demand-sampling-mode
-rollout` samples a new demand scenario for every PPO rollout. With the default
+rollout` samples a new demand scenario for every PPO rollout. The recommended
+`--demand-sampling-mode pool` revisits a shuffled finite pool controlled by
+`--train-demand-pool-size`; this provides repeated learning signal without
+memorizing one seed or sampling a never-repeated stream. With the default
 4-hour horizon, an episode contains multiple rollout windows. In both modes, only user
 locations, home-node assignment, and service
 preferences may change; nodes, capacities, service catalogue, and wired links do
@@ -167,10 +176,12 @@ explicit coefficients:
 `--idle-deployed-node-coef`. These terms penalize hotspots, imbalance, and idle
 deployed nodes instead of directly rewarding more replicas.
 
-At each eval interval, `eval_*` fields report one held-out deterministic rollout
-by default. Set `--eval-seeds` above 1 only when an explicit multi-seed sweep is
-needed. Periodic training no longer launches separate seen-demand and policy
-diagnostic rollouts.
+At each eval interval, `eval_*` fields report deterministic rollouts on a demand
+seed range disjoint from the training pool. `--eval-seeds` controls held-out
+coverage, while `--seen-eval-seeds` reports training-pool performance separately
+to expose the generalization gap. `--fast-warmup-updates` can initially optimize
+Fast PPO under a fixed feasible greedy deployment; periodic joint eval still
+uses the learned Slow policy so checkpoint selection remains comparable.
 
 For high-variance demand-randomized PPO, `--fast-windows-per-update K` can still
 collect multiple independent ten-minute windows before one Fast optimizer

@@ -11,8 +11,11 @@ from edge_drl.env.scenario import TaskRequest
 from edge_drl.models.ppo import PPOAgent
 
 
+SLOW_SERVICE_FEATURE_DIM = 10
+
+
 def slow_obs_dim(num_nodes: int, num_service_types: int) -> int:
-    return 8 + num_nodes * 5 + num_nodes * num_service_types
+    return 8 + num_nodes * 5 + num_nodes * num_service_types + num_service_types * SLOW_SERVICE_FEATURE_DIM
 
 
 def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
@@ -25,6 +28,31 @@ def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
 FAST_GLOBAL_DIM = 12
 FAST_NODE_FEATURE_DIM = 6
 FAST_EDGE_FEATURE_DIM = 3
+
+
+def _weighted_cvar(values: list[float], weights: list[float], tail_fraction: float = 0.05) -> float:
+    if not values:
+        return 0.0
+    values_np = np.asarray(values, dtype=np.float64)
+    weights_np = np.asarray(weights, dtype=np.float64)
+    positive = weights_np > 0.0
+    if not positive.any():
+        return 0.0
+    values_np = values_np[positive]
+    weights_np = weights_np[positive]
+    order = np.argsort(-values_np)
+    values_np = values_np[order]
+    weights_np = weights_np[order]
+    target_weight = max(float(weights_np.sum()) * tail_fraction, 1e-9)
+    remaining = target_weight
+    weighted_sum = 0.0
+    for value, weight in zip(values_np, weights_np):
+        consumed = min(float(weight), remaining)
+        weighted_sum += float(value) * consumed
+        remaining -= consumed
+        if remaining <= 1e-9:
+            break
+    return weighted_sum / target_weight
 
 
 class SlowWindowCritic(nn.Module):
@@ -388,7 +416,11 @@ class SlowDeploymentPPOAgent:
             / np.log1p(5_000_000.0),
             1.0,
         ]
-        return np.asarray(scalars + node_features + demand.reshape(-1).tolist(), dtype=np.float32)
+        service_features = self._service_features(env)
+        return np.asarray(
+            scalars + node_features + demand.reshape(-1).tolist() + service_features.reshape(-1).tolist(),
+            dtype=np.float32,
+        )
 
     def _build_window_state(
         self,
@@ -429,16 +461,54 @@ class SlowDeploymentPPOAgent:
             float(env.config.service_resource_fraction),
             1.0,
         ]
-        return np.asarray(scalars + node_features + demand.reshape(-1).tolist(), dtype=np.float32)
+        service_features = self._service_features(env)
+        return np.asarray(
+            scalars + node_features + demand.reshape(-1).tolist() + service_features.reshape(-1).tolist(),
+            dtype=np.float32,
+        )
 
     def _node_service_demand(self, env: EdgeComputingEnv) -> np.ndarray:
         assert env.scenario is not None
+        recent_request_rate = getattr(env, "slow_node_service_request_rate", None)
+        if recent_request_rate is not None and float(np.asarray(recent_request_rate).sum()) > 0.0:
+            return np.log1p(np.asarray(recent_request_rate, dtype=np.float32)) / np.log1p(500.0)
         demand = np.zeros((self.num_nodes, self.num_service_types), dtype=np.float32)
         for user in env.scenario.users:
             demand[user.home_node] += np.asarray(user.service_weights, dtype=np.float32)
         demand /= max(float(len(env.scenario.users)), 1.0)
         demand *= float(env._arrival_rate_per_minute())
         return np.log1p(demand) / np.log1p(500.0)
+
+    def set_recent_window_feedback(
+        self,
+        node_service_request_rate: np.ndarray,
+        service_feedback: np.ndarray,
+        env: EdgeComputingEnv | None = None,
+    ) -> None:
+        request_rate = np.asarray(node_service_request_rate, dtype=np.float32)
+        feedback = np.asarray(service_feedback, dtype=np.float32)
+        if request_rate.shape != (self.num_nodes, self.num_service_types):
+            raise ValueError("node-service request feedback has an unexpected shape")
+        if feedback.shape != (self.num_service_types, 7):
+            raise ValueError("service feedback has an unexpected shape")
+        if env is not None:
+            env.slow_node_service_request_rate = request_rate.copy()
+            env.slow_service_feedback = feedback.copy()
+
+    def _service_features(self, env: EdgeComputingEnv) -> np.ndarray:
+        assert env.scenario is not None
+        features = np.zeros((self.num_service_types, SLOW_SERVICE_FEATURE_DIM), dtype=np.float32)
+        feedback = getattr(env, "slow_service_feedback", None)
+        if feedback is not None:
+            features[:, :7] = np.asarray(feedback, dtype=np.float32)
+        for service in env.scenario.services:
+            service_id = service.service_id
+            compute_gcycles = sum(stage.compute_gcycles_mean for stage in service.stages)
+            data_mb = service.input_mb_mean + sum(stage.output_mb_mean for stage in service.stages)
+            features[service_id, 7] = np.log1p(compute_gcycles) / np.log1p(5.0)
+            features[service_id, 8] = np.log1p(data_mb) / np.log1p(10.0)
+            features[service_id, 9] = service.deadline_s_mean / 0.60
+        return np.clip(features, 0.0, 2.0)
 
     def _build_count_mask(
         self,
@@ -710,9 +780,17 @@ class HierarchicalPPOAgent:
     slow_deployment_memory_coef: float = 0.03
     slow_deployment_storage_coef: float = 0.01
     slow_migration_coef: float = 0.0
+    slow_cvar_coef: float = 0.25
+    slow_deadline_excess_coef: float = 0.5
     window_deployment_memory_fraction: float = 0.0
     window_deployment_storage_fraction: float = 0.0
     window_migration_fraction: float = 0.0
+    window_duration_minutes: float = 1.0
+    window_deployment: np.ndarray | None = None
+    feedback_env: EdgeComputingEnv | None = field(default=None, repr=False)
+    window_feedback_samples: list[tuple[int, int, float, float, float, tuple[int, ...]]] = field(
+        default_factory=list
+    )
     last_slow_window_metrics: dict[str, float] = field(default_factory=dict)
 
     @classmethod
@@ -742,6 +820,8 @@ class HierarchicalPPOAgent:
         slow_deployment_memory_coef: float = 0.03,
         slow_deployment_storage_coef: float = 0.01,
         slow_migration_coef: float = 0.0,
+        slow_cvar_coef: float = 0.25,
+        slow_deadline_excess_coef: float = 0.5,
     ) -> "HierarchicalPPOAgent":
         return cls(
             slow_agent=SlowDeploymentPPOAgent(
@@ -777,13 +857,16 @@ class HierarchicalPPOAgent:
             slow_deployment_memory_coef=slow_deployment_memory_coef,
             slow_deployment_storage_coef=slow_deployment_storage_coef,
             slow_migration_coef=slow_migration_coef,
+            slow_cvar_coef=slow_cvar_coef,
+            slow_deadline_excess_coef=slow_deadline_excess_coef,
         )
 
     def maybe_update_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> None:
+        self.feedback_env = env
         if not env.needs_deployment_update:
             return
         if record:
-            self.flush_slow_window_reward(done=False)
+            self.flush_slow_window_reward(done=False, env=env)
         deployment = self.slow_agent.plan_deployment(env, deterministic=deterministic, record=record)
         migration_count = env.apply_deployment(deployment)
         if record:
@@ -794,6 +877,8 @@ class HierarchicalPPOAgent:
             self.window_deployment_memory_fraction = memory_fraction
             self.window_deployment_storage_fraction = storage_fraction
             self.window_migration_fraction = float(migration_count / possible_placements)
+            self.window_duration_minutes = float(env.config.deployment_interval_minutes)
+            self.window_deployment = deployment.copy()
 
     def act(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> list[int]:
         self.maybe_update_deployment(env, deterministic=deterministic, record=record)
@@ -818,15 +903,41 @@ class HierarchicalPPOAgent:
         done: bool,
         weight: float = 1.0,
         slow_reward: float | None = None,
+        home_node: int | None = None,
+        service_id: int | None = None,
+        latency_s: float | None = None,
+        deadline_s: float | None = None,
+        stage_nodes: list[int] | tuple[int, ...] | None = None,
     ) -> None:
         self.fast_agent.assign_last_schedule_reward(reward, stage_count, done, weight=weight)
         self.window_reward += (reward if slow_reward is None else slow_reward) * weight
         self.window_steps += weight
+        if home_node is not None and service_id is not None and latency_s is not None and deadline_s is not None:
+            self.window_feedback_samples.append(
+                (
+                    int(home_node),
+                    int(service_id),
+                    float(latency_s),
+                    float(deadline_s),
+                    float(weight),
+                    tuple(int(node_id) for node_id in (stage_nodes or ())),
+                )
+            )
         if done:
-            self.flush_slow_window_reward(done=True)
+            self.flush_slow_window_reward(done=True, env=self.feedback_env)
 
-    def flush_slow_window_reward(self, done: bool) -> None:
-        latency_return = self.window_reward / float(self.window_steps) if self.window_steps > 0 else 0.0
+    def flush_slow_window_reward(self, done: bool, env: EdgeComputingEnv | None = None) -> None:
+        feedback_metrics = self._slow_window_feedback_metrics(env)
+        if self.window_feedback_samples:
+            physical_cost_s = (
+                feedback_metrics["slow_window_mean_latency_s"]
+                + self.slow_cvar_coef * feedback_metrics["slow_window_cvar95_latency_s"]
+                + self.slow_deadline_excess_coef * feedback_metrics["slow_window_deadline_excess_s"]
+            )
+            latency_return = -self.slow_reward_scale * physical_cost_s
+        else:
+            physical_cost_s = 0.0
+            latency_return = self.window_reward / float(self.window_steps) if self.window_steps > 0 else 0.0
         deployment_memory_cost = self.slow_deployment_memory_coef * self.window_deployment_memory_fraction
         deployment_storage_cost = self.slow_deployment_storage_coef * self.window_deployment_storage_fraction
         migration_cost = self.slow_migration_coef * self.window_migration_fraction
@@ -838,6 +949,8 @@ class HierarchicalPPOAgent:
         self.last_slow_window_metrics = {
             "slow_window_return": float(window_return),
             "slow_window_latency_return": float(latency_return),
+            "slow_window_physical_cost_s": float(physical_cost_s),
+            **feedback_metrics,
             "slow_deployment_memory_cost": float(self.slow_reward_scale * deployment_memory_cost),
             "slow_deployment_storage_cost": float(self.slow_reward_scale * deployment_storage_cost),
             "slow_migration_cost": float(self.slow_reward_scale * migration_cost),
@@ -847,9 +960,89 @@ class HierarchicalPPOAgent:
         }
         self.window_reward = 0.0
         self.window_steps = 0
+        self.window_feedback_samples.clear()
         self.window_deployment_memory_fraction = 0.0
         self.window_deployment_storage_fraction = 0.0
         self.window_migration_fraction = 0.0
+
+    def _slow_window_feedback_metrics(self, env: EdgeComputingEnv | None) -> dict[str, float]:
+        samples = self.window_feedback_samples
+        if not samples:
+            return {
+                "slow_window_mean_latency_s": 0.0,
+                "slow_window_cvar95_latency_s": 0.0,
+                "slow_window_deadline_excess_s": 0.0,
+                "slow_window_deadline_violation_rate": 0.0,
+            }
+
+        node_service_rate = np.zeros(
+            (self.slow_agent.num_nodes, self.slow_agent.num_service_types), dtype=np.float32
+        )
+        service_feedback = np.zeros((self.slow_agent.num_service_types, 7), dtype=np.float32)
+        all_latencies: list[float] = []
+        all_weights: list[float] = []
+        all_excesses: list[float] = []
+        total_weight = 0.0
+        total_violations = 0.0
+
+        for home_node, service_id, latency_s, deadline_s, weight, _ in samples:
+            node_service_rate[home_node, service_id] += weight
+            all_latencies.append(latency_s)
+            all_weights.append(weight)
+            excess = max(latency_s - deadline_s, 0.0)
+            all_excesses.append(excess)
+            total_weight += weight
+            if excess > 0.0:
+                total_violations += weight
+        node_service_rate /= max(self.window_duration_minutes, 1e-9)
+
+        deployment = self.window_deployment
+        service_stage_counts = np.ones(self.slow_agent.num_service_types, dtype=np.float64)
+        for service_id in range(self.slow_agent.num_service_types):
+            service_samples = [sample for sample in samples if sample[1] == service_id]
+            if not service_samples:
+                continue
+            latencies = [sample[2] for sample in service_samples]
+            weights = [sample[4] for sample in service_samples]
+            excesses = [max(sample[2] - sample[3], 0.0) for sample in service_samples]
+            service_weight = float(sum(weights))
+            used_replicas = {
+                (stage_id, node_id)
+                for sample in service_samples
+                for stage_id, node_id in enumerate(sample[5])
+            }
+            deployed_replicas = float(len(used_replicas))
+            if deployment is not None:
+                deployed_replicas = float(np.count_nonzero(deployment[service_id]))
+                service_stage_counts[service_id] = max(
+                    float(np.count_nonzero(np.any(deployment[service_id], axis=1))), 1.0
+                )
+            service_feedback[service_id] = np.asarray(
+                [
+                    service_weight / max(total_weight, 1e-9),
+                    np.average(latencies, weights=weights) / 0.60,
+                    _weighted_cvar(latencies, weights) / 0.60,
+                    np.average(excesses, weights=weights) / 0.60,
+                    sum(weight for excess, weight in zip(excesses, weights) if excess > 0.0)
+                    / max(service_weight, 1e-9),
+                    deployed_replicas
+                    / max(service_stage_counts[service_id] * self.slow_agent.num_nodes, 1.0),
+                    len(used_replicas) / max(deployed_replicas, 1.0),
+                ],
+                dtype=np.float32,
+            )
+        self.slow_agent.set_recent_window_feedback(
+            node_service_rate,
+            np.clip(service_feedback, 0.0, 2.0),
+            env=env,
+        )
+
+        return {
+            "slow_window_mean_latency_s": float(np.average(all_latencies, weights=all_weights)),
+            "slow_window_cvar95_latency_s": float(_weighted_cvar(all_latencies, all_weights)),
+            "slow_window_deadline_excess_s": float(np.average(all_excesses, weights=all_weights)),
+            "slow_window_deadline_violation_rate": float(total_violations / max(total_weight, 1e-9)),
+        }
 
     def _deployment_resource_fractions(self, env: EdgeComputingEnv) -> tuple[float, float]:
         assert env.scenario is not None

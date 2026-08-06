@@ -6,7 +6,7 @@ from train_dual_ppo import rollout
 
 
 def test_observation_dimensions():
-    assert slow_obs_dim(16, 3) == 8 + 16 * 5 + 16 * 3
+    assert slow_obs_dim(16, 3) == 8 + 16 * 5 + 16 * 3 + 3 * 10
     assert fast_obs_dim(16) == 12 + 16 * 6 + 16 * 16 * 3
 
 
@@ -122,6 +122,42 @@ def test_fast_update_preserves_slow_window_buffer():
     assert slow_metrics["placement_approx_kl"] >= 0
     assert slow_metrics["count_approx_kl"] + slow_metrics["placement_approx_kl"] > 0
     assert agent.completed_slow_windows == 0
+
+
+def test_slow_window_uses_observed_demand_and_tail_latency_feedback():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=18,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            deployment_interval_minutes=1,
+            mean_requests_per_minute=120.0,
+        )
+    )
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_reward_scale=10.0,
+        slow_cvar_coef=0.25,
+        slow_deadline_excess_coef=0.5,
+    )
+
+    stats = rollout(env, agent, max_requests=1, rollout_unit="window")
+
+    assert stats["slow_window_mean_latency_s"] > 0.0
+    assert stats["slow_window_cvar95_latency_s"] >= stats["slow_window_mean_latency_s"]
+    assert stats["slow_window_deadline_excess_s"] >= 0.0
+    expected_cost = (
+        stats["slow_window_mean_latency_s"]
+        + 0.25 * stats["slow_window_cvar95_latency_s"]
+        + 0.5 * stats["slow_window_deadline_excess_s"]
+    )
+    assert np.isclose(stats["slow_window_physical_cost_s"], expected_cost)
+    assert hasattr(env, "slow_node_service_request_rate")
+    assert env.slow_node_service_request_rate.sum() > 0.0
+    assert hasattr(env, "slow_service_feedback")
 
 
 def test_fast_only_rollout_records_only_fast_buffer():
