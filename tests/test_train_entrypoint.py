@@ -613,6 +613,51 @@ def test_fast_and_slow_ppo_use_independent_window_update_periods(tmp_path):
     assert [row["slow_window_count"] for row in rows] == ["0.0", "2.0", "0.0"]
 
 
+def test_synchronized_policy_updates_use_one_shared_window_batch(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "2",
+        "--rollout-unit",
+        "window",
+        "--fast-windows-per-update",
+        "2",
+        "--slow-windows-per-update",
+        "2",
+        "--synchronize-policy-updates",
+        "--episode-hours",
+        "1",
+        "--deployment-interval-minutes",
+        "1",
+        "--mean-requests-per-minute",
+        "60",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "synchronize_policy_updates=True" in result.stdout
+    assert "slow_update=1 slow_buffer=0/2" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["synchronize_policy_updates"] for row in rows] == ["1", "1"]
+    assert [row["slow_updated"] for row in rows] == ["1", "1"]
+    assert all(float(row["slow_count_action_mean"]) > 0.0 for row in rows)
+
+
 def test_convergence_analyzer_reads_training_log(tmp_path):
     log_path = tmp_path / "training.csv"
     log_path.write_text(

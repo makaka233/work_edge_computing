@@ -223,6 +223,14 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Accumulate this many completed deployment windows before each Slow PPO update.",
     )
+    parser.add_argument(
+        "--synchronize-policy-updates",
+        action="store_true",
+        help=(
+            "Update Fast and Slow PPO from one shared rollout batch. Requires equal "
+            "--fast-windows-per-update and --slow-windows-per-update."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--load-checkpoint", type=str, default="")
     parser.add_argument("--deterministic-eval", action="store_true")
@@ -283,6 +291,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fast-windows-per-update must be >= 1")
     if args.slow_windows_per_update < 1:
         parser.error("--slow-windows-per-update must be >= 1")
+    if args.synchronize_policy_updates and args.fast_windows_per_update != args.slow_windows_per_update:
+        parser.error(
+            "--synchronize-policy-updates requires --fast-windows-per-update == --slow-windows-per-update"
+        )
     if args.eval_seeds < 1:
         parser.error("--eval-seeds must be >= 1")
     if args.seen_eval_seeds < 0:
@@ -1033,6 +1045,27 @@ def _deployment_replica_stats(env: EdgeComputingEnv) -> dict[str, float]:
         "max_replicas_per_stage": float(counts_np.max()),
         "single_replica_stage_rate": float(np.mean(counts_np <= 1.0)),
         "total_deployed_replicas": float(counts_np.sum()),
+    }
+
+
+def _slow_count_action_stats(agent: HierarchicalPPOAgent) -> dict[str, float]:
+    actions = np.asarray(agent.slow_agent.count_ppo.buffer.actions, dtype=np.float64)
+    if actions.size == 0:
+        return {
+            "slow_count_action_mean": float("nan"),
+            "slow_count_action_std": float("nan"),
+            "slow_count_action_min": float("nan"),
+            "slow_count_action_max": float("nan"),
+            "slow_count_action_top1_share": float("nan"),
+        }
+    replica_actions = actions + 1.0
+    _, counts = np.unique(replica_actions, return_counts=True)
+    return {
+        "slow_count_action_mean": float(replica_actions.mean()),
+        "slow_count_action_std": float(replica_actions.std()),
+        "slow_count_action_min": float(replica_actions.min()),
+        "slow_count_action_max": float(replica_actions.max()),
+        "slow_count_action_top1_share": float(counts.max() / replica_actions.size),
     }
 
 
@@ -1947,6 +1980,7 @@ def main() -> None:
     )
     print(f"  fast_windows_per_update={args.fast_windows_per_update}")
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
+    print(f"  synchronize_policy_updates={args.synchronize_policy_updates}")
     print(f"  fast_warmup_updates={args.fast_warmup_updates}")
     deployment_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
@@ -2080,6 +2114,7 @@ def main() -> None:
             "update": 0,
             "episode": 0,
             "training_phase": "pretrain",
+            "synchronize_policy_updates": int(args.synchronize_policy_updates),
             "demand_seed": demand_seed_for_training_rollout(args, 0, 0),
             "demand_seed_end": demand_seed_for_training_rollout(args, 0, 0),
             "load_multiplier": load_multiplier_for_rollout(args, 0),
@@ -2161,6 +2196,11 @@ def main() -> None:
             "slow_window_cvar95_latency_s": np.nan,
             "slow_window_deadline_excess_s": np.nan,
             "slow_window_deadline_violation_rate": np.nan,
+            "slow_count_action_mean": np.nan,
+            "slow_count_action_std": np.nan,
+            "slow_count_action_min": np.nan,
+            "slow_count_action_max": np.nan,
+            "slow_count_action_top1_share": np.nan,
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
@@ -2385,6 +2425,7 @@ def main() -> None:
         )
         slow_updated = False
         slow_windows_available = agent.completed_slow_windows
+        slow_count_action_stats = _slow_count_action_stats(agent)
         if effective_train_mode == "fast-only":
             slow_metrics = agent.slow_agent.empty_update_metrics()
             agent.slow_agent.count_ppo.buffer.clear()
@@ -2432,6 +2473,7 @@ def main() -> None:
             "update": update + 1,
             "episode": episode_number,
             "training_phase": "fast_warmup" if effective_train_mode == "fast-only" else args.train_mode,
+            "synchronize_policy_updates": int(args.synchronize_policy_updates),
             "demand_seed": demand_seed,
             "demand_seed_end": demand_seed_end,
             "load_multiplier": load_multiplier,
@@ -2513,6 +2555,7 @@ def main() -> None:
             "slow_window_cvar95_latency_s": stats["slow_window_cvar95_latency_s"],
             "slow_window_deadline_excess_s": stats["slow_window_deadline_excess_s"],
             "slow_window_deadline_violation_rate": stats["slow_window_deadline_violation_rate"],
+            **slow_count_action_stats,
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],
@@ -2609,7 +2652,7 @@ def main() -> None:
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
             "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} service_mem={:.1%}/{:.1%} service_storage={:.1%}/{:.1%} idle_deployed={:.1%} "
-            "slow_update={} slow_buffer={}/{} slow_loss={:.4f} slow_windows={:.0f} critic_ev={:.3f} fast_loss={:.4f}".format(
+            "slow_update={} slow_buffer={}/{} count_action={:.2f}/{:.0f}-{:.0f} top1={:.1%} slow_loss={:.4f} slow_windows={:.0f} critic_ev={:.3f} fast_loss={:.4f}".format(
                 update + 1,
                 episode_label,
                 demand_seed,
@@ -2670,6 +2713,10 @@ def main() -> None:
                 int(slow_updated),
                 int(slow_windows_buffered),
                 args.slow_windows_per_update,
+                slow_count_action_stats["slow_count_action_mean"],
+                slow_count_action_stats["slow_count_action_min"],
+                slow_count_action_stats["slow_count_action_max"],
+                slow_count_action_stats["slow_count_action_top1_share"],
                 losses["slow"]["loss"],
                 losses["slow"].get("window_count", 0.0),
                 losses["slow"].get("critic_explained_variance", 0.0),
@@ -2701,8 +2748,12 @@ def main() -> None:
                     eval_stats["eval_hot_link_rate"],
                 )
             )
-        selection_latency = eval_stats.get("eval_avg_latency_s", stats["avg_latency_s"])
-        if args.save_best and selection_latency < best_latency:
+        selection_latency = (
+            eval_stats.get("eval_avg_latency_s")
+            if args.eval_interval
+            else stats["avg_latency_s"]
+        )
+        if args.save_best and selection_latency is not None and selection_latency < best_latency:
             best_latency = selection_latency
             save_checkpoint(
                 agent,

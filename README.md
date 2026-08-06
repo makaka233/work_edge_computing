@@ -63,7 +63,7 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode pool --train-demand-pool-size 16 --fast-windows-per-update 4 --slow-windows-per-update 16 --fast-warmup-updates 10 --updates 120 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 0.85,1.0,1.15,1.3 --eval-rollout-unit window --eval-interval 40 --eval-seeds 5 --seen-eval-seeds 3 --reward-mode latency --reward-scale 10 --slow-cvar-coef 0.25 --slow-deadline-excess-coef 0.5 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.01 --slow-placement-entropy-coef 0.003 --fast-lr 0.0002 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_pool16_staged120 --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --sampled-seconds-per-window 300 --arrival-profile stationary --demand-sampling-mode pool --train-demand-pool-size 16 --fast-windows-per-update 16 --slow-windows-per-update 16 --synchronize-policy-updates --fast-warmup-updates 10 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 0.85,1.0,1.15,1.3 --eval-rollout-unit window --eval-interval 20 --eval-seeds 5 --seen-eval-seeds 3 --reward-mode latency --reward-scale 10 --slow-cvar-coef 0.25 --slow-deadline-excess-coef 0.5 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0003 --slow-k-epochs 2 --slow-count-entropy-coef 0.001 --slow-placement-entropy-coef 0.001 --fast-lr 0.0003 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_pool16_sync80 --save-best --progress-interval-seconds 10
 python scripts/calibrate_environment.py --seconds 120 --traffic-scales 1.0,1.3 --task-compute-scales 1.0 --task-data-scales 1.0,1.5 --node-capacity-scales 1.0 --link-bandwidth-scales 1.0,0.5
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
@@ -112,7 +112,9 @@ change are intentionally incompatible; Fast-only weights remain reusable.
 Fast and Slow PPO have independent optimizer schedules. By default,
 `--fast-windows-per-update 1` updates Fast PPO after every ten-minute rollout,
 while `--slow-windows-per-update 8` keeps the Slow PPO policy fixed until eight
-complete window returns have accumulated. The log fields `slow_updated`,
+complete window returns have accumulated. For convergence experiments,
+`--synchronize-policy-updates` makes Fast and Slow update from the same batch;
+it requires the two window counts to be equal. The log fields `slow_updated`,
 `slow_windows_available`, and `slow_windows_buffered` make this cadence explicit.
 Slow count/placement KL metrics are recomputed after the optimizer step, so they
 remain meaningful even when `--slow-k-epochs 1` is used.
@@ -188,4 +190,7 @@ collect multiple independent ten-minute windows before one Fast optimizer
 update. `--rollouts-per-update` remains a compatibility alias.
 Slow deployment exploration can also be controlled separately with
 `--slow-count-entropy-coef` and `--slow-placement-entropy-coef`; the count policy
-is especially sensitive because its action space is only the replica count.
+is especially sensitive because its action space is the learned replica count.
+Training logs also report the actual count actions as
+`slow_count_action_mean`, `slow_count_action_min`, `slow_count_action_max`, and
+`slow_count_action_top1_share`.
