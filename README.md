@@ -63,7 +63,7 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode episode --fast-windows-per-update 1 --slow-windows-per-update 12 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 1.0 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_decoupled_updates --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode episode --fast-windows-per-update 1 --slow-windows-per-update 8 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 1.0 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_decoupled_updates --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
@@ -105,9 +105,11 @@ changes remain logged, but `--slow-migration-coef` defaults to zero for the
 current convergence experiments.
 Fast and Slow PPO have independent optimizer schedules. By default,
 `--fast-windows-per-update 1` updates Fast PPO after every ten-minute rollout,
-while `--slow-windows-per-update 12` keeps the Slow PPO policy fixed until twelve
+while `--slow-windows-per-update 8` keeps the Slow PPO policy fixed until eight
 complete window returns have accumulated. The log fields `slow_updated`,
 `slow_windows_available`, and `slow_windows_buffered` make this cadence explicit.
+Slow count/placement KL metrics are recomputed after the optimizer step, so they
+remain meaningful even when `--slow-k-epochs 1` is used.
 Training windows use stratified temporal approximation by default:
 `--sampled-seconds-per-window 60` performs 60 neural-policy/KKT settlements that
 represent all 600 logical seconds in a ten-minute window. Instantaneous KKT

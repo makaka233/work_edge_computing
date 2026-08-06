@@ -561,6 +561,31 @@ class PPOAgent:
                 break
         if progress is not None:
             progress.close()
+
+        post_update_kl_numerator = 0.0
+        post_update_kl_denominator = 0.0
+        with torch.no_grad():
+            for start in range(0, n, minibatch_size):
+                idx = np.arange(start, min(start + minibatch_size, n))
+                states = torch.as_tensor(
+                    np.stack([self.buffer.states[i] for i in idx]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                masks = torch.as_tensor(
+                    np.stack([self.buffer.masks[i] for i in idx]),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
+                old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
+                batch_weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
+                dist, _ = self.policy(states, masks)
+                log_ratio = dist.log_prob(actions) - old_logprobs
+                approx_kl = torch.expm1(log_ratio) - log_ratio
+                post_update_kl_numerator += float((approx_kl * batch_weights).sum().item())
+                post_update_kl_denominator += float(batch_weights.sum().item())
+        last_metrics["approx_kl"] = post_update_kl_numerator / max(post_update_kl_denominator, 1e-8)
         self.buffer.clear()
         return last_metrics
 

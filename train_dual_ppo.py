@@ -194,7 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--slow-windows-per-update",
         type=int,
-        default=12,
+        default=8,
         help="Accumulate this many completed deployment windows before each Slow PPO update.",
     )
     parser.add_argument("--device", type=str, default="cpu")

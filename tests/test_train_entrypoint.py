@@ -378,7 +378,7 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "fast_windows_per_update=2" in result.stdout
-    assert "slow_windows_per_update=12" in result.stdout
+    assert "slow_windows_per_update=8" in result.stdout
     assert "episode_horizon=4h deployment_windows=24" in result.stdout
     assert "arrival_profile=stationary" in result.stdout
     assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=0 window=01" in result.stdout

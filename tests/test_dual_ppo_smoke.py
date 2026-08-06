@@ -101,7 +101,12 @@ def test_fast_update_preserves_slow_window_buffer():
             mean_requests_per_minute=60.0,
         )
     )
-    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_lr=1e-2,
+        slow_k_epochs=1,
+    )
     rollout(env, agent, max_requests=1, rollout_unit="window")
 
     assert agent.completed_slow_windows == 1
@@ -113,6 +118,9 @@ def test_fast_update_preserves_slow_window_buffer():
 
     slow_metrics = agent.update_slow()
     assert slow_metrics["window_count"] == 1
+    assert slow_metrics["count_approx_kl"] >= 0
+    assert slow_metrics["placement_approx_kl"] >= 0
+    assert slow_metrics["count_approx_kl"] + slow_metrics["placement_approx_kl"] > 0
     assert agent.completed_slow_windows == 0
 
 
