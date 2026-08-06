@@ -151,6 +151,21 @@ in CPU cycles or transferred data. Use `--node-compute-capacity-scale` and
 `--wired-link-bandwidth-scale` below 1.0 when the fixed physical environment is
 too over-provisioned for the desired experiment. These capacity scales are part
 of the fixed physical scenario for a run and remain tied to `--physical-seed`.
+
+For reproducible pressure experiments, `--pressure-profile mec-moderate` applies
+the following fixed-run operating point: 20% active users, 1.75 requests per active
+user per minute, 1.5x task compute, 2x task data, 0.65x node compute capacity,
+0.35x wired-link bandwidth, 0.45 service resource fraction, and rollout load
+multipliers `0.8,1.1,1.4,1.7`. This keeps the topology, node locations, node
+tiers, service catalogue, and link classes fixed while making both compute and
+network pressure visible. `--pressure-profile mec-stress` is a stronger bounded
+ablation. Explicit scale flags override a profile, and the resolved values are
+stored in `metadata.json`.
+
+The moderate profile is intended as the first pressure test. It targets a
+moderate operating point rather than immediate saturation: if diagnostics show
+persistent infeasible actions or penalty latency, use the moderate profile as a
+calibration point before trying `mec-stress`.
 For demand-randomized convergence experiments, load multipliers can still be
 cycled across consecutive Fast windows. The stationary profile ignores rollout
 start modes. Use

@@ -29,6 +29,10 @@ traffic:
   active_user_request_rate_per_minute: 1.5
   traffic_scale: 1.0
   load_multipliers: [1.0]
+  pressure_profile: baseline
+  # mec-moderate preset: active_ratio=0.20, active_rate=1.75/min,
+  # task_compute=1.5, task_data=2.0, node_capacity=0.65,
+  # wired_bandwidth=0.35, service_resource_fraction=0.45.
   rollout_start_mode: beginning
   eval_rollout_start_mode: same
   task_compute_scale: 1.0

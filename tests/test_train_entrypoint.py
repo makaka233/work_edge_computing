@@ -5,12 +5,62 @@ from argparse import Namespace
 from pathlib import Path
 
 from train_dual_ppo import (
+    apply_pressure_profile,
     demand_seed_for_training_rollout,
     effective_replicas_per_stage,
     load_multiplier_for_rollout,
     rollout_start_minute,
     scenario_seed_for_offset,
 )
+
+
+def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
+    args = Namespace(
+        pressure_profile="mec-moderate",
+        active_user_ratio=0.15,
+        active_user_request_rate_per_minute=1.5,
+        traffic_scale=1.0,
+        load_multipliers="1.0",
+        task_compute_scale=1.0,
+        task_data_scale=1.0,
+        node_compute_capacity_scale=1.0,
+        wired_link_bandwidth_scale=1.0,
+        service_resource_fraction=0.5,
+    )
+
+    apply_pressure_profile(args, argv=["--pressure-profile", "mec-moderate"])
+
+    assert args.active_user_ratio == 0.20
+    assert args.active_user_request_rate_per_minute == 1.75
+    assert args.task_compute_scale == 1.5
+    assert args.task_data_scale == 2.0
+    assert args.node_compute_capacity_scale == 0.65
+    assert args.wired_link_bandwidth_scale == 0.35
+    assert args.service_resource_fraction == 0.45
+    assert args.load_multipliers == "0.8,1.1,1.4,1.7"
+
+
+def test_pressure_profile_does_not_override_explicit_scale():
+    args = Namespace(
+        pressure_profile="mec-moderate",
+        active_user_ratio=0.20,
+        active_user_request_rate_per_minute=1.75,
+        traffic_scale=1.0,
+        load_multipliers="0.8,1.1,1.4,1.7",
+        task_compute_scale=3.0,
+        task_data_scale=2.0,
+        node_compute_capacity_scale=0.65,
+        wired_link_bandwidth_scale=0.35,
+        service_resource_fraction=0.45,
+    )
+
+    apply_pressure_profile(
+        args,
+        argv=["--pressure-profile", "mec-moderate", "--task-compute-scale", "3.0"],
+    )
+
+    assert args.task_compute_scale == 3.0
+    assert args.task_data_scale == 2.0
 
 
 def test_scenario_refresh_groups_training_episodes():

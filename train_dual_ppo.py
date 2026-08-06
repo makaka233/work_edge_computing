@@ -20,6 +20,55 @@ from edge_drl.agents.drl import HierarchicalPPOAgent
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 
 
+PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
+    "baseline": {},
+    # Keep topology and physical seed fixed while moving the operating point
+    # into a moderate MEC stress regime.
+    "mec-moderate": {
+        "active_user_ratio": 0.20,
+        "active_user_request_rate_per_minute": 1.75,
+        "traffic_scale": 1.0,
+        "load_multipliers": "0.8,1.1,1.4,1.7",
+        "task_compute_scale": 1.5,
+        "task_data_scale": 2.0,
+        "node_compute_capacity_scale": 0.65,
+        "wired_link_bandwidth_scale": 0.35,
+        "service_resource_fraction": 0.45,
+    },
+    # Validate moderate pressure first; this profile is a bounded stress case
+    # rather than a saturation-first experiment.
+    "mec-stress": {
+        "active_user_ratio": 0.30,
+        "active_user_request_rate_per_minute": 2.0,
+        "traffic_scale": 1.0,
+        "load_multipliers": "0.8,1.1,1.4,1.7",
+        "task_compute_scale": 2.5,
+        "task_data_scale": 3.0,
+        "node_compute_capacity_scale": 0.45,
+        "wired_link_bandwidth_scale": 0.15,
+        "service_resource_fraction": 0.35,
+    },
+}
+
+
+def apply_pressure_profile(args: argparse.Namespace, argv: list[str] | None = None) -> argparse.Namespace:
+    """Apply a reproducible demand/capacity profile without changing topology."""
+
+    profile = PRESSURE_PROFILE_DEFAULTS[args.pressure_profile]
+    if not profile:
+        return args
+    explicit_options = {
+        token.split("=", 1)[0]
+        for token in (sys.argv[1:] if argv is None else argv)
+        if token.startswith("--")
+    }
+    for field, value in profile.items():
+        option = "--" + field.replace("_", "-")
+        if option not in explicit_options:
+            setattr(args, field, value)
+    return args
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train hierarchical dual-agent PPO for edge services.")
     parser.add_argument("--seed", type=int, default=2026)
@@ -48,6 +97,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-users", type=int, default=10_000)
     parser.add_argument("--num-edge-nodes", type=int, default=32)
     parser.add_argument("--num-service-types", type=int, default=10)
+    parser.add_argument(
+        "--pressure-profile",
+        choices=sorted(PRESSURE_PROFILE_DEFAULTS),
+        default="baseline",
+        help=(
+            "Reproducible MEC demand/capacity preset. The profile changes demand and fixed per-run "
+            "capacity scales only; explicit scale flags override it."
+        ),
+    )
     parser.add_argument(
         "--episode-hours",
         type=int,
@@ -234,7 +292,7 @@ def parse_args() -> argparse.Namespace:
         default=10.0,
         help="Print in-rollout terminal progress every N seconds. Use 0 to disable.",
     )
-    args = parser.parse_args()
+    args = apply_pressure_profile(parser.parse_args())
     if args.fast_windows_per_update < 1:
         parser.error("--fast-windows-per-update must be >= 1")
     if args.slow_windows_per_update < 1:
@@ -1786,6 +1844,7 @@ def main() -> None:
     print(f"  rollout_unit={args.rollout_unit}")
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
+    print(f"  pressure_profile={args.pressure_profile}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
     print(f"  fast_windows_per_update={args.fast_windows_per_update}")
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
