@@ -260,6 +260,126 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         return self.update(torch.cat([node_emb, messages], dim=-1))
 
 
+class GraphAttentionActorCritic(nn.Module):
+    """Graph actor-critic for either node placement or scalar count actions.
+
+    Slow deployment has two action heads: placement scores every node, while
+    replica count is a scalar categorical action. Both heads consume the same
+    topology-aware graph representation so they can see resource pressure and
+    execution feedback over the whole edge network.
+    """
+
+    def __init__(
+        self,
+        *,
+        global_dim: int,
+        node_feature_dim: int,
+        edge_feature_dim: int,
+        num_nodes: int,
+        action_dim: int,
+        action_mode: str,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        if action_mode not in {"node", "count"}:
+            raise ValueError("action_mode must be 'node' or 'count'")
+        self.global_dim = global_dim
+        self.node_feature_dim = node_feature_dim
+        self.edge_feature_dim = edge_feature_dim
+        self.num_nodes = num_nodes
+        self.action_mode = action_mode
+        self.node_offset = global_dim
+        self.edge_offset = global_dim + num_nodes * node_feature_dim
+
+        self.global_encoder = nn.Sequential(
+            nn.Linear(global_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_feature_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.edge_bias = nn.Sequential(
+            nn.Linear(edge_feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.attn_src = nn.Linear(hidden_dim, 1, bias=False)
+        self.attn_dst = nn.Linear(hidden_dim, 1, bias=False)
+        self.message = nn.Linear(hidden_dim, hidden_dim)
+        self.update = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+        )
+        if action_mode == "node":
+            self.actor = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+        else:
+            self.actor = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim),
+            )
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[Categorical, torch.Tensor]:
+        global_features = states[:, : self.global_dim]
+        node_features = states[:, self.node_offset : self.edge_offset].reshape(
+            -1,
+            self.num_nodes,
+            self.node_feature_dim,
+        )
+        edge_features = states[:, self.edge_offset :].reshape(
+            -1,
+            self.num_nodes,
+            self.num_nodes,
+            self.edge_feature_dim,
+        )
+
+        global_emb = self.global_encoder(global_features)
+        node_emb = self.node_encoder(node_features)
+        graph_emb = self._graph_attention(node_emb, edge_features)
+        pooled_nodes = graph_emb.mean(dim=1)
+        graph_context = torch.cat([global_emb, pooled_nodes], dim=-1)
+
+        if self.action_mode == "node":
+            logits = self.actor(torch.cat(
+                [global_emb.unsqueeze(1).expand(-1, self.num_nodes, -1), graph_emb],
+                dim=-1,
+            )).squeeze(-1)
+        else:
+            logits = self.actor(graph_context)
+
+        safe_masks = masks.bool()
+        fallback = torch.zeros_like(safe_masks)
+        fallback[:, 0] = True
+        safe_masks = torch.where(safe_masks.any(dim=1, keepdim=True), safe_masks, fallback)
+        logits = logits.masked_fill(~safe_masks, -1e9)
+        dist = Categorical(logits=logits)
+        values = self.critic(graph_context).squeeze(-1)
+        return dist, values
+
+    def _graph_attention(self, node_emb: torch.Tensor, edge_features: torch.Tensor) -> torch.Tensor:
+        adjacency = edge_features[..., 0] > 0.5
+        eye = torch.eye(self.num_nodes, dtype=torch.bool, device=edge_features.device).unsqueeze(0)
+        adjacency = adjacency | eye
+
+        src_score = self.attn_src(node_emb).expand(-1, -1, self.num_nodes)
+        dst_score = self.attn_dst(node_emb).transpose(1, 2).expand(-1, self.num_nodes, -1)
+        scores = torch.nn.functional.leaky_relu(src_score + dst_score + self.edge_bias(edge_features).squeeze(-1), 0.2)
+        scores = scores.masked_fill(~adjacency, -1e9)
+        attention = torch.softmax(scores, dim=-1)
+        messages = torch.matmul(attention, self.message(node_emb))
+        return self.update(torch.cat([node_emb, messages], dim=-1))
+
+
 class PPOAgent:
     def __init__(
         self,
@@ -311,6 +431,18 @@ class PPOAgent:
                 node_feature_dim=node_feature_dim,
                 edge_feature_dim=edge_feature_dim,
                 num_nodes=num_nodes,
+                hidden_dim=hidden_dim,
+            ).to(self.device)
+        elif policy_kind in {"slow_gat_node", "slow_gat_count"}:
+            if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:
+                raise ValueError(f"{policy_kind} requires global_dim, node_feature_dim, edge_feature_dim, and num_nodes")
+            self.policy = GraphAttentionActorCritic(
+                global_dim=global_dim,
+                node_feature_dim=node_feature_dim,
+                edge_feature_dim=edge_feature_dim,
+                num_nodes=num_nodes,
+                action_dim=action_dim,
+                action_mode="node" if policy_kind == "slow_gat_node" else "count",
                 hidden_dim=hidden_dim,
             ).to(self.device)
         else:

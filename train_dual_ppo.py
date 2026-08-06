@@ -221,6 +221,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-entropy-coef", type=float, default=0.001)
     parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
     parser.add_argument("--slow-placement-entropy-coef", type=float, default=None)
+    parser.add_argument(
+        "--slow-tail-latency-coef",
+        type=float,
+        default=0.35,
+        help="Weight of the window P95 latency in the Slow deployment return; 0 uses mean latency only.",
+    )
     parser.add_argument("--fast-entropy-coef", type=float, default=0.0)
     parser.add_argument("--slow-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
@@ -254,6 +260,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=12,
         help="Accumulate this many completed deployment windows before each Slow PPO update.",
+    )
+    parser.add_argument(
+        "--synchronized-window-block",
+        type=int,
+        default=0,
+        help="When positive, collect this many windows and update Fast and Slow PPO together each block.",
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--load-checkpoint", type=str, default="")
@@ -293,6 +305,9 @@ def parse_args() -> argparse.Namespace:
         help="Print in-rollout terminal progress every N seconds. Use 0 to disable.",
     )
     args = apply_pressure_profile(parser.parse_args())
+    if args.synchronized_window_block > 0:
+        args.fast_windows_per_update = args.synchronized_window_block
+        args.slow_windows_per_update = args.synchronized_window_block
     if args.fast_windows_per_update < 1:
         parser.error("--fast-windows-per-update must be >= 1")
     if args.slow_windows_per_update < 1:
@@ -305,6 +320,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--service-resource-fraction must be in (0, 1]")
     if args.slow_critic_k_epochs < 1:
         parser.error("--slow-critic-k-epochs must be >= 1")
+    if not 0.0 <= args.slow_tail_latency_coef <= 1.0:
+        parser.error("--slow-tail-latency-coef must be in [0, 1]")
+    if args.synchronized_window_block < 0:
+        parser.error("--synchronized-window-block must be >= 0")
     if args.episode_hours < 1:
         parser.error("--episode-hours must be >= 1")
     if args.deployment_interval_minutes < 1:
@@ -802,6 +821,14 @@ def rollout(
                     done=bool(done and group_idx == len(group_infos) - 1),
                     weight=request_count,
                     slow_reward=-float(info["latency_s"]) * reward_scale,
+                    latency_s=float(info["latency_s"]),
+                    penalty_latency_s=float(info["penalty_latency_s"]),
+                    deadline_s=float(request.deadline_s),
+                    invalid=not bool(info["valid"]),
+                    max_node_compute_load=float(np.max(env.node_compute_load)),
+                    max_link_load=float(np.max(env.link_load[np.isfinite(env.link_load)]))
+                    if np.any(np.isfinite(env.link_load))
+                    else 0.0,
                 )
             rewards.append(float(info["reward"]))
             train_rewards.append(float(train_reward))
@@ -854,6 +881,9 @@ def rollout(
     slow_window_metrics = {
         "slow_window_return": float("nan"),
         "slow_window_latency_return": float("nan"),
+        "slow_window_avg_latency": float("nan"),
+        "slow_window_p95_latency": float("nan"),
+        "slow_tail_latency_cost": float("nan"),
         "slow_deployment_memory_cost": float("nan"),
         "slow_deployment_storage_cost": float("nan"),
         "slow_migration_cost": float("nan"),
@@ -1214,6 +1244,9 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "cross_node_stage_transition_rate",
         "slow_window_return",
         "slow_window_latency_return",
+        "slow_window_avg_latency",
+        "slow_window_p95_latency",
+        "slow_tail_latency_cost",
         "slow_deployment_memory_cost",
         "slow_deployment_storage_cost",
         "slow_migration_cost",
@@ -1813,6 +1846,7 @@ def main() -> None:
         fast_minibatch_size=args.fast_minibatch_size,
         fast_policy_kind=args.fast_policy_kind,
         slow_reward_scale=args.reward_scale,
+        slow_tail_latency_coef=args.slow_tail_latency_coef,
         slow_deployment_memory_coef=args.slow_deployment_memory_coef,
         slow_deployment_storage_coef=args.slow_deployment_storage_coef,
         slow_migration_coef=args.slow_migration_coef,
@@ -1848,6 +1882,8 @@ def main() -> None:
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
     print(f"  fast_windows_per_update={args.fast_windows_per_update}")
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
+    print(f"  synchronized_window_block={args.synchronized_window_block or 'disabled'}")
+    print(f"  slow_tail_latency_coef={args.slow_tail_latency_coef:.2f} (P95 weight)")
     deployment_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
         1,
@@ -2038,6 +2074,9 @@ def main() -> None:
             "window_latency_delta_s": np.nan,
             "slow_window_return": np.nan,
             "slow_window_latency_return": np.nan,
+            "slow_window_avg_latency": np.nan,
+            "slow_window_p95_latency": np.nan,
+            "slow_tail_latency_cost": np.nan,
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
@@ -2173,6 +2212,15 @@ def main() -> None:
                         train_env.reset()
                     episode_number = train_episode_idx + 1
                 env = train_env
+                if args.demand_sampling_mode == "episode":
+                    # Keep the fixed physical scenario and user preferences, while
+                    # cycling demand intensity at each window boundary. This makes
+                    # a synchronized four-window block expose distinct load cases.
+                    previous_multiplier = float(env.config.demand_load_multiplier)
+                    env.config.demand_load_multiplier = float(load_multiplier)
+                    if not np.isclose(previous_multiplier, load_multiplier):
+                        env.current_requests = env._generate_current_second_requests()
+                        env.current_request = env.current_requests[0] if env.current_requests else None
                 window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
                 demand_seed = demand_seed_for_training_rollout(
                     args,
@@ -2344,6 +2392,9 @@ def main() -> None:
             "window_latency_delta_s": stats["window_latency_delta_s"],
             "slow_window_return": stats["slow_window_return"],
             "slow_window_latency_return": stats["slow_window_latency_return"],
+            "slow_window_avg_latency": stats["slow_window_avg_latency"],
+            "slow_window_p95_latency": stats["slow_window_p95_latency"],
+            "slow_tail_latency_cost": stats["slow_tail_latency_cost"],
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],

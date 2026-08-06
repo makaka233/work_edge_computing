@@ -11,8 +11,21 @@ from edge_drl.env.scenario import TaskRequest
 from edge_drl.models.ppo import PPOAgent
 
 
+SLOW_GLOBAL_DIM = 17
+SLOW_NODE_BASE_FEATURE_DIM = 5
+SLOW_EDGE_FEATURE_DIM = 4
+
+
+def slow_node_feature_dim(num_service_types: int) -> int:
+    return SLOW_NODE_BASE_FEATURE_DIM + num_service_types
+
+
 def slow_obs_dim(num_nodes: int, num_service_types: int) -> int:
-    return 8 + num_nodes * 5 + num_nodes * num_service_types
+    return (
+        SLOW_GLOBAL_DIM
+        + num_nodes * slow_node_feature_dim(num_service_types)
+        + num_nodes * num_nodes * SLOW_EDGE_FEATURE_DIM
+    )
 
 
 def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
@@ -59,6 +72,7 @@ class SlowDeploymentPPOAgent:
     critic_k_epochs: int = 4
     target_kl: float | None = 0.03
     minibatch_size: int = 2048
+    tail_latency_coef: float = 0.35
     device: str = "cpu"
     count_ppo: PPOAgent = field(init=False)
     placement_ppo: PPOAgent = field(init=False)
@@ -73,8 +87,11 @@ class SlowDeploymentPPOAgent:
     window_old_values: list[float] = field(default_factory=list)
     window_returns: list[float] = field(default_factory=list)
     pending_window_id: int | None = None
+    last_window_feedback: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not 0.0 <= self.tail_latency_coef <= 1.0:
+            raise ValueError("tail_latency_coef must be in [0, 1]")
         self.count_ppo = PPOAgent(
             obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
             action_dim=self.replicas_per_stage,
@@ -86,6 +103,11 @@ class SlowDeploymentPPOAgent:
             value_coef=self.value_coef,
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
+            policy_kind="slow_gat_count",
+            global_dim=SLOW_GLOBAL_DIM,
+            node_feature_dim=slow_node_feature_dim(self.num_service_types),
+            edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
+            num_nodes=self.num_nodes,
             device=self.device,
         )
         self.placement_ppo = PPOAgent(
@@ -99,6 +121,11 @@ class SlowDeploymentPPOAgent:
             value_coef=self.value_coef,
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
+            policy_kind="slow_gat_node",
+            global_dim=SLOW_GLOBAL_DIM,
+            node_feature_dim=slow_node_feature_dim(self.num_service_types),
+            edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
+            num_nodes=self.num_nodes,
             device=self.device,
         )
         self.ppo = self.placement_ppo
@@ -366,6 +393,8 @@ class SlowDeploymentPPOAgent:
         max_mem = max(n.memory_gb for n in nodes)
         max_storage = max(n.storage_gb for n in nodes)
         max_compute = max(n.compute_gcycles_per_s for n in nodes)
+        total_node_demand = demand.sum(axis=1)
+        max_node_demand = max(float(total_node_demand.max()), 1e-9)
         node_features = []
         for node in nodes:
             node_features.extend(
@@ -374,9 +403,10 @@ class SlowDeploymentPPOAgent:
                     remaining_storage[node.node_id] / max_storage,
                     node.compute_gcycles_per_s / max_compute,
                     env.node_compute_load[node.node_id],
-                    demand[node.node_id, service_id] / max(demand[:, service_id].max(), 1e-9),
+                    total_node_demand[node.node_id] / max_node_demand,
                 ]
             )
+            node_features.extend(demand[node.node_id].tolist())
         scalars = [
             service_id / max(self.num_service_types - 1, 1),
             stage_id / max(self.max_service_stages - 1, 1),
@@ -388,7 +418,10 @@ class SlowDeploymentPPOAgent:
             / np.log1p(5_000_000.0),
             1.0,
         ]
-        return np.asarray(scalars + node_features + demand.reshape(-1).tolist(), dtype=np.float32)
+        return np.asarray(
+            scalars + self._feedback_features() + node_features + self._build_edge_features(env),
+            dtype=np.float32,
+        )
 
     def _build_window_state(
         self,
@@ -415,9 +448,13 @@ class SlowDeploymentPPOAgent:
                     total_node_demand[node.node_id] / max_node_demand,
                 ]
             )
+            node_features.extend(demand[node.node_id].tolist())
         current_replica_rate = 0.0
         if env.deployment is not None:
             current_replica_rate = float(env.deployment.mean())
+        finite_link_load = env.link_load[np.isfinite(env.link_load)]
+        mean_link_load = float(np.mean(finite_link_load)) if finite_link_load.size else 0.0
+        max_link_load = float(np.max(finite_link_load)) if finite_link_load.size else 0.0
         scalars = [
             env.current_time_minute / max(env.config.episode_hours * 60, 1),
             np.log1p(env._arrival_rate_per_minute()) / np.log1p(20_000.0),
@@ -426,10 +463,51 @@ class SlowDeploymentPPOAgent:
             current_replica_rate,
             float(np.mean(env.node_compute_load)),
             float(np.max(env.node_compute_load)),
-            float(env.config.service_resource_fraction),
-            1.0,
+            mean_link_load,
+            max_link_load,
         ]
-        return np.asarray(scalars + node_features + demand.reshape(-1).tolist(), dtype=np.float32)
+        return np.asarray(
+            scalars + self._feedback_features() + node_features + self._build_edge_features(env),
+            dtype=np.float32,
+        )
+
+    def _feedback_features(self) -> list[float]:
+        feedback = self.last_window_feedback
+        return [
+            float(np.clip(feedback.get("avg_latency_s", 0.0), 0.0, 10.0)),
+            float(np.clip(feedback.get("p95_latency_s", 0.0), 0.0, 10.0)),
+            float(np.clip(feedback.get("avg_penalty_latency_s", 0.0) / 10.0, 0.0, 1.0)),
+            float(np.clip(feedback.get("deadline_violation_rate", 0.0), 0.0, 1.0)),
+            float(np.clip(feedback.get("invalid_action_rate", 0.0), 0.0, 1.0)),
+            float(np.clip(feedback.get("max_node_compute_load", 0.0), 0.0, 1.0)),
+            float(np.clip(feedback.get("max_link_load", 0.0), 0.0, 1.0)),
+            float(np.clip(feedback.get("deployment_memory_fraction", 0.0), 0.0, 1.0)),
+            float(np.clip(feedback.get("deployment_storage_fraction", 0.0), 0.0, 1.0)),
+        ]
+
+    def _build_edge_features(self, env: EdgeComputingEnv) -> list[float]:
+        assert env.scenario is not None
+        bandwidth = env.scenario.bandwidth_mb_s
+        propagation = env.scenario.propagation_ms
+        max_bandwidth = np.nanmax(np.where(np.isfinite(bandwidth), bandwidth, 0.0))
+        finite_propagation = np.where(np.isfinite(propagation), propagation, 0.0)
+        max_propagation = max(float(finite_propagation.max()), 1e-9)
+        features: list[float] = []
+        for src in range(self.num_nodes):
+            for dst in range(self.num_nodes):
+                connected = bool(env.scenario.adjacency[src, dst])
+                bw = bandwidth[src, dst] if np.isfinite(bandwidth[src, dst]) else max_bandwidth
+                prop = propagation[src, dst] if np.isfinite(propagation[src, dst]) else max_propagation
+                load = env.link_load[src, dst] if np.isfinite(env.link_load[src, dst]) else 0.0
+                features.extend(
+                    [
+                        float(connected),
+                        float(bw / max(max_bandwidth, 1e-9)),
+                        float(prop / max_propagation),
+                        float(np.clip(load, 0.0, 1.0)),
+                    ]
+                )
+        return features
 
     def _node_service_demand(self, env: EdgeComputingEnv) -> np.ndarray:
         assert env.scenario is not None
@@ -700,13 +778,36 @@ class FastSchedulingPPOAgent:
         return mask.astype(bool)
 
 
+def _weighted_percentile(samples: list[tuple[float, float]], percentile: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted((float(value), max(float(weight), 0.0)) for value, weight in samples)
+    total_weight = sum(weight for _, weight in ordered)
+    if total_weight <= 0.0:
+        return float(ordered[-1][0])
+    threshold = total_weight * float(percentile) / 100.0
+    cumulative = 0.0
+    for value, weight in ordered:
+        cumulative += weight
+        if cumulative >= threshold:
+            return value
+    return float(ordered[-1][0])
+
+
 @dataclass
 class HierarchicalPPOAgent:
     slow_agent: SlowDeploymentPPOAgent
     fast_agent: FastSchedulingPPOAgent
     window_reward: float = 0.0
     window_steps: float = 0.0
+    window_latency_samples: list[tuple[float, float]] = field(default_factory=list)
+    window_penalty_latency_sum: float = 0.0
+    window_deadline_violations: float = 0.0
+    window_invalid_actions: float = 0.0
+    window_max_node_compute_load: float = 0.0
+    window_max_link_load: float = 0.0
     slow_reward_scale: float = 1.0
+    slow_tail_latency_coef: float = 0.35
     slow_deployment_memory_coef: float = 0.03
     slow_deployment_storage_coef: float = 0.01
     slow_migration_coef: float = 0.0
@@ -739,6 +840,7 @@ class HierarchicalPPOAgent:
         fast_minibatch_size: int = 512,
         fast_policy_kind: str = "gat_node_scorer",
         slow_reward_scale: float = 1.0,
+        slow_tail_latency_coef: float = 0.35,
         slow_deployment_memory_coef: float = 0.03,
         slow_deployment_storage_coef: float = 0.01,
         slow_migration_coef: float = 0.0,
@@ -759,6 +861,7 @@ class HierarchicalPPOAgent:
                 critic_k_epochs=slow_critic_k_epochs,
                 target_kl=slow_target_kl,
                 minibatch_size=slow_minibatch_size,
+                tail_latency_coef=slow_tail_latency_coef,
                 device=device,
             ),
             fast_agent=FastSchedulingPPOAgent(
@@ -774,6 +877,7 @@ class HierarchicalPPOAgent:
                 device=device,
             ),
             slow_reward_scale=slow_reward_scale,
+            slow_tail_latency_coef=slow_tail_latency_coef,
             slow_deployment_memory_coef=slow_deployment_memory_coef,
             slow_deployment_storage_coef=slow_deployment_storage_coef,
             slow_migration_coef=slow_migration_coef,
@@ -818,15 +922,56 @@ class HierarchicalPPOAgent:
         done: bool,
         weight: float = 1.0,
         slow_reward: float | None = None,
+        latency_s: float | None = None,
+        penalty_latency_s: float | None = None,
+        deadline_s: float | None = None,
+        invalid: bool = False,
+        max_node_compute_load: float | None = None,
+        max_link_load: float | None = None,
     ) -> None:
         self.fast_agent.assign_last_schedule_reward(reward, stage_count, done, weight=weight)
         self.window_reward += (reward if slow_reward is None else slow_reward) * weight
         self.window_steps += weight
+        if latency_s is not None:
+            self.window_latency_samples.append((float(latency_s), float(weight)))
+            self.window_penalty_latency_sum += float(penalty_latency_s or 0.0) * weight
+            self.window_deadline_violations += float(
+                bool(deadline_s is not None and float(latency_s) > float(deadline_s))
+            ) * weight
+            self.window_invalid_actions += float(bool(invalid)) * weight
+            if max_node_compute_load is not None:
+                self.window_max_node_compute_load = max(self.window_max_node_compute_load, float(max_node_compute_load))
+            if max_link_load is not None:
+                self.window_max_link_load = max(self.window_max_link_load, float(max_link_load))
         if done:
             self.flush_slow_window_reward(done=True)
 
     def flush_slow_window_reward(self, done: bool) -> None:
-        latency_return = self.window_reward / float(self.window_steps) if self.window_steps > 0 else 0.0
+        total_weight = float(sum(weight for _, weight in self.window_latency_samples))
+        if total_weight > 0.0:
+            mean_latency = float(
+                sum(latency * weight for latency, weight in self.window_latency_samples) / total_weight
+            )
+            p95_latency = _weighted_percentile(self.window_latency_samples, 95.0)
+            tail_latency = (
+                (1.0 - self.slow_tail_latency_coef) * mean_latency
+                + self.slow_tail_latency_coef * p95_latency
+            )
+            latency_return = -self.slow_reward_scale * tail_latency
+            feedback = {
+                "avg_latency_s": mean_latency,
+                "p95_latency_s": p95_latency,
+                "avg_penalty_latency_s": self.window_penalty_latency_sum / total_weight,
+                "deadline_violation_rate": self.window_deadline_violations / total_weight,
+                "invalid_action_rate": self.window_invalid_actions / total_weight,
+                "max_node_compute_load": self.window_max_node_compute_load,
+                "max_link_load": self.window_max_link_load,
+                "deployment_memory_fraction": self.window_deployment_memory_fraction,
+                "deployment_storage_fraction": self.window_deployment_storage_fraction,
+            }
+        else:
+            latency_return = self.window_reward / float(self.window_steps) if self.window_steps > 0 else 0.0
+            feedback = {}
         deployment_memory_cost = self.slow_deployment_memory_coef * self.window_deployment_memory_fraction
         deployment_storage_cost = self.slow_deployment_storage_coef * self.window_deployment_storage_fraction
         migration_cost = self.slow_migration_coef * self.window_migration_fraction
@@ -835,9 +980,17 @@ class HierarchicalPPOAgent:
         )
         window_return = latency_return - operating_cost
         self.slow_agent.assign_pending_reward(window_return, done=done)
+        self.slow_agent.last_window_feedback = feedback
         self.last_slow_window_metrics = {
             "slow_window_return": float(window_return),
             "slow_window_latency_return": float(latency_return),
+            "slow_window_avg_latency": float(feedback.get("avg_latency_s", 0.0)),
+            "slow_window_p95_latency": float(feedback.get("p95_latency_s", 0.0)),
+            "slow_tail_latency_cost": float(
+                -latency_return / max(self.slow_reward_scale, 1e-9)
+                if total_weight > 0.0
+                else 0.0
+            ),
             "slow_deployment_memory_cost": float(self.slow_reward_scale * deployment_memory_cost),
             "slow_deployment_storage_cost": float(self.slow_reward_scale * deployment_storage_cost),
             "slow_migration_cost": float(self.slow_reward_scale * migration_cost),
@@ -847,6 +1000,12 @@ class HierarchicalPPOAgent:
         }
         self.window_reward = 0.0
         self.window_steps = 0
+        self.window_latency_samples.clear()
+        self.window_penalty_latency_sum = 0.0
+        self.window_deadline_violations = 0.0
+        self.window_invalid_actions = 0.0
+        self.window_max_node_compute_load = 0.0
+        self.window_max_link_load = 0.0
         self.window_deployment_memory_fraction = 0.0
         self.window_deployment_storage_fraction = 0.0
         self.window_migration_fraction = 0.0

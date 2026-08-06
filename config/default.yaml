@@ -58,12 +58,14 @@ agent:
   reference_project: DRL-AC-Allocation
   architecture: hierarchical
   slow_policy: service_stage_placement
+  slow_encoder: topology_aware_graph_attention
   fast_policy: request_level_stage_scheduling
   continuous_resource_solver: kkt_closed_form
   drl:
     type: dual_agent_ppo
     optimizer_reward_scale: 10.0
     rollouts_per_update: 1
+    synchronized_window_block: 0
     slow_agent_decision: every_10_minutes
     fast_agent_decision: per_node_service_group
     optimizer_update: after_rollout_batch
@@ -73,16 +75,17 @@ agent:
     feasibility_repair: true
     slow_count_entropy_coef: null
     slow_placement_entropy_coef: null
+    slow_tail_latency_coef: 0.35
     slow_value_coef: 0.5
     slow_critic_lr: 0.0003
     slow_critic_k_epochs: 4
     slow_composite_action_return: one_return_per_10min_window
     slow_deployment_memory_coef: 0.03
     slow_deployment_storage_coef: 0.01
-    slow_migration_coef: 0.02
+    slow_migration_coef: 0.0
     reward:
       fast: negative_physical_latency_seconds
-      slow: window_mean_latency_plus_deployment_and_migration_cost
+      slow: window_mean_p95_latency_plus_deployment_and_migration_cost
       resource_shaping_scope: diagnostics_only
       compute_hotspot_threshold: 0.60
       link_hotspot_threshold: 0.60

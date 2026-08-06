@@ -6,7 +6,7 @@ from train_dual_ppo import rollout
 
 
 def test_observation_dimensions():
-    assert slow_obs_dim(16, 3) == 8 + 16 * 5 + 16 * 3
+    assert slow_obs_dim(16, 3) == 17 + 16 * (5 + 3) + 16 * 16 * 4
     assert fast_obs_dim(16) == 12 + 16 * 6 + 16 * 16 * 3
 
 
@@ -167,8 +167,8 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     )
     env.reset()
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
-    assert agent.slow_agent.count_ppo.policy.actor.out_features == 4
-    assert agent.slow_agent.placement_ppo.policy.actor.out_features == env.config.num_edge_nodes
+    assert agent.slow_agent.count_ppo.policy.actor[-1].out_features == 4
+    assert agent.slow_agent.placement_ppo.policy.actor[-1].out_features == 1
 
     def count_two(state, mask, deterministic=False):
         assert mask[1]
@@ -218,3 +218,47 @@ def test_deterministic_slow_deployment_respects_count_policy():
             assert deployment[service.service_id, stage.stage_id].sum() == 3
     feasible, reason = env.check_deployment_feasible(deployment)
     assert feasible, reason
+
+
+def test_slow_window_return_includes_tail_latency_feedback():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=37,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_tail_latency_coef=0.5,
+    )
+    agent.slow_agent.pending_window_id = 0
+    agent.observe_step_reward(
+        reward=-0.1,
+        stage_count=0,
+        done=False,
+        weight=1.0,
+        latency_s=0.1,
+        penalty_latency_s=0.0,
+        deadline_s=0.2,
+    )
+    agent.observe_step_reward(
+        reward=-0.5,
+        stage_count=0,
+        done=False,
+        weight=1.0,
+        latency_s=0.5,
+        penalty_latency_s=0.0,
+        deadline_s=0.2,
+    )
+    agent.flush_slow_window_reward(done=True)
+
+    assert np.isclose(agent.slow_agent.last_window_feedback["avg_latency_s"], 0.3)
+    assert np.isclose(agent.slow_agent.last_window_feedback["p95_latency_s"], 0.5)
+    assert np.isclose(agent.last_slow_window_metrics["slow_tail_latency_cost"], 0.4)
+    assert np.isclose(agent.slow_agent.window_returns[0], -0.4)

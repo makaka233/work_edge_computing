@@ -99,15 +99,24 @@ by the KKT module.
 Slow deployment is trained as one composite action per 10-minute window. Count and
 placement actors share a window-level advantage and a dedicated window critic;
 the component choices are not treated as consecutive GAE steps. Fast PPO is
-optimized only against physical task latency. The slow window return combines
-request-weighted physical latency with deployment memory/storage costs. Migration
-changes remain logged, but `--slow-migration-coef` defaults to zero for the
-current convergence experiments.
+optimized only against physical task latency. Both Slow actors use a topology-aware
+graph-attention encoder; the placement head scores nodes and the count head scores
+replica-count actions. The Slow state includes node/link capacity and load plus
+the previous window's mean latency, P95 latency, penalty latency, and deadline
+feedback. The slow window return combines mean and P95 latency according to
+`--slow-tail-latency-coef` (default 0.35) with deployment memory/storage costs.
+Migration changes remain logged, but `--slow-migration-coef` defaults to zero for
+the current convergence experiments.
 Fast and Slow PPO have independent optimizer schedules. By default,
 `--fast-windows-per-update 1` updates Fast PPO after every ten-minute rollout,
 while `--slow-windows-per-update 12` keeps the Slow PPO policy fixed until twelve
 complete window returns have accumulated. The log fields `slow_updated`,
 `slow_windows_available`, and `slow_windows_buffered` make this cadence explicit.
+For a synchronized training block, use `--synchronized-window-block 4`; this
+sets both PPO update periods to four windows. With `--demand-sampling-mode episode`
+and multiple `--load-multipliers`, the fixed user distribution is retained while
+each window in the block receives the next load multiplier, for example
+`0.8,1.1,1.4,1.7`.
 Training windows use stratified temporal approximation by default:
 `--sampled-seconds-per-window 60` performs 60 neural-policy/KKT settlements that
 represent all 600 logical seconds in a ten-minute window. Instantaneous KKT
