@@ -130,6 +130,9 @@ def save_policy_resource(rows: list[dict[str, str]], output: Path, window: int, 
     critic_ev = values(rows, "slow_critic_explained_variance")
     count_entropy = values(rows, "slow_count_entropy")
     fast_kl = values(rows, "fast_approx_kl")
+    slow_updated = values(rows, "slow_updated") > 0.5
+    critic_ev[~slow_updated] = np.nan
+    count_entropy[~slow_updated] = np.nan
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 12), constrained_layout=True)
     fig.suptitle(f"Policy and resource diagnostics: {run_name}", fontsize=15)
@@ -154,10 +157,30 @@ def save_policy_resource(rows: list[dict[str, str]], output: Path, window: int, 
     axes[1].set_title("Resource pressure, rolling averages")
     axes[1].legend(ncol=4)
 
-    axes[2].plot(update, critic_ev, color="#B279A2", alpha=0.45, label="Slow critic explained variance")
-    axes[2].plot(update, rolling_mean(critic_ev, window), color="#7B4F8C", linewidth=2.2, label=f"Critic EV rolling {window}")
+    axes[2].plot(
+        update[slow_updated],
+        critic_ev[slow_updated],
+        color="#B279A2",
+        alpha=0.45,
+        label="Slow critic explained variance",
+    )
+    critic_rolling = rolling_mean(critic_ev, window)
+    axes[2].plot(
+        update[slow_updated],
+        critic_rolling[slow_updated],
+        color="#7B4F8C",
+        linewidth=2.2,
+        label=f"Critic EV rolling {window}",
+    )
     entropy_axis = axes[2].twinx()
-    entropy_axis.plot(update, rolling_mean(count_entropy, window), color="#9C755F", linewidth=2.0, label="Slow count entropy")
+    count_entropy_rolling = rolling_mean(count_entropy, window)
+    entropy_axis.plot(
+        update[slow_updated],
+        count_entropy_rolling[slow_updated],
+        color="#9C755F",
+        linewidth=2.0,
+        label="Slow count entropy",
+    )
     entropy_axis.plot(update, rolling_mean(fast_kl, window), color="#E45756", linewidth=1.8, label="Fast approximate KL")
     entropy_axis.axhline(0.03, color="#E45756", linestyle=":", alpha=0.7, label="Fast target KL")
     axes[2].set_xlabel("PPO update")
