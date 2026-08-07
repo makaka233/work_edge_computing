@@ -396,6 +396,11 @@ class EdgeComputingEnv:
             all_link_demands.extend(group["joint_link_demands"])
 
         node_capacity = np.array([n.compute_gcycles_per_s for n in self.scenario.nodes], dtype=np.float64)
+        raw_node_capacity = node_capacity.copy()
+        instantaneous_node_work = np.zeros(self.config.num_edge_nodes, dtype=np.float64)
+        for demand in all_compute_demands:
+            instantaneous_node_work[demand.node_id] += demand.compute_gcycles * demand.multiplicity
+        instantaneous_compute_pressure = instantaneous_node_work / np.maximum(raw_node_capacity, 1e-9)
         node_capacity *= np.clip(1.0 - 0.75 * self.node_compute_load, 0.10, 1.0)
         link_capacity = self.scenario.bandwidth_mb_s.copy()
         finite = np.isfinite(link_capacity)
@@ -449,6 +454,10 @@ class EdgeComputingEnv:
                     "compute_demands": group["compute_demands"],
                     "link_demands": group["link_demands"],
                     "load_penalty": float(group["load_penalty"]),
+                    "instantaneous_compute_work_gcycles": float(instantaneous_node_work.sum()),
+                    "instantaneous_avg_compute_pressure": float(np.mean(instantaneous_compute_pressure)),
+                    "instantaneous_max_compute_pressure": float(np.max(instantaneous_compute_pressure)),
+                    "instantaneous_p95_compute_pressure": float(np.percentile(instantaneous_compute_pressure, 95)),
                 }
             )
         return infos
@@ -648,6 +657,10 @@ class EdgeComputingEnv:
             "access_delay_s": mean("access_delay_s"),
             "propagation_delay_s": mean("propagation_delay_s"),
             "load_penalty": mean("load_penalty"),
+            "instantaneous_compute_work_gcycles": mean("instantaneous_compute_work_gcycles"),
+            "instantaneous_avg_compute_pressure": mean("instantaneous_avg_compute_pressure"),
+            "instantaneous_max_compute_pressure": mean("instantaneous_max_compute_pressure"),
+            "instantaneous_p95_compute_pressure": mean("instantaneous_p95_compute_pressure"),
         }
 
     def _require_ready(self) -> None:

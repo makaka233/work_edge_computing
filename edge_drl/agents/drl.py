@@ -12,7 +12,7 @@ from edge_drl.models.ppo import PPOAgent
 
 
 SLOW_GLOBAL_DIM = 17
-SLOW_NODE_BASE_FEATURE_DIM = 5
+SLOW_NODE_BASE_FEATURE_DIM = 6
 SLOW_EDGE_FEATURE_DIM = 4
 
 
@@ -36,7 +36,7 @@ def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
 
 
 FAST_GLOBAL_DIM = 12
-FAST_NODE_FEATURE_DIM = 6
+FAST_NODE_FEATURE_DIM = 9
 FAST_EDGE_FEATURE_DIM = 3
 
 
@@ -181,6 +181,7 @@ class SlowDeploymentPPOAgent:
                 service.service_id,
                 stage.stage_id,
                 0,
+                planned_deployment=deployment,
             )
             count_mask = self._build_count_mask(
                 stage,
@@ -218,6 +219,7 @@ class SlowDeploymentPPOAgent:
                     service.service_id,
                     stage.stage_id,
                     replica_idx,
+                    planned_deployment=deployment,
                 )
                 already = deployment[service.service_id, stage.stage_id]
                 feasible_new = (
@@ -387,6 +389,7 @@ class SlowDeploymentPPOAgent:
         service_id: int,
         stage_id: int,
         replica_idx: int,
+        planned_deployment: np.ndarray | None = None,
     ) -> np.ndarray:
         assert env.scenario is not None
         nodes = env.scenario.nodes
@@ -395,6 +398,10 @@ class SlowDeploymentPPOAgent:
         max_compute = max(n.compute_gcycles_per_s for n in nodes)
         total_node_demand = demand.sum(axis=1)
         max_node_demand = max(float(total_node_demand.max()), 1e-9)
+        affinity_nodes = np.zeros(self.num_nodes, dtype=np.float32)
+        placement = planned_deployment if planned_deployment is not None else env.deployment
+        if placement is not None and stage_id > 0:
+            affinity_nodes = placement[service_id, stage_id - 1].astype(np.float32)
         node_features = []
         for node in nodes:
             node_features.extend(
@@ -404,6 +411,7 @@ class SlowDeploymentPPOAgent:
                     node.compute_gcycles_per_s / max_compute,
                     env.node_compute_load[node.node_id],
                     total_node_demand[node.node_id] / max_node_demand,
+                    affinity_nodes[node.node_id],
                 ]
             )
             node_features.extend(demand[node.node_id].tolist())
@@ -437,6 +445,11 @@ class SlowDeploymentPPOAgent:
         max_compute = max(n.compute_gcycles_per_s for n in nodes)
         total_node_demand = demand.sum(axis=1)
         max_node_demand = max(float(total_node_demand.max()), 1e-9)
+        deployed_nodes = (
+            np.any(env.deployment, axis=(0, 1)).astype(np.float32)
+            if env.deployment is not None
+            else np.zeros(self.num_nodes, dtype=np.float32)
+        )
         node_features: list[float] = []
         for node in nodes:
             node_features.extend(
@@ -446,6 +459,7 @@ class SlowDeploymentPPOAgent:
                     node.compute_gcycles_per_s / max_compute,
                     env.node_compute_load[node.node_id],
                     total_node_demand[node.node_id] / max_node_demand,
+                    deployed_nodes[node.node_id],
                 ]
             )
             node_features.extend(demand[node.node_id].tolist())
@@ -586,6 +600,12 @@ class FastSchedulingPPOAgent:
     minibatch_size: int = 512
     device: str = "cpu"
     ppo: PPOAgent = field(init=False)
+    _workload_cache_key: tuple[object, ...] | None = field(default=None, init=False, repr=False)
+    _workload_cache: tuple[np.ndarray, dict[tuple[int, int], np.ndarray]] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.ppo = PPOAgent(
@@ -734,6 +754,14 @@ class FastSchedulingPPOAgent:
         tick_node_counts = np.zeros(self.num_nodes, dtype=np.float64)
         for item in env.current_requests:
             tick_node_counts[item.home_node] += float(item.request_count)
+        expected_node_work, expected_stage_work = self._expected_current_compute_workload(env)
+        stage_work = expected_stage_work.get((request.service_id, stage_id), np.zeros(self.num_nodes))
+        candidate_post_work = self._candidate_post_compute_workload(
+            env,
+            request,
+            stage_id,
+            expected_node_work,
+        )
         node_features = []
         deployed = env.deployment[request.service_id, stage_id] if env.deployment is not None else np.zeros(self.num_nodes, dtype=bool)
         for node in nodes:
@@ -749,6 +777,12 @@ class FastSchedulingPPOAgent:
                     env.node_compute_load[node.node_id],
                     bandwidth / max(max_bandwidth, 1e-9),
                     tick_node_counts[node.node_id] / max(tick_request_count, 1.0),
+                    self._normalize_compute_pressure(expected_node_work[node.node_id], node.compute_gcycles_per_s),
+                    self._normalize_compute_pressure(stage_work[node.node_id], node.compute_gcycles_per_s),
+                    self._normalize_compute_pressure(
+                        candidate_post_work[node.node_id],
+                        node.compute_gcycles_per_s * max(1.0 - 0.75 * env.node_compute_load[node.node_id], 0.10),
+                    ),
                 ]
             )
         scalars = [
@@ -768,6 +802,99 @@ class FastSchedulingPPOAgent:
         if self.policy_kind == "gat_node_scorer":
             node_features += self._build_edge_features(env)
         return np.asarray(scalars + node_features, dtype=np.float32)
+
+    @staticmethod
+    def _normalize_compute_pressure(work_gcycles: float, capacity_gcycles_per_s: float) -> float:
+        """Expose instantaneous batch pressure without confusing it with EWMA load."""
+
+        pressure = max(float(work_gcycles), 0.0) / max(float(capacity_gcycles_per_s), 1e-9)
+        return float(np.tanh(pressure))
+
+    def _expected_current_compute_workload(
+        self,
+        env: EdgeComputingEnv,
+    ) -> tuple[np.ndarray, dict[tuple[int, int], np.ndarray]]:
+        """Estimate current-second compute work under the active deployment.
+
+        The environment settles all requests in a second jointly.  The old
+        observation exposed only a one-minute EWMA, so the scheduler could not
+        distinguish a lightly loaded node from a node facing a large current
+        batch.  This estimate distributes each stage's work across its active
+        replicas in proportion to their capacities and is cached for the
+        current request tick.
+        """
+
+        env._require_ready()
+        assert env.scenario is not None
+        if env.deployment is None:
+            return (
+                np.zeros(self.num_nodes, dtype=np.float64),
+                {},
+            )
+        cache_key = (
+            id(env.current_requests),
+            float(env.current_time_minute),
+            float(env.metrics.get("deployment_updates", 0.0)),
+        )
+        if self._workload_cache_key == cache_key and self._workload_cache is not None:
+            return self._workload_cache
+
+        node_work = np.zeros(self.num_nodes, dtype=np.float64)
+        stage_work: dict[tuple[int, int], np.ndarray] = {}
+        capacities = np.asarray(
+            [node.compute_gcycles_per_s for node in env.scenario.nodes],
+            dtype=np.float64,
+        )
+        for current_request in env.current_requests:
+            request_weight = float(current_request.request_count)
+            for current_stage_id, compute_gcycles in enumerate(current_request.stage_compute_gcycles):
+                key = (current_request.service_id, current_stage_id)
+                candidates = env.deployment[current_request.service_id, current_stage_id]
+                candidate_ids = np.flatnonzero(candidates)
+                if candidate_ids.size == 0:
+                    continue
+                candidate_capacities = capacities[candidate_ids]
+                shares = candidate_capacities / max(float(candidate_capacities.sum()), 1e-9)
+                contribution = float(compute_gcycles) * request_weight * shares
+                node_work[candidate_ids] += contribution
+                if key not in stage_work:
+                    stage_work[key] = np.zeros(self.num_nodes, dtype=np.float64)
+                stage_work[key][candidate_ids] += contribution
+
+        self._workload_cache_key = cache_key
+        self._workload_cache = (node_work, stage_work)
+        return self._workload_cache
+
+    def _candidate_post_compute_workload(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        expected_node_work: np.ndarray,
+    ) -> np.ndarray:
+        """Estimate node work if this request stage is assigned to each candidate."""
+
+        if env.deployment is None or stage_id >= len(request.stage_compute_gcycles):
+            return np.zeros(self.num_nodes, dtype=np.float64)
+        candidates = env.deployment[request.service_id, stage_id]
+        candidate_ids = np.flatnonzero(candidates)
+        if candidate_ids.size == 0:
+            return np.zeros(self.num_nodes, dtype=np.float64)
+
+        capacities = np.asarray(
+            [node.compute_gcycles_per_s for node in env.scenario.nodes],
+            dtype=np.float64,
+        )
+        candidate_capacities = capacities[candidate_ids]
+        shares = candidate_capacities / max(float(candidate_capacities.sum()), 1e-9)
+        request_work = float(request.stage_compute_gcycles[stage_id]) * float(request.request_count)
+        baseline_without_request = expected_node_work.copy()
+        baseline_without_request[candidate_ids] -= request_work * shares
+        return np.where(
+            candidates,
+            baseline_without_request + request_work,
+            0.0,
+        )
 
     def _build_edge_features(self, env: EdgeComputingEnv) -> list[float]:
         assert env.scenario is not None
@@ -839,8 +966,11 @@ class HierarchicalPPOAgent:
     window_invalid_actions: float = 0.0
     window_max_node_compute_load: float = 0.0
     window_max_link_load: float = 0.0
+    window_cross_stage_transitions: float = 0.0
+    window_stage_transitions: float = 0.0
     slow_reward_scale: float = 1.0
     slow_tail_latency_coef: float = 0.35
+    slow_colocation_coef: float = 0.05
     slow_deployment_memory_coef: float = 0.03
     slow_deployment_storage_coef: float = 0.01
     slow_migration_coef: float = 0.0
@@ -874,6 +1004,7 @@ class HierarchicalPPOAgent:
         fast_policy_kind: str = "gat_node_scorer",
         slow_reward_scale: float = 1.0,
         slow_tail_latency_coef: float = 0.35,
+        slow_colocation_coef: float = 0.05,
         slow_deployment_memory_coef: float = 0.03,
         slow_deployment_storage_coef: float = 0.01,
         slow_migration_coef: float = 0.0,
@@ -911,6 +1042,7 @@ class HierarchicalPPOAgent:
             ),
             slow_reward_scale=slow_reward_scale,
             slow_tail_latency_coef=slow_tail_latency_coef,
+            slow_colocation_coef=slow_colocation_coef,
             slow_deployment_memory_coef=slow_deployment_memory_coef,
             slow_deployment_storage_coef=slow_deployment_storage_coef,
             slow_migration_coef=slow_migration_coef,
@@ -943,10 +1075,12 @@ class HierarchicalPPOAgent:
         record: bool = True,
     ) -> list[list[int]]:
         self.maybe_update_deployment(env, deterministic=deterministic, record=record)
-        return [
-            self.fast_agent.schedule(env, request=request, deterministic=deterministic, record=record)
-            for request in env.current_requests
-        ]
+        return self.fast_agent.schedule_batch(
+            env,
+            list(env.current_requests),
+            deterministic=deterministic,
+            record=record,
+        )
 
     def observe_step_reward(
         self,
@@ -961,6 +1095,8 @@ class HierarchicalPPOAgent:
         invalid: bool = False,
         max_node_compute_load: float | None = None,
         max_link_load: float | None = None,
+        cross_stage_transitions: float = 0.0,
+        stage_transitions: float = 0.0,
     ) -> None:
         self.fast_agent.assign_last_schedule_reward(reward, stage_count, done, weight=weight)
         self.window_reward += (reward if slow_reward is None else slow_reward) * weight
@@ -976,6 +1112,8 @@ class HierarchicalPPOAgent:
                 self.window_max_node_compute_load = max(self.window_max_node_compute_load, float(max_node_compute_load))
             if max_link_load is not None:
                 self.window_max_link_load = max(self.window_max_link_load, float(max_link_load))
+        self.window_cross_stage_transitions += max(float(cross_stage_transitions), 0.0)
+        self.window_stage_transitions += max(float(stage_transitions), 0.0)
         if done:
             self.flush_slow_window_reward(done=True)
 
@@ -1005,11 +1143,20 @@ class HierarchicalPPOAgent:
         else:
             latency_return = self.window_reward / float(self.window_steps) if self.window_steps > 0 else 0.0
             feedback = {}
+        cross_stage_rate = self.window_cross_stage_transitions / max(self.window_stage_transitions, 1e-9)
+        colocation_cost = self.slow_colocation_coef * cross_stage_rate
+        if total_weight > 0.0:
+            feedback.update(
+                {
+                    "cross_stage_transition_rate": cross_stage_rate,
+                    "colocation_rate": 1.0 - cross_stage_rate,
+                }
+            )
         deployment_memory_cost = self.slow_deployment_memory_coef * self.window_deployment_memory_fraction
         deployment_storage_cost = self.slow_deployment_storage_coef * self.window_deployment_storage_fraction
         migration_cost = self.slow_migration_coef * self.window_migration_fraction
         operating_cost = self.slow_reward_scale * (
-            deployment_memory_cost + deployment_storage_cost + migration_cost
+            deployment_memory_cost + deployment_storage_cost + migration_cost + colocation_cost
         )
         window_return = latency_return - operating_cost
         self.slow_agent.assign_pending_reward(window_return, done=done)
@@ -1024,6 +1171,9 @@ class HierarchicalPPOAgent:
                 if total_weight > 0.0
                 else 0.0
             ),
+            "slow_colocation_cost": float(self.slow_reward_scale * colocation_cost),
+            "slow_cross_stage_transition_rate": float(cross_stage_rate),
+            "slow_colocation_rate": float(1.0 - cross_stage_rate),
             "slow_deployment_memory_cost": float(self.slow_reward_scale * deployment_memory_cost),
             "slow_deployment_storage_cost": float(self.slow_reward_scale * deployment_storage_cost),
             "slow_migration_cost": float(self.slow_reward_scale * migration_cost),
@@ -1039,6 +1189,8 @@ class HierarchicalPPOAgent:
         self.window_invalid_actions = 0.0
         self.window_max_node_compute_load = 0.0
         self.window_max_link_load = 0.0
+        self.window_cross_stage_transitions = 0.0
+        self.window_stage_transitions = 0.0
         self.window_deployment_memory_fraction = 0.0
         self.window_deployment_storage_fraction = 0.0
         self.window_migration_fraction = 0.0

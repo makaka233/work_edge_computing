@@ -227,6 +227,12 @@ def parse_args() -> argparse.Namespace:
         default=0.35,
         help="Weight of the window P95 latency in the Slow deployment return; 0 uses mean latency only.",
     )
+    parser.add_argument(
+        "--slow-colocation-coef",
+        type=float,
+        default=0.05,
+        help="Penalty in seconds-equivalent for cross-node transitions between adjacent stages in the Slow return.",
+    )
     parser.add_argument("--fast-entropy-coef", type=float, default=0.0)
     parser.add_argument("--slow-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
@@ -322,6 +328,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-critic-k-epochs must be >= 1")
     if not 0.0 <= args.slow_tail_latency_coef <= 1.0:
         parser.error("--slow-tail-latency-coef must be in [0, 1]")
+    if args.slow_colocation_coef < 0.0:
+        parser.error("--slow-colocation-coef must be >= 0")
     if args.synchronized_window_block < 0:
         parser.error("--synchronized-window-block must be >= 0")
     if args.episode_hours < 1:
@@ -747,6 +755,14 @@ def rollout(
     link_imbalance_penalties: list[float] = []
     idle_deployed_node_penalties: list[float] = []
     latencies: list[float] = []
+    compute_latencies: list[float] = []
+    link_latencies: list[float] = []
+    access_latencies: list[float] = []
+    propagation_latencies: list[float] = []
+    instantaneous_compute_work: list[float] = []
+    instantaneous_avg_compute_pressures: list[float] = []
+    instantaneous_max_compute_pressures: list[float] = []
+    instantaneous_p95_compute_pressures: list[float] = []
     valid_latencies: list[float] = []
     valid_weights: list[float] = []
     penalty_latencies: list[float] = []
@@ -816,6 +832,14 @@ def rollout(
             request_count = float(info.get("request_count", request.request_count))
             train_reward_info = _training_reward_components(info, env, args)
             train_reward = train_reward_info["train_reward"]
+            stage_transitions = float(max(len(info["stage_nodes"]) - 1, 0) * request_count)
+            cross_stage_transitions = float(
+                sum(
+                    previous_node != next_node
+                    for previous_node, next_node in zip(info["stage_nodes"], info["stage_nodes"][1:])
+                )
+                * request_count
+            )
             if record:
                 agent.observe_step_reward(
                     train_reward * reward_scale,
@@ -831,6 +855,8 @@ def rollout(
                     max_link_load=float(np.max(env.link_load[np.isfinite(env.link_load)]))
                     if np.any(np.isfinite(env.link_load))
                     else 0.0,
+                    cross_stage_transitions=cross_stage_transitions,
+                    stage_transitions=stage_transitions,
                 )
             rewards.append(float(info["reward"]))
             train_rewards.append(float(train_reward))
@@ -843,6 +869,14 @@ def rollout(
             link_imbalance_penalties.append(float(train_reward_info["link_imbalance_penalty"]))
             idle_deployed_node_penalties.append(float(train_reward_info["idle_deployed_node_penalty"]))
             latencies.append(float(info["latency_s"]))
+            compute_latencies.append(float(info["compute_delay_s"]))
+            link_latencies.append(float(info["link_delay_s"]))
+            access_latencies.append(float(info["access_delay_s"]))
+            propagation_latencies.append(float(info["propagation_delay_s"]))
+            instantaneous_compute_work.append(float(info["instantaneous_compute_work_gcycles"]))
+            instantaneous_avg_compute_pressures.append(float(info["instantaneous_avg_compute_pressure"]))
+            instantaneous_max_compute_pressures.append(float(info["instantaneous_max_compute_pressure"]))
+            instantaneous_p95_compute_pressures.append(float(info["instantaneous_p95_compute_pressure"]))
             penalty_latencies.append(float(info["penalty_latency_s"]))
             if info["valid"]:
                 valid_latencies.append(float(info["physical_latency_s"]))
@@ -886,6 +920,9 @@ def rollout(
         "slow_window_avg_latency": float("nan"),
         "slow_window_p95_latency": float("nan"),
         "slow_tail_latency_cost": float("nan"),
+        "slow_colocation_cost": float("nan"),
+        "slow_cross_stage_transition_rate": float("nan"),
+        "slow_colocation_rate": float("nan"),
         "slow_deployment_memory_cost": float("nan"),
         "slow_deployment_storage_cost": float("nan"),
         "slow_migration_cost": float("nan"),
@@ -933,6 +970,14 @@ def rollout(
         "avg_idle_deployed_node_penalty": _weighted_mean(idle_deployed_node_penalties, weights),
         "avg_latency_s": _weighted_mean(latencies, weights),
         "p95_latency_s": _weighted_percentile(latencies, weights, 95.0),
+        "avg_compute_latency_s": _weighted_mean(compute_latencies, weights),
+        "avg_link_latency_s": _weighted_mean(link_latencies, weights),
+        "avg_access_latency_s": _weighted_mean(access_latencies, weights),
+        "avg_propagation_latency_s": _weighted_mean(propagation_latencies, weights),
+        "avg_instantaneous_compute_work_gcycles": _weighted_mean(instantaneous_compute_work, weights),
+        "avg_instantaneous_compute_pressure": _weighted_mean(instantaneous_avg_compute_pressures, weights),
+        "avg_max_instantaneous_compute_pressure": _weighted_mean(instantaneous_max_compute_pressures, weights),
+        "avg_p95_instantaneous_compute_pressure": _weighted_mean(instantaneous_p95_compute_pressures, weights),
         "avg_valid_latency_s": _weighted_mean(valid_latencies, valid_weights),
         "p95_valid_latency_s": _weighted_percentile(valid_latencies, valid_weights, 95.0),
         "valid_requests": rollout_valid_requests,
@@ -1199,6 +1244,14 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "avg_idle_deployed_node_penalty",
         "avg_latency_s",
         "p95_latency_s",
+        "avg_compute_latency_s",
+        "avg_link_latency_s",
+        "avg_access_latency_s",
+        "avg_propagation_latency_s",
+        "avg_instantaneous_compute_work_gcycles",
+        "avg_instantaneous_compute_pressure",
+        "avg_max_instantaneous_compute_pressure",
+        "avg_p95_instantaneous_compute_pressure",
         "avg_penalty_latency_s",
         "penalty_latency_share",
         "invalid_action_rate",
@@ -1249,6 +1302,9 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_window_avg_latency",
         "slow_window_p95_latency",
         "slow_tail_latency_cost",
+        "slow_colocation_cost",
+        "slow_cross_stage_transition_rate",
+        "slow_colocation_rate",
         "slow_deployment_memory_cost",
         "slow_deployment_storage_cost",
         "slow_migration_cost",
@@ -1397,6 +1453,22 @@ def evaluate_agent(
         )
     avg_latencies = np.array([r["avg_latency_s"] for r in runs], dtype=np.float64)
     p95_latencies = np.array([r["p95_latency_s"] for r in runs], dtype=np.float64)
+    avg_compute_latencies = np.array([r["avg_compute_latency_s"] for r in runs], dtype=np.float64)
+    avg_link_latencies = np.array([r["avg_link_latency_s"] for r in runs], dtype=np.float64)
+    avg_access_latencies = np.array([r["avg_access_latency_s"] for r in runs], dtype=np.float64)
+    avg_propagation_latencies = np.array([r["avg_propagation_latency_s"] for r in runs], dtype=np.float64)
+    avg_instantaneous_compute_work = np.array(
+        [r["avg_instantaneous_compute_work_gcycles"] for r in runs], dtype=np.float64
+    )
+    avg_instantaneous_compute_pressure = np.array(
+        [r["avg_instantaneous_compute_pressure"] for r in runs], dtype=np.float64
+    )
+    avg_max_instantaneous_compute_pressure = np.array(
+        [r["avg_max_instantaneous_compute_pressure"] for r in runs], dtype=np.float64
+    )
+    avg_p95_instantaneous_compute_pressure = np.array(
+        [r["avg_p95_instantaneous_compute_pressure"] for r in runs], dtype=np.float64
+    )
     avg_valid_latencies = np.array([r["avg_valid_latency_s"] for r in runs], dtype=np.float64)
     p95_valid_latencies = np.array([r["p95_valid_latency_s"] for r in runs], dtype=np.float64)
     avg_penalty_latencies = np.array([r["avg_penalty_latency_s"] for r in runs], dtype=np.float64)
@@ -1442,6 +1514,14 @@ def evaluate_agent(
         "eval_avg_latency_s": float(avg_latencies.mean()),
         "eval_avg_latency_std": float(avg_latencies.std()),
         "eval_p95_latency_s": float(p95_latencies.mean()),
+        "eval_avg_compute_latency_s": float(avg_compute_latencies.mean()),
+        "eval_avg_link_latency_s": float(avg_link_latencies.mean()),
+        "eval_avg_access_latency_s": float(avg_access_latencies.mean()),
+        "eval_avg_propagation_latency_s": float(avg_propagation_latencies.mean()),
+        "eval_avg_instantaneous_compute_work_gcycles": float(avg_instantaneous_compute_work.mean()),
+        "eval_avg_instantaneous_compute_pressure": float(avg_instantaneous_compute_pressure.mean()),
+        "eval_avg_max_instantaneous_compute_pressure": float(avg_max_instantaneous_compute_pressure.mean()),
+        "eval_avg_p95_instantaneous_compute_pressure": float(avg_p95_instantaneous_compute_pressure.mean()),
         "eval_avg_valid_latency_s": float(avg_valid_latencies.mean()),
         "eval_p95_valid_latency_s": float(p95_valid_latencies.mean()),
         "eval_avg_penalty_latency_s": float(avg_penalty_latencies.mean()),
@@ -1492,6 +1572,14 @@ EVAL_STAT_KEYS = [
     "eval_avg_latency_s",
     "eval_avg_latency_std",
     "eval_p95_latency_s",
+    "eval_avg_compute_latency_s",
+    "eval_avg_link_latency_s",
+    "eval_avg_access_latency_s",
+    "eval_avg_propagation_latency_s",
+    "eval_avg_instantaneous_compute_work_gcycles",
+    "eval_avg_instantaneous_compute_pressure",
+    "eval_avg_max_instantaneous_compute_pressure",
+    "eval_avg_p95_instantaneous_compute_pressure",
     "eval_avg_valid_latency_s",
     "eval_p95_valid_latency_s",
     "eval_avg_penalty_latency_s",
@@ -1849,6 +1937,7 @@ def main() -> None:
         fast_policy_kind=args.fast_policy_kind,
         slow_reward_scale=args.reward_scale,
         slow_tail_latency_coef=args.slow_tail_latency_coef,
+        slow_colocation_coef=args.slow_colocation_coef,
         slow_deployment_memory_coef=args.slow_deployment_memory_coef,
         slow_deployment_storage_coef=args.slow_deployment_storage_coef,
         slow_migration_coef=args.slow_migration_coef,
@@ -1886,6 +1975,7 @@ def main() -> None:
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
     print(f"  synchronized_window_block={args.synchronized_window_block or 'disabled'}")
     print(f"  slow_tail_latency_coef={args.slow_tail_latency_coef:.2f} (P95 weight)")
+    print(f"  slow_colocation_coef={args.slow_colocation_coef:.3f} (cross-stage transition penalty)")
     deployment_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
         1,
@@ -2028,6 +2118,14 @@ def main() -> None:
             "avg_idle_deployed_node_penalty": np.nan,
             "avg_latency_s": np.nan,
             "p95_latency_s": np.nan,
+            "avg_compute_latency_s": np.nan,
+            "avg_link_latency_s": np.nan,
+            "avg_access_latency_s": np.nan,
+            "avg_propagation_latency_s": np.nan,
+            "avg_instantaneous_compute_work_gcycles": np.nan,
+            "avg_instantaneous_compute_pressure": np.nan,
+            "avg_max_instantaneous_compute_pressure": np.nan,
+            "avg_p95_instantaneous_compute_pressure": np.nan,
             "avg_valid_latency_s": np.nan,
             "p95_valid_latency_s": np.nan,
             "valid_requests": 0,
@@ -2079,6 +2177,9 @@ def main() -> None:
             "slow_window_avg_latency": np.nan,
             "slow_window_p95_latency": np.nan,
             "slow_tail_latency_cost": np.nan,
+            "slow_colocation_cost": np.nan,
+            "slow_cross_stage_transition_rate": np.nan,
+            "slow_colocation_rate": np.nan,
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
@@ -2111,6 +2212,14 @@ def main() -> None:
             "eval_avg_latency_s": eval_stats["eval_avg_latency_s"],
             "eval_avg_latency_std": eval_stats["eval_avg_latency_std"],
             "eval_p95_latency_s": eval_stats["eval_p95_latency_s"],
+            "eval_avg_compute_latency_s": eval_stats["eval_avg_compute_latency_s"],
+            "eval_avg_link_latency_s": eval_stats["eval_avg_link_latency_s"],
+            "eval_avg_access_latency_s": eval_stats["eval_avg_access_latency_s"],
+            "eval_avg_propagation_latency_s": eval_stats["eval_avg_propagation_latency_s"],
+            "eval_avg_instantaneous_compute_work_gcycles": eval_stats["eval_avg_instantaneous_compute_work_gcycles"],
+            "eval_avg_instantaneous_compute_pressure": eval_stats["eval_avg_instantaneous_compute_pressure"],
+            "eval_avg_max_instantaneous_compute_pressure": eval_stats["eval_avg_max_instantaneous_compute_pressure"],
+            "eval_avg_p95_instantaneous_compute_pressure": eval_stats["eval_avg_p95_instantaneous_compute_pressure"],
             "eval_avg_valid_latency_s": eval_stats["eval_avg_valid_latency_s"],
             "eval_p95_valid_latency_s": eval_stats["eval_p95_valid_latency_s"],
             "eval_avg_penalty_latency_s": eval_stats["eval_avg_penalty_latency_s"],
@@ -2346,6 +2455,14 @@ def main() -> None:
             "avg_idle_deployed_node_penalty": stats["avg_idle_deployed_node_penalty"],
             "avg_latency_s": stats["avg_latency_s"],
             "p95_latency_s": stats["p95_latency_s"],
+            "avg_compute_latency_s": stats["avg_compute_latency_s"],
+            "avg_link_latency_s": stats["avg_link_latency_s"],
+            "avg_access_latency_s": stats["avg_access_latency_s"],
+            "avg_propagation_latency_s": stats["avg_propagation_latency_s"],
+            "avg_instantaneous_compute_work_gcycles": stats["avg_instantaneous_compute_work_gcycles"],
+            "avg_instantaneous_compute_pressure": stats["avg_instantaneous_compute_pressure"],
+            "avg_max_instantaneous_compute_pressure": stats["avg_max_instantaneous_compute_pressure"],
+            "avg_p95_instantaneous_compute_pressure": stats["avg_p95_instantaneous_compute_pressure"],
             "avg_valid_latency_s": stats["avg_valid_latency_s"],
             "p95_valid_latency_s": stats["p95_valid_latency_s"],
             "valid_requests": int(stats["valid_requests"]),
@@ -2397,6 +2514,9 @@ def main() -> None:
             "slow_window_avg_latency": stats["slow_window_avg_latency"],
             "slow_window_p95_latency": stats["slow_window_p95_latency"],
             "slow_tail_latency_cost": stats["slow_tail_latency_cost"],
+            "slow_colocation_cost": stats["slow_colocation_cost"],
+            "slow_cross_stage_transition_rate": stats["slow_cross_stage_transition_rate"],
+            "slow_colocation_rate": stats["slow_colocation_rate"],
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],
@@ -2429,6 +2549,14 @@ def main() -> None:
             "eval_avg_latency_s": eval_stats.get("eval_avg_latency_s", np.nan),
             "eval_avg_latency_std": eval_stats.get("eval_avg_latency_std", np.nan),
             "eval_p95_latency_s": eval_stats.get("eval_p95_latency_s", np.nan),
+            "eval_avg_compute_latency_s": eval_stats.get("eval_avg_compute_latency_s", np.nan),
+            "eval_avg_link_latency_s": eval_stats.get("eval_avg_link_latency_s", np.nan),
+            "eval_avg_access_latency_s": eval_stats.get("eval_avg_access_latency_s", np.nan),
+            "eval_avg_propagation_latency_s": eval_stats.get("eval_avg_propagation_latency_s", np.nan),
+            "eval_avg_instantaneous_compute_work_gcycles": eval_stats.get("eval_avg_instantaneous_compute_work_gcycles", np.nan),
+            "eval_avg_instantaneous_compute_pressure": eval_stats.get("eval_avg_instantaneous_compute_pressure", np.nan),
+            "eval_avg_max_instantaneous_compute_pressure": eval_stats.get("eval_avg_max_instantaneous_compute_pressure", np.nan),
+            "eval_avg_p95_instantaneous_compute_pressure": eval_stats.get("eval_avg_p95_instantaneous_compute_pressure", np.nan),
             "eval_avg_valid_latency_s": eval_stats.get("eval_avg_valid_latency_s", np.nan),
             "eval_p95_valid_latency_s": eval_stats.get("eval_p95_valid_latency_s", np.nan),
             "eval_avg_penalty_latency_s": eval_stats.get("eval_avg_penalty_latency_s", np.nan),
