@@ -297,7 +297,7 @@ def test_default_single_task_latency_is_mec_scale():
     assert p95_latency_s <= 0.60
 
 
-def test_request_aggregation_counts_underlying_requests():
+def test_individual_request_events_preserve_one_second_batch_settlement():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=43,
@@ -316,14 +316,18 @@ def test_request_aggregation_counts_underlying_requests():
     requests = list(env.current_requests)
     start_time = env.current_time_minute
     expected_count = sum(request.request_count for request in requests)
+    assert expected_count == len(requests)
     assert expected_count > 1
+    assert all(request.request_count == 1 for request in requests)
+    assert all(request.user_id >= 0 for request in requests)
 
     actions = agent.act_batch(env)
     _, _, _, info = env.step(actions)
 
     assert info["request_count"] == expected_count
     assert env.metrics["time_steps"] == 1
-    assert env.metrics["aggregate_events"] == len(requests)
+    assert info["request_event_count"] == len(requests)
+    assert env.metrics["request_events"] == len(requests)
     assert env.metrics["requests"] == expected_count
     assert np.isclose(env.current_time_minute - start_time, 1.0 / 60.0)
 
@@ -350,10 +354,10 @@ def test_representative_step_advances_weighted_time_without_changing_instantaneo
     _, _, _, info = env.step(actions, represented_seconds=10.0)
 
     assert info["request_count"] == sampled_request_count * 10
-    assert info["group_count"] == len(requests)
+    assert info["request_event_count"] == len(requests)
     assert info["represented_seconds"] == 10.0
     assert env.metrics["requests"] == sampled_request_count * 10
-    assert env.metrics["aggregate_events"] == len(requests) * 10
+    assert env.metrics["request_events"] == len(requests) * 10
     assert env.metrics["time_steps"] == 10
     assert env.metrics["settlement_steps"] == 1
     assert np.isclose(env.current_time_minute - start_time, 10.0 / 60.0)
@@ -515,7 +519,7 @@ def test_service_resource_fraction_preserves_physical_nodes_but_limits_placement
     np.testing.assert_allclose(env.service_storage_capacities(), physical_storage * 0.4)
 
 
-def test_all_nonempty_node_service_groups_are_preserved():
+def test_individual_requests_preserve_arrival_and_identity():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
             seed=47,
@@ -532,5 +536,7 @@ def test_all_nonempty_node_service_groups_are_preserved():
     requests = env.current_requests
     assert len(requests) > 4
     assert all(request.arrival_minute == window_time for request in requests)
-    assert len({(request.home_node, request.service_id) for request in requests}) == len(requests)
-    assert sum(request.request_count for request in requests) > 0
+    assert len({request.request_id for request in requests}) == len(requests)
+    assert all(request.request_count == 1 for request in requests)
+    assert all(request.user_id >= 0 for request in requests)
+    assert sum(request.request_count for request in requests) == len(requests)

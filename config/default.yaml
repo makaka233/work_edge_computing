@@ -50,9 +50,9 @@ latency_calibration:
   task_input_mb_range: [0.05, 1.5]
   stage_compute_gcycles_range: [0.4, 4.0]
   note: >
-    Every non-empty node-service group is preserved. All groups in one second
-    compete jointly for compute and link resources, then the environment advances
-    by exactly one second.
+    Every arriving task is preserved as an individual request. All requests in
+    one second compete jointly for compute and link resources, then the
+    environment advances by exactly one second.
 
 agent:
   reference_project: DRL-AC-Allocation
@@ -67,7 +67,7 @@ agent:
     rollouts_per_update: 1
     synchronized_window_block: 0
     slow_agent_decision: every_10_minutes
-    fast_agent_decision: per_node_service_group
+    fast_agent_decision: per_request
     optimizer_update: after_rollout_batch
     max_replicas_per_stage: null
     actual_replica_count: learned_by_count_ppo

@@ -69,6 +69,37 @@ def test_dual_ppo_rollout_and_update():
     assert len(agent.fast_agent.ppo.buffer) == 0
 
 
+def test_fast_batch_inference_keeps_request_major_buffer_order():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=18,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    requests = list(env.current_requests)
+    actions = agent.fast_agent.schedule_batch(env, requests, deterministic=True, record=True)
+
+    expected_transitions = sum(len(request.stage_compute_gcycles) for request in requests)
+    assert len(agent.fast_agent.ppo.buffer) == expected_transitions
+    offset = 0
+    for request_idx, request in enumerate(requests):
+        for stage_id in range(len(request.stage_compute_gcycles)):
+            expected_state = agent.fast_agent._build_state(
+                env,
+                request,
+                stage_id,
+                actions[request_idx][:stage_id],
+            )
+            np.testing.assert_allclose(agent.fast_agent.ppo.buffer.states[offset], expected_state)
+            offset += 1
+
+
 def test_deterministic_eval_does_not_write_rollout_buffers():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

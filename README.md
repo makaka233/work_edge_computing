@@ -15,7 +15,7 @@ kept thin. The problem model is different, so the code is specialized for:
   inspection, traffic perception, retail events, robot control, medical vital
   anomaly detection, drone inspection, and connected-vehicle planning.
 - Slow service-stage deployment every 10 minutes.
-- Fast scheduling for every non-empty node-service group in each one-second step.
+- Fast scheduling for every individual request in each one-second step.
 - KKT closed-form allocation for continuous compute and link bandwidth.
 - MEC-scale task latency calibration: service requests use small input payloads,
   single-digit Gcycle staged compute demand, 150 Mbps uplink, and 10 ms radio
@@ -37,14 +37,15 @@ kept thin. The problem model is different, so the code is specialized for:
 - The physical edge infrastructure is fixed by `--physical-seed`: edge-node
   positions, compute capacity, memory, storage, service catalogue, and wired
   link bandwidth/propagation do not change during scenario refresh.
-- A normal `env.step` equals one simulated second. Arrivals are grouped by
-  `(home_node, service_id)`, every non-empty group is preserved, and no
-  representative-group sampling or count reassignment is performed.
-- The fast policy schedules every group before settlement. Compute and link
-  demands from all groups then enter one joint KKT allocation, metrics are
-  weighted by `request_count`, loads update once, and time advances one second.
-- Fast-policy state includes the current second's total request count, group
-  count, service share, and per-access-node demand share, so each factored group
+- A normal `env.step` equals one simulated second. Arrivals remain as individual
+  `TaskRequest` objects with `request_count=1`; no node-service aggregation or
+  representative-request reassignment is performed.
+- The fast policy schedules every request before settlement. Compute and link
+  demands from all requests then enter one joint KKT allocation, loads update
+  once, and time advances one second. This preserves batch contention while
+  allowing different requests to use different deployed replicas.
+- Fast-policy state includes the current second's total request count, request
+  event count, service share, and per-access-node demand share, so each request
   action can respond to the batch it will compete with.
 
 ## Current Modules
@@ -76,7 +77,7 @@ one-second steps and 24 ten-minute slow-deployment windows. Prefer
 each rollout samples one independent ten-minute demand window while the physical
 edge network stays fixed. `train_dual_ppo.py` prints
 in-rollout terminal progress by default every 10 seconds. The progress line
-reports update progress, real request count, aggregate event count, simulated
+reports update progress, real request count, request event count, simulated
 hours, deployment updates, average latency, elapsed time, and ETA. Use
 `--progress-interval-seconds 0` to disable it or a smaller value for more
 frequent refreshes.

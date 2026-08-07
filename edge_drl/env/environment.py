@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
-from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_grouped_request, generate_realistic_scenario
+from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_realistic_scenario, generate_request
 
 
 def _daily_arrival_factor(minute_of_day: float) -> float:
@@ -110,7 +110,6 @@ class EdgeComputingEnv:
         self.request_counter = 0
         self.current_requests: list[TaskRequest] = []
         self.current_request: TaskRequest | None = None
-        self.request_group_probabilities: np.ndarray | None = None
         self.node_compute_load = np.zeros(self.config.num_edge_nodes, dtype=np.float64)
         self.link_load = np.zeros((self.config.num_edge_nodes, self.config.num_edge_nodes), dtype=np.float64)
         self.last_load_update_minute = 0.0
@@ -143,14 +142,13 @@ class EdgeComputingEnv:
         self.next_deployment_update_minute = 0.0
         self.request_counter = 0
         self.current_requests = []
-        self.request_group_probabilities = self._build_request_group_probabilities()
         self.node_compute_load = np.zeros(self.config.num_edge_nodes, dtype=np.float64)
         self.link_load = np.zeros((self.config.num_edge_nodes, self.config.num_edge_nodes), dtype=np.float64)
         self.last_load_update_minute = 0.0
         self.last_migration_cost = 0.0
         self.metrics = {
             "requests": 0.0,
-            "aggregate_events": 0.0,
+            "request_events": 0.0,
             "time_steps": 0.0,
             "settlement_steps": 0.0,
             "invalid_actions": 0.0,
@@ -261,7 +259,7 @@ class EdgeComputingEnv:
         requests = list(self.current_requests)
         schedules = list(batch_stage_nodes)
         if len(schedules) != len(requests):
-            raise ValueError(f"expected {len(requests)} group schedules, got {len(schedules)}")
+            raise ValueError(f"expected {len(requests)} request schedules, got {len(schedules)}")
 
         group_infos = self.evaluate_batch_schedules(requests, schedules)
         migration_cost = self.last_migration_cost
@@ -291,7 +289,9 @@ class EdgeComputingEnv:
             if float(group_info["latency_s"]) > request.deadline_s:
                 self.metrics["deadline_violations"] += request_count
 
-        self.metrics["aggregate_events"] += float(len(requests)) * represented_seconds
+        # Each entry is now one independent request.  All requests in this
+        # second are still settled jointly, preserving one-second time steps.
+        self.metrics["request_events"] += float(len(requests)) * represented_seconds
         self.metrics["time_steps"] += represented_seconds
         self.metrics["settlement_steps"] += 1.0
         self._update_dynamic_loads_batch(group_infos, requests, represented_seconds=represented_seconds)
@@ -311,7 +311,7 @@ class EdgeComputingEnv:
         info.update(
             {
                 "group_infos": group_infos,
-                "group_count": len(group_infos),
+                "request_event_count": len(group_infos),
                 "request_count": total_count,
                 "represented_seconds": represented_seconds,
                 "migration_cost": migration_cost,
@@ -555,44 +555,26 @@ class EdgeComputingEnv:
     def _generate_current_second_requests(self) -> list[TaskRequest]:
         expected_requests = self._arrival_rate_per_minute() / 60.0
         total_count = int(self.rng.poisson(expected_requests))
-        return self._generate_aggregated_requests(total_count)
+        return self._generate_individual_requests(total_count)
 
-    def _build_request_group_probabilities(self) -> np.ndarray:
+    def _generate_individual_requests(self, total_count: int) -> list[TaskRequest]:
         assert self.scenario is not None
-        probabilities = np.zeros((self.config.num_edge_nodes, self.config.num_service_types), dtype=np.float64)
-        for user in self.scenario.users:
-            probabilities[user.home_node] += np.asarray(user.service_weights, dtype=np.float64)
-        probabilities /= probabilities.sum()
-        return probabilities.reshape(-1)
-
-    def _generate_aggregated_requests(self, total_count: int) -> list[TaskRequest]:
-        assert self.scenario is not None
-        assert self.request_group_probabilities is not None
         if total_count <= 0:
             return []
-        group_counts = self.rng.multinomial(total_count, self.request_group_probabilities)
         requests: list[TaskRequest] = []
-        for group_id, request_count in enumerate(group_counts):
-            if request_count <= 0:
-                continue
-            home_node = group_id // self.config.num_service_types
-            service_id = group_id % self.config.num_service_types
+        for _ in range(total_count):
             requests.append(
-                generate_grouped_request(
+                generate_request(
                     rng=self.rng,
                     request_id=self.request_counter,
                     arrival_minute=self.current_time_minute,
-                    request_count=int(request_count),
-                    user_id=-1,
-                    home_node=int(home_node),
-                    service_id=int(service_id),
+                    users=self.scenario.users,
                     services=self.scenario.services,
                     task_compute_scale=self.config.task_compute_scale,
                     task_data_scale=self.config.task_data_scale,
                 )
             )
             self.request_counter += 1
-        requests.sort(key=lambda request: (-request.request_count, request.home_node, request.service_id))
         return requests
 
     def _arrival_rate_per_minute(self) -> float:

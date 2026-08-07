@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
         "--request-aggregation-window-seconds",
         type=float,
         default=1.0,
-        help="Fixed at 1 second: one env.step jointly settles all non-empty node-service groups in that second.",
+        help="Legacy name; fixed at 1 second so one env.step settles all individual requests arriving in that second.",
     )
     parser.add_argument(
         "--sampled-seconds-per-window",
@@ -329,7 +329,7 @@ def parse_args() -> argparse.Namespace:
     if args.deployment_interval_minutes < 1:
         parser.error("--deployment-interval-minutes must be >= 1")
     if not np.isclose(args.request_aggregation_window_seconds, 1.0):
-        parser.error("--request-aggregation-window-seconds must be exactly 1.0")
+        parser.error("--request-aggregation-window-seconds must remain exactly 1.0")
     if args.sampled_seconds_per_window < 0:
         parser.error("--sampled-seconds-per-window must be >= 0")
     if args.train_mode == "joint" and args.rollout_unit == "requests":
@@ -496,7 +496,7 @@ class RolloutProgress:
         deployment_interval_minutes: int,
         rollout_start_minute: float = 0.0,
         start_requests: float = 0.0,
-        start_aggregate_events: float = 0.0,
+        start_request_events: float = 0.0,
     ):
         self.label = label
         self.target_requests = target_requests
@@ -506,7 +506,7 @@ class RolloutProgress:
         self.deployment_interval_minutes = deployment_interval_minutes
         self.rollout_start_minute = rollout_start_minute
         self.start_requests = start_requests
-        self.start_aggregate_events = start_aggregate_events
+        self.start_request_events = start_request_events
         self.started_at = time.monotonic()
         self.last_print_at = self.started_at
         self.printed = False
@@ -589,7 +589,7 @@ class RolloutProgress:
     ) -> None:
         assert self.tqdm_bar is not None
         requests = max(float(env.metrics.get("requests", 0.0)) - self.start_requests, 0.0)
-        aggregate_events = int(max(float(env.metrics.get("aggregate_events", 0.0)) - self.start_aggregate_events, 0.0))
+        request_events = int(max(float(env.metrics.get("request_events", 0.0)) - self.start_request_events, 0.0))
         sim_hours = env.current_time_minute / 60.0
         episode_fraction = sim_hours / max(float(self.episode_hours), 1e-9)
         if self.rollout_unit == "episode":
@@ -608,7 +608,7 @@ class RolloutProgress:
         elapsed = max(now - self.started_at, 1e-9)
         total_windows = max(int(np.ceil(self.episode_hours * 60.0 / max(self.deployment_interval_minutes, 1))), 1)
         current_window = min(int(env.current_time_minute // max(self.deployment_interval_minutes, 1)) + 1, total_windows)
-        wall_event_rate = aggregate_events / elapsed
+        wall_event_rate = request_events / elapsed
         units = self._progress_units(env)
         delta = max(units - self.progress_units, 0.0)
         if delta > 0:
@@ -787,7 +787,7 @@ def rollout(
         deployment_interval_minutes=env.config.deployment_interval_minutes,
         rollout_start_minute=rollout_start_minute,
         start_requests=float(start_metrics.get("requests", 0.0)),
-        start_aggregate_events=float(start_metrics.get("aggregate_events", 0.0)),
+        start_request_events=float(start_metrics.get("request_events", 0.0)),
     )
     while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit, stop_time_minute=stop_time_minute):
         step_represented_seconds = represented_seconds
@@ -801,10 +801,12 @@ def rollout(
         if train_mode == "fast-only":
             if env.needs_deployment_update:
                 env.apply_deployment(frozen_slow_policy.act(env))
-            actions = [
-                agent.fast_agent.schedule(env, request=request, deterministic=deterministic, record=record)
-                for request in requests
-            ]
+            actions = agent.fast_agent.schedule_batch(
+                env,
+                requests,
+                deterministic=deterministic,
+                record=record,
+            )
         else:
             actions = agent.act_batch(env, deterministic=deterministic, record=record)
         deployment_window = int(env.metrics["deployment_updates"])
@@ -902,7 +904,7 @@ def rollout(
         total_stage_transitions=total_stage_transitions,
     )
     rollout_requests = float(env.metrics["requests"] - start_metrics.get("requests", 0.0))
-    rollout_aggregate_events = float(env.metrics["aggregate_events"] - start_metrics.get("aggregate_events", 0.0))
+    rollout_request_events = float(env.metrics["request_events"] - start_metrics.get("request_events", 0.0))
     rollout_invalid_actions = float(env.metrics["invalid_actions"] - start_metrics.get("invalid_actions", 0.0))
     rollout_valid_requests = float(env.metrics["valid_requests"] - start_metrics.get("valid_requests", 0.0))
     rollout_deadline_violations = float(env.metrics["deadline_violations"] - start_metrics.get("deadline_violations", 0.0))
@@ -912,7 +914,7 @@ def rollout(
     rollout_duration_minutes = max(env.current_time_minute - rollout_start_minute, 0.0)
     return {
         "requests": rollout_requests,
-        "aggregate_events": rollout_aggregate_events,
+        "request_events": rollout_request_events,
         "settlement_steps": rollout_settlement_steps,
         "logical_steps": rollout_logical_steps,
         "temporal_sampling_fraction": float(rollout_settlement_steps / max(rollout_logical_steps, 1.0)),
@@ -1181,7 +1183,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
 
     requests = np.asarray([r["requests"] for r in rollouts], dtype=np.float64)
     valid_requests = np.asarray([r["valid_requests"] for r in rollouts], dtype=np.float64)
-    aggregate_events = np.asarray([r["aggregate_events"] for r in rollouts], dtype=np.float64)
+    request_events = np.asarray([r["request_events"] for r in rollouts], dtype=np.float64)
     deployment_updates = np.asarray([r["deployment_updates"] for r in rollouts], dtype=np.float64)
 
     request_weighted = [
@@ -1257,7 +1259,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
 
     aggregated: dict[str, float] = {
         "requests": float(requests.sum()),
-        "aggregate_events": float(aggregate_events.sum()),
+        "request_events": float(request_events.sum()),
         "settlement_steps": float(sum(r["settlement_steps"] for r in rollouts)),
         "logical_steps": float(sum(r["logical_steps"] for r in rollouts)),
         "simulated_hours": float(sum(r["simulated_hours"] for r in rollouts)),
@@ -1403,7 +1405,7 @@ def evaluate_agent(
     invalid_action_rates = np.array([r["invalid_action_rate"] for r in runs], dtype=np.float64)
     violation_rates = np.array([r["deadline_violation_rate"] for r in runs], dtype=np.float64)
     deployment_updates = np.array([r["deployment_updates"] for r in runs], dtype=np.float64)
-    aggregate_events = np.array([r["aggregate_events"] for r in runs], dtype=np.float64)
+    request_events = np.array([r["request_events"] for r in runs], dtype=np.float64)
     settlement_steps = np.array([r["settlement_steps"] for r in runs], dtype=np.float64)
     logical_steps = np.array([r["logical_steps"] for r in runs], dtype=np.float64)
     avg_replicas = np.array([r["avg_replicas_per_stage"] for r in runs], dtype=np.float64)
@@ -1448,7 +1450,7 @@ def evaluate_agent(
         "eval_invalid_action_rate": float(invalid_action_rates.mean()),
         "eval_deadline_violation_rate": float(violation_rates.mean()),
         "eval_deployment_updates": float(deployment_updates.mean()),
-        "eval_aggregate_events": float(aggregate_events.mean()),
+        "eval_request_events": float(request_events.mean()),
         "eval_settlement_steps": float(settlement_steps.mean()),
         "eval_logical_steps": float(logical_steps.mean()),
         "eval_temporal_sampling_fraction": float(settlement_steps.sum() / max(logical_steps.sum(), 1.0)),
@@ -1498,7 +1500,7 @@ EVAL_STAT_KEYS = [
     "eval_invalid_action_rate",
     "eval_deadline_violation_rate",
     "eval_deployment_updates",
-    "eval_aggregate_events",
+    "eval_request_events",
     "eval_settlement_steps",
     "eval_logical_steps",
     "eval_temporal_sampling_fraction",
@@ -1889,7 +1891,7 @@ def main() -> None:
         1,
     )
     print(f"  episode_horizon={args.episode_hours}h deployment_windows={deployment_windows}")
-    print("  environment_step=1s representative_group_sampling=disabled")
+    print("  environment_step=1s request_granularity=individual batch_settlement=joint")
     window_seconds = args.deployment_interval_minutes * 60
     effective_sampled_seconds = (
         window_seconds
@@ -1953,7 +1955,7 @@ def main() -> None:
     )
     print(f"  ppo_minibatch slow={args.slow_minibatch_size} fast={args.fast_minibatch_size}")
     print(f"  slow_agent=service deployment every {args.deployment_interval_minutes} minutes")
-    print("  fast_agent=joint one-second group scheduling")
+    print("  fast_agent=independent request scheduling within each one-second batch")
     if args.fast_bc_requests > 0:
         print(
             "  fast_bc samples={} loss={:.4f} accuracy={:.4f}".format(
@@ -2007,7 +2009,7 @@ def main() -> None:
             "rollouts_collected": 0,
             "window_in_episode": 0,
             "requests": 0,
-            "aggregate_events": 0,
+            "request_events": 0,
             "settlement_steps": 0,
             "logical_steps": 0,
             "temporal_sampling_fraction": np.nan,
@@ -2117,7 +2119,7 @@ def main() -> None:
             "eval_invalid_action_rate": eval_stats["eval_invalid_action_rate"],
             "eval_deadline_violation_rate": eval_stats["eval_deadline_violation_rate"],
             "eval_deployment_updates": eval_stats["eval_deployment_updates"],
-            "eval_aggregate_events": eval_stats["eval_aggregate_events"],
+            "eval_request_events": eval_stats["eval_request_events"],
             "eval_settlement_steps": eval_stats["eval_settlement_steps"],
             "eval_logical_steps": eval_stats["eval_logical_steps"],
             "eval_temporal_sampling_fraction": eval_stats["eval_temporal_sampling_fraction"],
@@ -2325,7 +2327,7 @@ def main() -> None:
             "rollouts_collected": len(rollout_stats),
             "window_in_episode": window_in_episode,
             "requests": int(stats["requests"]),
-            "aggregate_events": int(stats["aggregate_events"]),
+            "request_events": int(stats["request_events"]),
             "settlement_steps": int(stats["settlement_steps"]),
             "logical_steps": int(round(stats["logical_steps"])),
             "temporal_sampling_fraction": stats["temporal_sampling_fraction"],
@@ -2435,7 +2437,7 @@ def main() -> None:
             "eval_invalid_action_rate": eval_stats.get("eval_invalid_action_rate", np.nan),
             "eval_deadline_violation_rate": eval_stats.get("eval_deadline_violation_rate", np.nan),
             "eval_deployment_updates": eval_stats.get("eval_deployment_updates", np.nan),
-            "eval_aggregate_events": eval_stats.get("eval_aggregate_events", np.nan),
+            "eval_request_events": eval_stats.get("eval_request_events", np.nan),
             "eval_settlement_steps": eval_stats.get("eval_settlement_steps", np.nan),
             "eval_logical_steps": eval_stats.get("eval_logical_steps", np.nan),
             "eval_temporal_sampling_fraction": eval_stats.get("eval_temporal_sampling_fraction", np.nan),
@@ -2485,7 +2487,7 @@ def main() -> None:
             else f"episodes={episode_start_number:03d}-{episode_number:03d}"
         )
         print(
-            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} aggregate_events={} sampled_steps={}/{} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} request_events={} sampled_steps={}/{} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} diag_res={:.4f} slowR={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
@@ -2503,7 +2505,7 @@ def main() -> None:
                 int(stats["episode_complete"]),
                 window_in_episode,
                 int(stats["requests"]),
-                int(stats["aggregate_events"]),
+                int(stats["request_events"]),
                 int(stats["settlement_steps"]),
                 int(round(stats["logical_steps"])),
                 stats["simulated_hours"],

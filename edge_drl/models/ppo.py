@@ -459,6 +459,32 @@ class PPOAgent:
             logprob_t = dist.log_prob(action_t)
         return int(action_t.item()), float(logprob_t.item()), float(value.item())
 
+    def act_batch(
+        self,
+        states: list[np.ndarray] | np.ndarray,
+        masks: list[np.ndarray] | np.ndarray,
+        deterministic: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Sample a batch of masked actions with one policy forward pass."""
+
+        state_array = np.asarray(states, dtype=np.float32)
+        mask_array = np.asarray(masks, dtype=bool)
+        if state_array.ndim != 2 or mask_array.ndim != 2 or state_array.shape[0] == 0:
+            raise ValueError("act_batch expects non-empty 2D states and masks")
+        if state_array.shape[0] != mask_array.shape[0]:
+            raise ValueError("states and masks must have the same batch size")
+        state_t = torch.as_tensor(state_array, dtype=torch.float32, device=self.device)
+        mask_t = torch.as_tensor(mask_array, dtype=torch.bool, device=self.device)
+        with torch.no_grad():
+            dist, values = self.policy(state_t, mask_t)
+            actions = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
+            logprobs = dist.log_prob(actions)
+        return (
+            actions.detach().cpu().numpy().astype(np.int64),
+            logprobs.detach().cpu().numpy().astype(np.float32),
+            values.detach().cpu().numpy().astype(np.float32),
+        )
+
     def action_stats(self, state: np.ndarray, mask: np.ndarray) -> dict[str, float | int]:
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)

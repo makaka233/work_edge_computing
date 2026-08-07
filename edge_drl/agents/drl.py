@@ -614,39 +614,72 @@ class FastSchedulingPPOAgent:
         deterministic: bool = False,
         record: bool = True,
     ) -> list[int]:
-        env._require_ready()
         if request is None:
             assert env.current_request is not None
             request = env.current_request
+        return self.schedule_batch(env, [request], deterministic=deterministic, record=record)[0]
 
-        stage_nodes: list[int] = []
-        masks: list[np.ndarray] = []
-        states: list[np.ndarray] = []
-        actions: list[int] = []
-        logprobs: list[float] = []
-        values: list[float] = []
+    def schedule_batch(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        deterministic: bool = False,
+        record: bool = True,
+    ) -> list[list[int]]:
+        """Schedule independent requests with stage-wise batched inference."""
 
-        for stage_id in range(len(request.stage_compute_gcycles)):
-            state = self._build_state(env, request, stage_id, stage_nodes)
-            mask = self._build_mask(env, request, stage_id, stage_nodes)
-            action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
-            if not mask[action]:
-                action = int(np.where(mask)[0][0])
-            stage_nodes.append(action)
-            states.append(state)
-            masks.append(mask)
-            actions.append(action)
-            logprobs.append(logprob)
-            values.append(value)
+        env._require_ready()
+        if not requests:
+            return []
 
+        schedules: list[list[int]] = [[] for _ in requests]
+        transition_records: list[list[tuple[np.ndarray, np.ndarray, int, float, float]]] = [
+            [] for _ in requests
+        ]
+        max_stages = max(len(request.stage_compute_gcycles) for request in requests)
+        for stage_id in range(max_stages):
+            active_indices = [
+                request_idx
+                for request_idx, request in enumerate(requests)
+                if stage_id < len(request.stage_compute_gcycles)
+            ]
+            if not active_indices:
+                continue
+            states = [
+                self._build_state(env, requests[request_idx], stage_id, schedules[request_idx])
+                for request_idx in active_indices
+            ]
+            masks = [
+                self._build_mask(env, requests[request_idx], stage_id, schedules[request_idx])
+                for request_idx in active_indices
+            ]
+            actions, logprobs, values = self.ppo.act_batch(states, masks, deterministic=deterministic)
+            for local_idx, request_idx in enumerate(active_indices):
+                action = int(actions[local_idx])
+                if not masks[local_idx][action]:
+                    action = int(np.where(masks[local_idx])[0][0])
+                schedules[request_idx].append(action)
+                if record:
+                    transition_records[request_idx].append(
+                        (
+                            states[local_idx],
+                            masks[local_idx].astype(bool),
+                            action,
+                            float(logprobs[local_idx]),
+                            float(values[local_idx]),
+                        )
+                    )
         if record:
-            for state, mask, action, logprob, value in zip(states, masks, actions, logprobs, values):
-                self.ppo.buffer.states.append(state)
-                self.ppo.buffer.masks.append(mask.astype(bool))
-                self.ppo.buffer.actions.append(action)
-                self.ppo.buffer.logprobs.append(logprob)
-                self.ppo.buffer.values.append(value)
-        return stage_nodes
+            # Keep transition order request-major because rollout rewards are
+            # assigned after env.step in that same request order.
+            for request_records in transition_records:
+                for state, mask, action, logprob, value in request_records:
+                    self.ppo.buffer.states.append(state)
+                    self.ppo.buffer.masks.append(mask)
+                    self.ppo.buffer.actions.append(action)
+                    self.ppo.buffer.logprobs.append(logprob)
+                    self.ppo.buffer.values.append(value)
+        return schedules
 
     def schedule_with_diagnostics(
         self,
@@ -694,7 +727,7 @@ class FastSchedulingPPOAgent:
         max_compute = max(n.compute_gcycles_per_s for n in nodes)
         max_bandwidth = np.nanmax(np.where(np.isfinite(env.scenario.bandwidth_mb_s), env.scenario.bandwidth_mb_s, 0.0))
         tick_request_count = float(sum(item.request_count for item in env.current_requests))
-        tick_group_count = float(len(env.current_requests))
+        tick_request_event_count = float(len(env.current_requests))
         tick_service_count = float(
             sum(item.request_count for item in env.current_requests if item.service_id == request.service_id)
         )
@@ -729,7 +762,7 @@ class FastSchedulingPPOAgent:
             env.current_time_minute / max(env.config.episode_hours * 60, 1),
             len(request.stage_compute_gcycles) / self.max_service_stages,
             np.log1p(tick_request_count) / np.log1p(5_000.0),
-            tick_group_count / max(env.config.num_edge_nodes * env.config.num_service_types, 1),
+            tick_request_event_count / max(env.config.num_edge_nodes * env.config.num_service_types, 1),
             tick_service_count / max(tick_request_count, 1.0),
         ]
         if self.policy_kind == "gat_node_scorer":
