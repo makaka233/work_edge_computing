@@ -160,9 +160,15 @@ class FastGreedyScheduler:
         compute_delay = request.stage_compute_gcycles[stage_id] / max(node.compute_gcycles_per_s, 1e-9)
         load_penalty = env.node_compute_load[node_id]
         if stage_id == 0 and node_id != request.home_node:
-            if not env.scenario.adjacency[request.home_node, node_id]:
+            path = env.shortest_path(request.home_node, node_id)
+            if path is None:
                 return float("inf")
-            link_delay = request.input_mb / max(env.scenario.bandwidth_mb_s[request.home_node, node_id], 1e-9)
+            link_delay = float(
+                sum(
+                    request.input_mb / max(env.scenario.bandwidth_mb_s[src, dst], 1e-9)
+                    for src, dst in zip(path, path[1:])
+                )
+            )
         else:
             link_delay = 0.0
         return compute_delay + link_delay + 0.2 * load_penalty
@@ -190,7 +196,7 @@ class FastGreedyScheduler:
             for path, score in partial_paths:
                 prev_node = request.home_node if not path else path[-1]
                 for node_id in candidates:
-                    if prev_node != node_id and not env.scenario.adjacency[prev_node, node_id]:
+                    if env.shortest_path(prev_node, node_id) is None:
                         continue
                     next_paths.append(
                         (

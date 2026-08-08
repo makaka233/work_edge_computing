@@ -97,24 +97,46 @@ edge nodes because duplicate placement on the same node is masked. Continuous
 compute and bandwidth allocation remains outside the neural policy and is solved
 by the KKT module.
 
-Slow deployment is trained as one composite action per 10-minute window. Count and
-placement actors share a window-level advantage and a dedicated window critic;
-the component choices are not treated as consecutive GAE steps. Fast PPO is
-optimized only against physical task latency. Both Slow actors use a topology-aware
+Slow deployment is trained from one 10-minute window at a time, but Count and
+Placement no longer receive one undifferentiated return for every component
+action. Placement receives service-stage mean/P95 latency and deadline return.
+Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
+and deadline violations penalize under-provisioning, while a continuous effective-
+replica measure based on request shares penalizes replicas that add little usable
+capacity. This avoids treating a replica as fully useful merely because it handled
+one request during a high-traffic window. Both PPO policies train their own value
+heads from these factorized Monte-Carlo targets. The separate window critic remains as a
+high-level diagnostic. Fast PPO receives an additive stage-local latency reward
+plus the exact KKT difference reward for compute/link congestion imposed on other
+requests. Requests are inferred in microbatches (default 16); after each
+microbatch a virtual workload ledger reserves the selected-node work so later
+requests do not see stale batch load. Both Slow actors use a topology-aware
 graph-attention encoder; the placement head scores nodes and the count head scores
 replica-count actions. The Slow state includes node/link capacity and load plus
 the previous window's mean latency, P95 latency, penalty latency, and deadline
-feedback. The slow window return combines mean and P95 latency according to
-`--slow-tail-latency-coef` (default 0.35) with deployment memory/storage costs.
+feedback. The global slow window diagnostic combines mean and P95 latency according
+to `--slow-tail-latency-coef` (default 0.35) with deployment, idle-replica, deadline,
+and migration costs.
 Migration changes remain logged, but `--slow-migration-coef` defaults to zero for
 the current convergence experiments.
-Fast and Slow PPO have independent optimizer schedules. By default,
-`--fast-windows-per-update 1` updates Fast PPO after every ten-minute rollout,
-while `--slow-windows-per-update 12` keeps the Slow PPO policy fixed until twelve
-complete window returns have accumulated. The log fields `slow_updated`,
-`slow_windows_available`, and `slow_windows_buffered` make this cadence explicit.
+Fast and Slow PPO use alternating frozen-controller phases by default. Four Slow
+warm-up updates first collect 32 windows each with Fast frozen. Afterwards, three
+Fast updates collect stochastic Fast actions under deterministic Slow deployment;
+the next Slow update freezes Fast deterministically and collects 32 independent
+window returns. Because replica count is ordinal, deterministic Slow deployment
+uses the ceiling of the Count distribution's expected replica count instead of an
+unstable categorical argmax; use `--slow-deterministic-count-mode mode` only for an
+explicit mode ablation. This prevents one Slow PPO batch from mixing returns
+produced by several different Fast policies. Configure the cadence with
+`--slow-warmup-updates`, `--fast-updates-per-cycle`,
+`--fast-windows-per-update`, and `--slow-windows-per-update`; use
+`--joint-training-schedule simultaneous` only for legacy ablations. The log field
+`training_phase` records which policy was active.
 For a synchronized training block, use `--synchronized-window-block 4`; this
-sets both PPO update periods to four windows. With `--demand-sampling-mode episode`
+sets both PPO update periods to four windows and selects simultaneous mode. Four windows are useful for a quick
+smoke run, but are usually too few for Slow PPO when four load multipliers are
+cycled because each pressure level contributes only one sample. Prefer independent
+alternating collection with at least 32 Slow windows for convergence runs. With `--demand-sampling-mode episode`
 and multiple `--load-multipliers`, the fixed user distribution is retained while
 each window in the block receives the next load multiplier, for example
 `0.8,1.1,1.4,1.7`.
@@ -130,6 +152,10 @@ and `temporal_sampling_fraction`.
 `--service-resource-fraction` fixes the share of each physical
 node's memory/storage available to this controller, representing system and
 co-tenant reservations without imposing a per-service replica-count cap.
+The physical metro graph is a connected symmetric k-nearest-neighbor topology
+(`--topology-k-nearest 6` by default). Transfers use cached multi-hop routes and
+consume bandwidth plus propagation delay on every physical edge, rather than
+treating all edge nodes as directly connected.
 
 When `--fixed-scenario` is omitted, demand-side variation can be sampled in two
 ways while the physical edge network remains fixed by `--physical-seed`.

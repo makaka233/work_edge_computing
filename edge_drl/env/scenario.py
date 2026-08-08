@@ -78,6 +78,8 @@ def generate_realistic_scenario(
     max_service_stages: int,
     node_compute_capacity_scale: float = 1.0,
     wired_link_bandwidth_scale: float = 1.0,
+    topology_k_nearest: int = 6,
+    deadline_scale: float = 1.0,
 ) -> EdgeScenario:
     """Generate a city-scale MEC scenario with realistic heterogeneity.
 
@@ -90,6 +92,10 @@ def generate_realistic_scenario(
         raise ValueError("num_users must be in [10000, 15000].")
     if max_service_stages > 3:
         raise ValueError("max_service_stages must be <= 3.")
+    if not 1 <= topology_k_nearest < num_edge_nodes:
+        raise ValueError("topology_k_nearest must be in [1, num_edge_nodes).")
+    if deadline_scale <= 0.0:
+        raise ValueError("deadline_scale must be positive.")
 
     city_width_km = 36.0
     city_height_km = 28.0
@@ -140,6 +146,7 @@ def generate_realistic_scenario(
         rng=rng,
         num_service_types=num_service_types,
         max_service_stages=max_service_stages,
+        deadline_scale=deadline_scale,
     )
 
     base_service_popularity = demand_rng.dirichlet(np.linspace(2.2, 0.8, num_service_types))
@@ -159,7 +166,7 @@ def generate_realistic_scenario(
         )
 
     node_dist = _pairwise_distance(node_xy, node_xy)
-    adjacency = np.ones((num_edge_nodes, num_edge_nodes), dtype=bool)
+    adjacency = _build_sparse_metro_adjacency(node_dist, topology_k_nearest)
 
     bandwidth = np.zeros((num_edge_nodes, num_edge_nodes), dtype=np.float64)
     propagation = np.full((num_edge_nodes, num_edge_nodes), np.inf, dtype=np.float64)
@@ -167,6 +174,8 @@ def generate_realistic_scenario(
     np.fill_diagonal(propagation, 0.0)
     for i in range(num_edge_nodes):
         for j in range(i + 1, num_edge_nodes):
+            if not adjacency[i, j]:
+                continue
             distance = max(node_dist[i, j], 0.2)
             link_class = rng.choice(["bottleneck", "metro", "backbone"], p=[0.18, 0.62, 0.20])
             if link_class == "bottleneck":
@@ -190,6 +199,56 @@ def generate_realistic_scenario(
         bandwidth_mb_s=bandwidth,
         propagation_ms=propagation,
     )
+
+
+def _build_sparse_metro_adjacency(node_dist: np.ndarray, k_nearest: int) -> np.ndarray:
+    """Build a connected sparse metro graph from geographic neighbors.
+
+    Direct stage transfers are allowed only on physical edges, so the graph is
+    explicitly connected after symmetric k-nearest-neighbor construction.  The
+    repair adds the shortest bridge between disconnected components and keeps
+    the topology sparse instead of silently reverting to a complete graph.
+    """
+
+    num_nodes = int(node_dist.shape[0])
+    adjacency = np.eye(num_nodes, dtype=bool)
+    for node_id in range(num_nodes):
+        nearest = np.argsort(node_dist[node_id])[1 : k_nearest + 1]
+        adjacency[node_id, nearest] = True
+        adjacency[nearest, node_id] = True
+
+    while True:
+        components: list[list[int]] = []
+        unseen = set(range(num_nodes))
+        while unseen:
+            root = unseen.pop()
+            stack = [root]
+            component = [root]
+            while stack:
+                current = stack.pop()
+                neighbors = set(np.flatnonzero(adjacency[current]).tolist()) & unseen
+                unseen.difference_update(neighbors)
+                stack.extend(neighbors)
+                component.extend(neighbors)
+            components.append(component)
+        if len(components) == 1:
+            break
+
+        base = np.asarray(components[0], dtype=np.int64)
+        best: tuple[float, int, int] | None = None
+        for other_component in components[1:]:
+            other = np.asarray(other_component, dtype=np.int64)
+            distances = node_dist[np.ix_(base, other)]
+            flat_idx = int(np.argmin(distances))
+            base_idx, other_idx = np.unravel_index(flat_idx, distances.shape)
+            candidate = (float(distances[base_idx, other_idx]), int(base[base_idx]), int(other[other_idx]))
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+        assert best is not None
+        _, src, dst = best
+        adjacency[src, dst] = True
+        adjacency[dst, src] = True
+    return adjacency
 
 
 def generate_request(
@@ -299,6 +358,7 @@ def _generate_services(
     rng: np.random.Generator,
     num_service_types: int,
     max_service_stages: int,
+    deadline_scale: float = 1.0,
 ) -> list[Service]:
     services: list[Service] = []
     profiles = [
@@ -394,7 +454,7 @@ def _generate_services(
                 name=str(profile["name"]),
                 stages=tuple(stages),
                 input_mb_mean=float(profile["input_mb"] * rng.uniform(0.85, 1.15)),
-                deadline_s_mean=float(profile["deadline_s"] * rng.uniform(0.90, 1.10)),
+                deadline_s_mean=float(profile["deadline_s"] * deadline_scale * rng.uniform(0.90, 1.10)),
             )
         )
     return services

@@ -32,11 +32,12 @@ def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
 
     assert args.active_user_ratio == 0.20
     assert args.active_user_request_rate_per_minute == 1.75
-    assert args.task_compute_scale == 1.5
-    assert args.task_data_scale == 2.0
-    assert args.node_compute_capacity_scale == 0.65
-    assert args.wired_link_bandwidth_scale == 0.35
-    assert args.service_resource_fraction == 0.45
+    assert args.task_compute_scale == 1.35
+    assert args.task_data_scale == 2.5
+    assert args.node_compute_capacity_scale == 0.75
+    assert args.wired_link_bandwidth_scale == 0.25
+    assert args.service_resource_fraction == 0.35
+    assert args.deadline_scale == 2.5
     assert args.load_multipliers == "0.8,1.1,1.4,1.7"
 
 
@@ -60,7 +61,7 @@ def test_pressure_profile_does_not_override_explicit_scale():
     )
 
     assert args.task_compute_scale == 3.0
-    assert args.task_data_scale == 2.0
+    assert args.task_data_scale == 2.5
 
 
 def test_scenario_refresh_groups_training_episodes():
@@ -301,6 +302,8 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "2",
+        "--slow-warmup-updates",
+        "0",
         "--rollout-unit",
         "window",
         "--mean-requests-per-minute",
@@ -357,6 +360,8 @@ def test_window_rollout_demand_sampling_resets_each_update(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "2",
+        "--slow-warmup-updates",
+        "0",
         "--rollout-unit",
         "window",
         "--demand-sampling-mode",
@@ -403,6 +408,8 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "1",
+        "--slow-warmup-updates",
+        "0",
         "--rollout-unit",
         "window",
         "--demand-sampling-mode",
@@ -428,7 +435,7 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "fast_windows_per_update=2" in result.stdout
-    assert "slow_windows_per_update=12" in result.stdout
+    assert "slow_windows_per_update=32" in result.stdout
     assert "episode_horizon=4h deployment_windows=24" in result.stdout
     assert "arrival_profile=stationary" in result.stdout
     assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=0 window=01" in result.stdout
@@ -551,6 +558,8 @@ def test_training_samples_window_but_eval_runs_full_window(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "1",
+        "--slow-warmup-updates",
+        "0",
         "--rollout-unit",
         "window",
         "--deployment-interval-minutes",
@@ -606,6 +615,8 @@ def test_fast_and_slow_ppo_use_independent_window_update_periods(tmp_path):
         "1",
         "--slow-windows-per-update",
         "2",
+        "--joint-training-schedule",
+        "simultaneous",
         "--episode-hours",
         "1",
         "--deployment-interval-minutes",
@@ -635,6 +646,111 @@ def test_fast_and_slow_ppo_use_independent_window_update_periods(tmp_path):
     assert [row["slow_windows_available"] for row in rows] == ["1", "2", "1"]
     assert [row["slow_windows_buffered"] for row in rows] == ["1", "0", "1"]
     assert [row["slow_window_count"] for row in rows] == ["0.0", "2.0", "0.0"]
+
+
+def test_alternating_schedule_freezes_one_controller_per_phase(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "3",
+        "--rollout-unit",
+        "window",
+        "--fast-windows-per-update",
+        "1",
+        "--slow-windows-per-update",
+        "2",
+        "--joint-training-schedule",
+        "alternating",
+        "--fast-updates-per-cycle",
+        "2",
+        "--slow-warmup-updates",
+        "0",
+        "--episode-hours",
+        "1",
+        "--deployment-interval-minutes",
+        "1",
+        "--sampled-seconds-per-window",
+        "5",
+        "--mean-requests-per-minute",
+        "60",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["training_phase"] for row in rows] == ["fast", "fast", "slow"]
+    assert float(rows[0]["fast_loss"]) != 0.0
+    assert float(rows[1]["fast_loss"]) != 0.0
+    assert float(rows[2]["fast_loss"]) == 0.0
+    assert [row["slow_updated"] for row in rows] == ["0", "0", "1"]
+    assert float(rows[2]["slow_count_return_std"]) > 0.0
+
+
+def test_alternating_schedule_runs_slow_warmup_before_fast_updates(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "3",
+        "--rollout-unit",
+        "window",
+        "--fast-windows-per-update",
+        "1",
+        "--slow-windows-per-update",
+        "1",
+        "--joint-training-schedule",
+        "alternating",
+        "--fast-updates-per-cycle",
+        "2",
+        "--slow-warmup-updates",
+        "2",
+        "--episode-hours",
+        "1",
+        "--deployment-interval-minutes",
+        "1",
+        "--sampled-seconds-per-window",
+        "1",
+        "--mean-requests-per-minute",
+        "60",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "8",
+        "--num-service-types",
+        "2",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["training_phase"] for row in rows] == ["slow_warmup", "slow_warmup", "fast"]
+    assert [row["slow_updated"] for row in rows] == ["1", "1", "0"]
+    assert [float(row["fast_loss"]) == 0.0 for row in rows] == [True, True, False]
+    assert "slow_count_effective_replicas_per_stage" in rows[0]
+    assert "slow_count_redundant_replica_fraction" in rows[0]
 
 
 def test_convergence_analyzer_reads_training_log(tmp_path):

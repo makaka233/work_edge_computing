@@ -29,11 +29,12 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
         "active_user_request_rate_per_minute": 1.75,
         "traffic_scale": 1.0,
         "load_multipliers": "0.8,1.1,1.4,1.7",
-        "task_compute_scale": 1.5,
-        "task_data_scale": 2.0,
-        "node_compute_capacity_scale": 0.65,
-        "wired_link_bandwidth_scale": 0.35,
-        "service_resource_fraction": 0.45,
+        "task_compute_scale": 1.35,
+        "task_data_scale": 2.5,
+        "node_compute_capacity_scale": 0.75,
+        "wired_link_bandwidth_scale": 0.25,
+        "service_resource_fraction": 0.35,
+        "deadline_scale": 2.5,
     },
     # Validate moderate pressure first; this profile is a bounded stress case
     # rather than a saturation-first experiment.
@@ -47,6 +48,7 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
         "node_compute_capacity_scale": 0.45,
         "wired_link_bandwidth_scale": 0.15,
         "service_resource_fraction": 0.35,
+        "deadline_scale": 3.0,
     },
 }
 
@@ -82,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scenario-refresh-episodes",
         type=int,
-        default=1,
+        default=4,
         help="Without --fixed-scenario, reuse one scenario instance for this many training episodes.",
     )
     parser.add_argument(
@@ -161,6 +163,18 @@ def parse_args() -> argparse.Namespace:
         help="Scale fixed wired-link bandwidths for this run. Values below 1.0 create stronger link bottlenecks.",
     )
     parser.add_argument(
+        "--topology-k-nearest",
+        type=int,
+        default=6,
+        help="Connect each edge node to this many geographic neighbors, then repair connectivity.",
+    )
+    parser.add_argument(
+        "--deadline-scale",
+        type=float,
+        default=1.0,
+        help="Scale service deadlines without changing task compute or data demand.",
+    )
+    parser.add_argument(
         "--service-resource-fraction",
         type=float,
         default=0.5,
@@ -234,6 +248,18 @@ def parse_args() -> argparse.Namespace:
         help="Penalty in seconds-equivalent for cross-node transitions between adjacent stages in the Slow return.",
     )
     parser.add_argument("--fast-entropy-coef", type=float, default=0.0)
+    parser.add_argument(
+        "--fast-congestion-credit-coef",
+        type=float,
+        default=1.0,
+        help="Weight of exact KKT marginal congestion externality in each Fast stage reward.",
+    )
+    parser.add_argument(
+        "--fast-reservation-microbatch-size",
+        type=int,
+        default=16,
+        help="Requests per Fast inference microbatch before virtual compute reservations are updated.",
+    )
     parser.add_argument("--slow-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
     parser.add_argument("--slow-critic-k-epochs", type=int, default=4)
@@ -244,6 +270,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Slow-return migration penalty. Disabled by default; deployment changes remain logged.",
+    )
+    parser.add_argument("--slow-idle-replica-coef", type=float, default=0.25)
+    parser.add_argument("--slow-count-shortage-coef", type=float, default=0.25)
+    parser.add_argument(
+        "--slow-count-latency-coef",
+        type=float,
+        default=1.0,
+        help="Dense stage tail-latency weight in the Slow Count return.",
+    )
+    parser.add_argument("--slow-deadline-violation-coef", type=float, default=0.10)
+    parser.add_argument(
+        "--slow-deterministic-count-mode",
+        choices=["expected", "mode"],
+        default="expected",
+        help="Decode ordered Count actions by conservative posterior mean or categorical mode.",
     )
     parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-target-kl", type=float, default=0.03)
@@ -264,8 +305,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--slow-windows-per-update",
         type=int,
-        default=12,
+        default=32,
         help="Accumulate this many completed deployment windows before each Slow PPO update.",
+    )
+    parser.add_argument(
+        "--joint-training-schedule",
+        choices=["alternating", "simultaneous"],
+        default="alternating",
+        help="Alternate frozen Fast/Slow collection phases or retain legacy simultaneous updates.",
+    )
+    parser.add_argument(
+        "--fast-updates-per-cycle",
+        type=int,
+        default=3,
+        help="Number of Fast-only updates before one frozen-Fast Slow update in alternating mode.",
+    )
+    parser.add_argument(
+        "--slow-warmup-updates",
+        type=int,
+        default=4,
+        help="Number of frozen-Fast Slow updates collected before alternating joint training starts.",
     )
     parser.add_argument(
         "--synchronized-window-block",
@@ -314,6 +373,7 @@ def parse_args() -> argparse.Namespace:
     if args.synchronized_window_block > 0:
         args.fast_windows_per_update = args.synchronized_window_block
         args.slow_windows_per_update = args.synchronized_window_block
+        args.joint_training_schedule = "simultaneous"
     if args.fast_windows_per_update < 1:
         parser.error("--fast-windows-per-update must be >= 1")
     if args.slow_windows_per_update < 1:
@@ -324,6 +384,27 @@ def parse_args() -> argparse.Namespace:
         parser.error("--replicas-per-stage must be >= 0")
     if not 0.0 < args.service_resource_fraction <= 1.0:
         parser.error("--service-resource-fraction must be in (0, 1]")
+    if not 1 <= args.topology_k_nearest < args.num_edge_nodes:
+        parser.error("--topology-k-nearest must be in [1, num-edge-nodes)")
+    if args.deadline_scale <= 0.0:
+        parser.error("--deadline-scale must be positive")
+    if args.fast_congestion_credit_coef < 0.0:
+        parser.error("--fast-congestion-credit-coef must be >= 0")
+    if args.fast_reservation_microbatch_size < 1:
+        parser.error("--fast-reservation-microbatch-size must be >= 1")
+    if (
+        args.slow_idle_replica_coef < 0.0
+        or args.slow_count_shortage_coef < 0.0
+        or args.slow_count_latency_coef < 0.0
+        or args.slow_deadline_violation_coef < 0.0
+    ):
+        parser.error("Slow shaping coefficients must be >= 0")
+    if args.fast_updates_per_cycle < 1:
+        parser.error("--fast-updates-per-cycle must be >= 1")
+    if args.slow_warmup_updates < 0:
+        parser.error("--slow-warmup-updates must be >= 0")
+    if args.joint_training_schedule == "alternating" and args.rollout_unit != "window":
+        args.joint_training_schedule = "simultaneous"
     if args.slow_critic_k_epochs < 1:
         parser.error("--slow-critic-k-epochs must be >= 1")
     if not 0.0 <= args.slow_tail_latency_coef <= 1.0:
@@ -435,6 +516,8 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             task_data_scale=args.task_data_scale,
             node_compute_capacity_scale=args.node_compute_capacity_scale,
             wired_link_bandwidth_scale=args.wired_link_bandwidth_scale,
+            topology_k_nearest=args.topology_k_nearest,
+            deadline_scale=args.deadline_scale,
             service_resource_fraction=args.service_resource_fraction,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
@@ -466,6 +549,8 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             task_data_scale=args.task_data_scale,
             node_compute_capacity_scale=args.node_compute_capacity_scale,
             wired_link_bandwidth_scale=args.wired_link_bandwidth_scale,
+            topology_k_nearest=args.topology_k_nearest,
+            deadline_scale=args.deadline_scale,
             service_resource_fraction=args.service_resource_fraction,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
@@ -718,6 +803,10 @@ def rollout(
     args: argparse.Namespace | None = None,
     deterministic: bool = False,
     record: bool = True,
+    record_fast: bool | None = None,
+    record_slow: bool | None = None,
+    deterministic_fast: bool | None = None,
+    deterministic_slow: bool | None = None,
     reward_scale: float = 1.0,
     train_mode: str = "joint",
     frozen_slow_policy: SlowGreedyDeploymentPolicy | None = None,
@@ -737,7 +826,12 @@ def rollout(
             compute_imbalance_coef=0.0,
             link_imbalance_coef=0.0,
             idle_deployed_node_coef=0.0,
+            fast_congestion_credit_coef=1.0,
         )
+    record_fast = record if record_fast is None else bool(record_fast)
+    record_slow = record if record_slow is None else bool(record_slow)
+    deterministic_fast = deterministic if deterministic_fast is None else bool(deterministic_fast)
+    deterministic_slow = deterministic if deterministic_slow is None else bool(deterministic_slow)
     if reset_env:
         env.reset()
     if record:
@@ -754,6 +848,7 @@ def rollout(
     compute_imbalance_penalties: list[float] = []
     link_imbalance_penalties: list[float] = []
     idle_deployed_node_penalties: list[float] = []
+    fast_externality_costs: list[float] = []
     latencies: list[float] = []
     compute_latencies: list[float] = []
     link_latencies: list[float] = []
@@ -820,11 +915,17 @@ def rollout(
             actions = agent.fast_agent.schedule_batch(
                 env,
                 requests,
-                deterministic=deterministic,
-                record=record,
+                deterministic=deterministic_fast,
+                record=record_fast,
             )
         else:
-            actions = agent.act_batch(env, deterministic=deterministic, record=record)
+            agent.maybe_update_deployment(env, deterministic=deterministic_slow, record=record_slow)
+            actions = agent.fast_agent.schedule_batch(
+                env,
+                requests,
+                deterministic=deterministic_fast,
+                record=record_fast,
+            )
         deployment_window = int(env.metrics["deployment_updates"])
         _, _, done, batch_info = env.step(actions, represented_seconds=step_represented_seconds)
         group_infos = batch_info["group_infos"]
@@ -832,6 +933,13 @@ def rollout(
             request_count = float(info.get("request_count", request.request_count))
             train_reward_info = _training_reward_components(info, env, args)
             train_reward = train_reward_info["train_reward"]
+            stage_latency_costs = _stage_latency_costs(info, env, request)
+            stage_externality_costs = _stage_congestion_externality_costs(info, env, request)
+            fast_externality_costs.append(float(sum(stage_externality_costs)))
+            fast_stage_rewards = [
+                -float(latency_cost + args.fast_congestion_credit_coef * externality_cost) * reward_scale
+                for latency_cost, externality_cost in zip(stage_latency_costs, stage_externality_costs)
+            ]
             stage_transitions = float(max(len(info["stage_nodes"]) - 1, 0) * request_count)
             cross_stage_transitions = float(
                 sum(
@@ -840,12 +948,13 @@ def rollout(
                 )
                 * request_count
             )
-            if record:
+            if record_fast or record_slow:
                 agent.observe_step_reward(
                     train_reward * reward_scale,
                     stage_count=len(request.stage_compute_gcycles),
                     done=bool(done and group_idx == len(group_infos) - 1),
                     weight=request_count,
+                    fast_stage_rewards=fast_stage_rewards,
                     slow_reward=-float(info["latency_s"]) * reward_scale,
                     latency_s=float(info["latency_s"]),
                     penalty_latency_s=float(info["penalty_latency_s"]),
@@ -857,6 +966,12 @@ def rollout(
                     else 0.0,
                     cross_stage_transitions=cross_stage_transitions,
                     stage_transitions=stage_transitions,
+                    service_id=int(request.service_id),
+                    stage_nodes=[int(node_id) for node_id in info["stage_nodes"]],
+                    slow_stage_costs=stage_latency_costs,
+                    env=env,
+                    record_fast=record_fast,
+                    record_slow=record_slow,
                 )
             rewards.append(float(info["reward"]))
             train_rewards.append(float(train_reward))
@@ -893,8 +1008,8 @@ def rollout(
                         cross_node_stage_transitions += request_count
             weights.append(request_count)
             window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
-        if record and done and not group_infos:
-            agent.flush_slow_window_reward(done=True)
+        if record_slow and done and not group_infos:
+            agent.flush_slow_window_reward(done=True, env=env)
         if progress.should_print():
             progress.maybe_print(
                 env,
@@ -912,8 +1027,8 @@ def rollout(
         avg_valid_latency_s=_weighted_mean(valid_latencies, valid_weights),
         avg_penalty_latency_s=_weighted_mean(penalty_latencies, weights),
     )
-    if record and (env.done or env.needs_deployment_update):
-        agent.flush_slow_window_reward(done=env.done)
+    if record_slow and (env.done or env.needs_deployment_update):
+        agent.flush_slow_window_reward(done=env.done, env=env)
     slow_window_metrics = {
         "slow_window_return": float("nan"),
         "slow_window_latency_return": float("nan"),
@@ -926,6 +1041,13 @@ def rollout(
         "slow_deployment_memory_cost": float("nan"),
         "slow_deployment_storage_cost": float("nan"),
         "slow_migration_cost": float("nan"),
+        "slow_deadline_violation_cost": float("nan"),
+        "slow_factorized_stage_return_mean": float("nan"),
+        "slow_factorized_stage_return_std": float("nan"),
+        "slow_factorized_count_return_mean": float("nan"),
+        "slow_factorized_count_return_std": float("nan"),
+        "slow_count_effective_replicas_per_stage": float("nan"),
+        "slow_count_redundant_replica_fraction": float("nan"),
         "slow_deployment_memory_fraction": float("nan"),
         "slow_deployment_storage_fraction": float("nan"),
         "slow_migration_fraction": float("nan"),
@@ -961,6 +1083,7 @@ def rollout(
         "avg_reward": _weighted_mean(rewards, weights),
         "avg_train_reward": _weighted_mean(train_rewards, weights),
         "avg_train_latency_cost_s": _weighted_mean(train_latency_costs, weights),
+        "avg_fast_externality_cost_s": _weighted_mean(fast_externality_costs, weights),
         "avg_train_resource_penalty": _weighted_mean(train_resource_penalties, weights),
         "avg_diagnostic_resource_penalty": _weighted_mean(diagnostic_resource_penalties, weights),
         "avg_compute_hotspot_penalty": _weighted_mean(compute_hotspot_penalties, weights),
@@ -1235,6 +1358,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "avg_reward",
         "avg_train_reward",
         "avg_train_latency_cost_s",
+        "avg_fast_externality_cost_s",
         "avg_train_resource_penalty",
         "avg_diagnostic_resource_penalty",
         "avg_compute_hotspot_penalty",
@@ -1308,6 +1432,13 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_deployment_memory_cost",
         "slow_deployment_storage_cost",
         "slow_migration_cost",
+        "slow_deadline_violation_cost",
+        "slow_factorized_stage_return_mean",
+        "slow_factorized_stage_return_std",
+        "slow_factorized_count_return_mean",
+        "slow_factorized_count_return_std",
+        "slow_count_effective_replicas_per_stage",
+        "slow_count_redundant_replica_fraction",
         "slow_deployment_memory_fraction",
         "slow_deployment_storage_fraction",
         "slow_migration_fraction",
@@ -1409,6 +1540,77 @@ def _training_reward_components(
         "diagnostic_resource_penalty": resource_penalty,
         **components,
     }
+
+
+def _stage_latency_costs(
+    policy_info: dict[str, object],
+    env: EdgeComputingEnv,
+    request,
+) -> list[float]:
+    """Decompose one request's end-to-end latency into additive stage costs.
+
+    Each stage owns its compute delay and the communication needed to reach
+    that stage.  Radio access belongs to stage zero and any invalid-action
+    penalty belongs to the terminal stage.  The resulting costs sum exactly to
+    ``latency_s``, allowing Fast PPO to use proper per-stage credit instead of
+    repeating the full request latency at every stage.
+    """
+
+    assert env.scenario is not None
+    stage_nodes = [int(node_id) for node_id in policy_info["stage_nodes"]]
+    compute_delays = policy_info["compute_delays"]
+    link_delays = policy_info["link_delays"]
+    propagation_delays = policy_info.get("logical_propagation_delays", {})
+    costs: list[float] = []
+    for stage_id, node_id in enumerate(stage_nodes):
+        cost = float(compute_delays.get(f"stage-{stage_id}", 0.0))
+        if stage_id == 0:
+            cost += float(policy_info["access_delay_s"])
+            previous_node = int(request.home_node)
+            link_key = "ingress"
+        else:
+            previous_node = stage_nodes[stage_id - 1]
+            link_key = f"stage-{stage_id - 1}"
+        if previous_node != node_id:
+            cost += float(link_delays.get(link_key, 0.0))
+            cost += float(propagation_delays.get(link_key, 0.0))
+        costs.append(cost)
+
+    if not costs:
+        return []
+    costs[-1] += float(policy_info["penalty_latency_s"])
+    # Keep the decomposition robust to future latency components and floating
+    # point drift by assigning any residual to the terminal transition.
+    costs[-1] += float(policy_info["latency_s"]) - float(sum(costs))
+    return costs
+
+
+def _stage_congestion_externality_costs(
+    policy_info: dict[str, object],
+    env: EdgeComputingEnv,
+    request,
+) -> list[float]:
+    """Assign exact KKT difference-reward externalities to Fast stages.
+
+    A stage owns the compute congestion it creates at its selected node and the
+    wired-link congestion created while reaching that stage.  These terms are
+    zero for isolated resources and positive only when another request shares
+    the same constrained resource.
+    """
+
+    del env
+    stage_nodes = [int(node_id) for node_id in policy_info["stage_nodes"]]
+    compute_externalities = policy_info.get("compute_externality_delays", {})
+    link_externalities = policy_info.get("link_externality_delays", {})
+    costs: list[float] = []
+    for stage_id, node_id in enumerate(stage_nodes):
+        cost = float(compute_externalities.get(f"stage-{stage_id}", 0.0))
+        previous_node = int(request.home_node) if stage_id == 0 else stage_nodes[stage_id - 1]
+        link_key = "ingress" if stage_id == 0 else f"stage-{stage_id - 1}"
+        if previous_node != node_id:
+            cost += float(link_externalities.get(link_key, 0.0))
+        costs.append(cost)
+    return costs
 
 
 def _training_reward(
@@ -1856,7 +2058,7 @@ def load_checkpoint(agent: HierarchicalPPOAgent, path: Path) -> dict[str, object
     return checkpoint.get("metadata", {})
 
 
-def append_log(path: Path, row: dict[str, float | int]) -> None:
+def append_log(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as handle:
@@ -1866,7 +2068,7 @@ def append_log(path: Path, row: dict[str, float | int]) -> None:
         writer.writerow(row)
 
 
-def write_single_row_csv(path: Path, row: dict[str, float | int]) -> None:
+def write_single_row_csv(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
@@ -1935,12 +2137,18 @@ def main() -> None:
         slow_minibatch_size=args.slow_minibatch_size,
         fast_minibatch_size=args.fast_minibatch_size,
         fast_policy_kind=args.fast_policy_kind,
+        fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
         slow_reward_scale=args.reward_scale,
         slow_tail_latency_coef=args.slow_tail_latency_coef,
         slow_colocation_coef=args.slow_colocation_coef,
         slow_deployment_memory_coef=args.slow_deployment_memory_coef,
         slow_deployment_storage_coef=args.slow_deployment_storage_coef,
         slow_migration_coef=args.slow_migration_coef,
+        slow_idle_replica_coef=args.slow_idle_replica_coef,
+        slow_count_shortage_coef=args.slow_count_shortage_coef,
+        slow_count_latency_coef=args.slow_count_latency_coef,
+        slow_deadline_violation_coef=args.slow_deadline_violation_coef,
+        slow_deterministic_count_mode=args.slow_deterministic_count_mode,
     )
     loaded_metadata: dict[str, object] = {}
     if args.load_checkpoint:
@@ -1973,6 +2181,15 @@ def main() -> None:
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
     print(f"  fast_windows_per_update={args.fast_windows_per_update}")
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
+    print(
+        f"  joint_training_schedule={args.joint_training_schedule} "
+        f"fast_updates_per_cycle={args.fast_updates_per_cycle} slow_warmup_updates={args.slow_warmup_updates}"
+    )
+    print(
+        f"  fast_congestion_credit={args.fast_congestion_credit_coef} "
+        f"reservation_microbatch={args.fast_reservation_microbatch_size}"
+    )
+    print(f"  topology_k_nearest={args.topology_k_nearest} deadline_scale={args.deadline_scale}")
     print(f"  synchronized_window_block={args.synchronized_window_block or 'disabled'}")
     print(f"  slow_tail_latency_coef={args.slow_tail_latency_coef:.2f} (P95 weight)")
     print(f"  slow_colocation_coef={args.slow_colocation_coef:.3f} (cross-stage transition penalty)")
@@ -2024,7 +2241,10 @@ def main() -> None:
         )
     )
     print(
-        "  slow_window_cost memory_coef={} storage_coef={} migration_coef={} critic_lr={} critic_epochs={}".format(
+        "  slow_window_cost count_latency_coef={} redundancy_coef={} shortage_coef={} memory_coef={} storage_coef={} migration_coef={} critic_lr={} critic_epochs={}".format(
+            args.slow_count_latency_coef,
+            args.slow_idle_replica_coef,
+            args.slow_count_shortage_coef,
             args.slow_deployment_memory_coef,
             args.slow_deployment_storage_coef,
             args.slow_migration_coef,
@@ -2032,6 +2252,7 @@ def main() -> None:
             args.slow_critic_k_epochs,
         )
     )
+    print(f"  slow_deterministic_count_mode={args.slow_deterministic_count_mode}")
     print(
         "  ppo slow_lr={} fast_lr={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={} fast_entropy={} slow_value_coef={}".format(
             args.slow_lr,
@@ -2089,6 +2310,7 @@ def main() -> None:
         diagnostic_stats: dict[str, float] = {}
         initial_row = {
             "update": 0,
+            "training_phase": "eval",
             "episode": 0,
             "demand_seed": scenario_seed_for_offset(args, 0),
             "demand_seed_end": scenario_seed_for_offset(args, 0),
@@ -2109,6 +2331,7 @@ def main() -> None:
             "avg_reward": np.nan,
             "avg_train_reward": np.nan,
             "avg_train_latency_cost_s": np.nan,
+            "avg_fast_externality_cost_s": np.nan,
             "avg_train_resource_penalty": np.nan,
             "avg_diagnostic_resource_penalty": np.nan,
             "avg_compute_hotspot_penalty": np.nan,
@@ -2183,6 +2406,13 @@ def main() -> None:
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
+            "slow_deadline_violation_cost": np.nan,
+            "slow_factorized_stage_return_mean": np.nan,
+            "slow_factorized_stage_return_std": np.nan,
+            "slow_factorized_count_return_mean": np.nan,
+            "slow_factorized_count_return_std": np.nan,
+            "slow_count_effective_replicas_per_stage": np.nan,
+            "slow_count_redundant_replica_fraction": np.nan,
             "slow_deployment_memory_fraction": np.nan,
             "slow_deployment_storage_fraction": np.nan,
             "slow_migration_fraction": np.nan,
@@ -2196,13 +2426,26 @@ def main() -> None:
             "slow_window_count": 0.0,
             "slow_window_return_mean": np.nan,
             "slow_window_return_std": np.nan,
+            "slow_count_return_mean": np.nan,
+            "slow_count_return_std": np.nan,
+            "slow_placement_return_mean": np.nan,
+            "slow_placement_return_std": np.nan,
             "slow_advantage_mean": np.nan,
             "slow_advantage_std": np.nan,
+            "slow_window_advantage_mean": np.nan,
+            "slow_window_advantage_std": np.nan,
             "slow_critic_explained_variance": np.nan,
+            "slow_window_critic_explained_variance": np.nan,
             "slow_count_loss": 0.0,
+            "slow_count_value_loss": 0.0,
+            "slow_count_explained_variance": np.nan,
+            "slow_count_post_explained_variance": np.nan,
             "slow_count_entropy": 0.0,
             "slow_count_approx_kl": 0.0,
             "slow_placement_loss": 0.0,
+            "slow_placement_value_loss": 0.0,
+            "slow_placement_explained_variance": np.nan,
+            "slow_placement_post_explained_variance": np.nan,
             "slow_placement_entropy": 0.0,
             "slow_placement_approx_kl": 0.0,
             "fast_loss": 0.0,
@@ -2291,25 +2534,50 @@ def main() -> None:
 
     train_env: EdgeComputingEnv | None = None
     train_episode_idx = 0
+    training_rollout_idx = 0
     total_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
         1,
     )
     for update in range(args.updates):
+        alternating_joint = args.train_mode == "joint" and args.joint_training_schedule == "alternating"
+        slow_warmup_phase = alternating_joint and update < args.slow_warmup_updates
+        alternating_update = update - args.slow_warmup_updates
+        scheduled_slow_phase = (
+            alternating_joint
+            and alternating_update >= 0
+            and alternating_update % (args.fast_updates_per_cycle + 1) == args.fast_updates_per_cycle
+        )
+        slow_phase = slow_warmup_phase or scheduled_slow_phase
+        training_phase = (
+            "slow_warmup"
+            if slow_warmup_phase
+            else "slow"
+            if slow_phase
+            else "fast"
+            if alternating_joint
+            else "joint"
+        )
+        windows_this_update = args.slow_windows_per_update if slow_phase else args.fast_windows_per_update
+        record_fast_phase = not slow_phase
+        record_slow_phase = args.train_mode == "joint" and (slow_phase or not alternating_joint)
+        deterministic_fast_phase = bool(slow_phase)
+        deterministic_slow_phase = bool(alternating_joint and not slow_phase)
         rollout_stats: list[dict[str, float]] = []
         demand_seeds: list[int] = []
         load_multipliers: list[float] = []
         start_minutes: list[float] = []
         episode_numbers: list[int] = []
         window_numbers: list[int] = []
-        for rollout_in_update in range(args.fast_windows_per_update):
-            rollout_idx = update * args.fast_windows_per_update + rollout_in_update
+        for rollout_in_update in range(windows_this_update):
+            rollout_idx = training_rollout_idx
+            training_rollout_idx += 1
             start_minute = rollout_start_minute(args, rollout_idx)
             load_multiplier = load_multiplier_for_rollout(args, rollout_idx)
             batch_suffix = (
                 ""
-                if args.fast_windows_per_update <= 1
-                else f" rollout={rollout_in_update + 1:02d}/{args.fast_windows_per_update:02d}"
+                if windows_this_update <= 1
+                else f" rollout={rollout_in_update + 1:02d}/{windows_this_update:02d}"
             )
             if args.rollout_unit == "window":
                 if args.demand_sampling_mode == "rollout":
@@ -2353,6 +2621,10 @@ def main() -> None:
                     progress_interval_seconds=args.progress_interval_seconds,
                     rollout_unit=args.rollout_unit,
                     reset_env=False,
+                    record_fast=record_fast_phase,
+                    record_slow=record_slow_phase,
+                    deterministic_fast=deterministic_fast_phase,
+                    deterministic_slow=deterministic_slow_phase,
                 )
                 if args.rollout_unit == "window" and one_stats["episode_complete"]:
                     train_episode_idx += 1
@@ -2370,6 +2642,10 @@ def main() -> None:
                     progress_label=f"update={update + 1:03d}/{args.updates:03d}{batch_suffix}",
                     progress_interval_seconds=args.progress_interval_seconds,
                     rollout_unit=args.rollout_unit,
+                    record_fast=record_fast_phase,
+                    record_slow=record_slow_phase,
+                    deterministic_fast=deterministic_fast_phase,
+                    deterministic_slow=deterministic_slow_phase,
                 )
                 window_in_episode = int(one_stats["deployment_updates"])
             rollout_stats.append(one_stats)
@@ -2401,7 +2677,7 @@ def main() -> None:
             agent.slow_agent.placement_ppo.buffer.clear()
             agent.window_reward = 0.0
             agent.window_steps = 0
-        elif slow_windows_available >= args.slow_windows_per_update:
+        elif record_slow_phase and slow_windows_available >= args.slow_windows_per_update:
             slow_metrics = agent.update_slow(
                 progress_label=f"update={update + 1:03d}/{args.updates:03d} slow PPO",
                 progress_interval_seconds=args.progress_interval_seconds,
@@ -2426,6 +2702,7 @@ def main() -> None:
         diagnostic_stats = {}
         log_row = {
             "update": update + 1,
+            "training_phase": training_phase,
             "episode": episode_number,
             "demand_seed": demand_seed,
             "demand_seed_end": demand_seed_end,
@@ -2446,6 +2723,7 @@ def main() -> None:
             "avg_reward": stats["avg_reward"],
             "avg_train_reward": stats["avg_train_reward"],
             "avg_train_latency_cost_s": stats["avg_train_latency_cost_s"],
+            "avg_fast_externality_cost_s": stats["avg_fast_externality_cost_s"],
             "avg_train_resource_penalty": stats["avg_train_resource_penalty"],
             "avg_diagnostic_resource_penalty": stats["avg_diagnostic_resource_penalty"],
             "avg_compute_hotspot_penalty": stats["avg_compute_hotspot_penalty"],
@@ -2520,6 +2798,13 @@ def main() -> None:
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],
+            "slow_deadline_violation_cost": stats["slow_deadline_violation_cost"],
+            "slow_factorized_stage_return_mean": stats["slow_factorized_stage_return_mean"],
+            "slow_factorized_stage_return_std": stats["slow_factorized_stage_return_std"],
+            "slow_factorized_count_return_mean": stats["slow_factorized_count_return_mean"],
+            "slow_factorized_count_return_std": stats["slow_factorized_count_return_std"],
+            "slow_count_effective_replicas_per_stage": stats["slow_count_effective_replicas_per_stage"],
+            "slow_count_redundant_replica_fraction": stats["slow_count_redundant_replica_fraction"],
             "slow_deployment_memory_fraction": stats["slow_deployment_memory_fraction"],
             "slow_deployment_storage_fraction": stats["slow_deployment_storage_fraction"],
             "slow_migration_fraction": stats["slow_migration_fraction"],
@@ -2533,13 +2818,34 @@ def main() -> None:
             "slow_window_count": losses["slow"].get("window_count", 0.0),
             "slow_window_return_mean": losses["slow"].get("window_return_mean", np.nan),
             "slow_window_return_std": losses["slow"].get("window_return_std", np.nan),
+            "slow_count_return_mean": losses["slow"].get("count_return_mean", np.nan),
+            "slow_count_return_std": losses["slow"].get("count_return_std", np.nan),
+            "slow_placement_return_mean": losses["slow"].get("placement_return_mean", np.nan),
+            "slow_placement_return_std": losses["slow"].get("placement_return_std", np.nan),
             "slow_advantage_mean": losses["slow"].get("advantage_mean", np.nan),
             "slow_advantage_std": losses["slow"].get("advantage_std", np.nan),
+            "slow_window_advantage_mean": losses["slow"].get("window_advantage_mean", np.nan),
+            "slow_window_advantage_std": losses["slow"].get("window_advantage_std", np.nan),
             "slow_critic_explained_variance": losses["slow"].get("critic_explained_variance", np.nan),
+            "slow_window_critic_explained_variance": losses["slow"].get(
+                "window_critic_explained_variance", np.nan
+            ),
             "slow_count_loss": losses["slow"].get("count_loss", np.nan),
+            "slow_count_value_loss": losses["slow"].get("count_value_loss", np.nan),
+            "slow_count_explained_variance": losses["slow"].get("count_explained_variance", np.nan),
+            "slow_count_post_explained_variance": losses["slow"].get(
+                "count_post_explained_variance", np.nan
+            ),
             "slow_count_entropy": losses["slow"].get("count_entropy", np.nan),
             "slow_count_approx_kl": losses["slow"].get("count_approx_kl", np.nan),
             "slow_placement_loss": losses["slow"].get("placement_loss", np.nan),
+            "slow_placement_value_loss": losses["slow"].get("placement_value_loss", np.nan),
+            "slow_placement_explained_variance": losses["slow"].get(
+                "placement_explained_variance", np.nan
+            ),
+            "slow_placement_post_explained_variance": losses["slow"].get(
+                "placement_post_explained_variance", np.nan
+            ),
             "slow_placement_entropy": losses["slow"].get("placement_entropy", np.nan),
             "slow_placement_approx_kl": losses["slow"].get("placement_approx_kl", np.nan),
             "fast_loss": losses["fast"]["loss"],

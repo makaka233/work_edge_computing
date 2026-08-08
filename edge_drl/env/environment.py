@@ -9,6 +9,66 @@ from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_
 from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_realistic_scenario, generate_request
 
 
+def _compute_kkt_externality_delays(
+    demands: list[ComputeDemand],
+    capacities: np.ndarray,
+) -> dict[str, float]:
+    """Return each compute demand's per-request marginal delay externality.
+
+    Under the sqrt-allocation KKT solution, total weighted delay at a node is
+    ``S**2 / capacity`` with ``S=sum(m_i*sqrt(C_i))``.  Removing demand i gives
+    an exact difference reward.  Subtracting its own delay leaves the delay it
+    imposes on all other demands sharing that node.
+    """
+
+    by_node: dict[int, list[ComputeDemand]] = {}
+    externalities: dict[str, float] = {}
+    for demand in demands:
+        if demand.compute_gcycles <= 0.0:
+            externalities[demand.demand_id] = 0.0
+        else:
+            by_node.setdefault(demand.node_id, []).append(demand)
+    for node_id, node_demands in by_node.items():
+        capacity = max(float(capacities[node_id]), 1e-9)
+        weighted = np.asarray(
+            [d.multiplicity * np.sqrt(d.compute_gcycles) for d in node_demands],
+            dtype=np.float64,
+        )
+        total = float(weighted.sum())
+        for demand, own_weight in zip(node_demands, weighted):
+            externalities[demand.demand_id] = float(
+                np.sqrt(demand.compute_gcycles) * max(total - float(own_weight), 0.0) / capacity
+            )
+    return externalities
+
+
+def _link_kkt_externality_delays(
+    demands: list[LinkDemand],
+    capacities: np.ndarray,
+) -> dict[str, float]:
+    """Return the exact per-request marginal externality for each wired demand."""
+
+    by_link: dict[tuple[int, int], list[LinkDemand]] = {}
+    externalities: dict[str, float] = {}
+    for demand in demands:
+        if demand.src_node == demand.dst_node or demand.data_mb <= 0.0:
+            externalities[demand.demand_id] = 0.0
+        else:
+            by_link.setdefault((demand.src_node, demand.dst_node), []).append(demand)
+    for (src, dst), link_demands in by_link.items():
+        capacity = max(float(capacities[src, dst]), 1e-9)
+        weighted = np.asarray(
+            [d.multiplicity * np.sqrt(d.data_mb) for d in link_demands],
+            dtype=np.float64,
+        )
+        total = float(weighted.sum())
+        for demand, own_weight in zip(link_demands, weighted):
+            externalities[demand.demand_id] = float(
+                np.sqrt(demand.data_mb) * max(total - float(own_weight), 0.0) / capacity
+            )
+    return externalities
+
+
 def _daily_arrival_factor(minute_of_day: float) -> float:
     morning_peak = np.exp(-0.5 * ((minute_of_day - 9 * 60) / 105.0) ** 2)
     lunch_peak = np.exp(-0.5 * ((minute_of_day - 13 * 60) / 90.0) ** 2)
@@ -42,6 +102,8 @@ class EdgeEnvConfig:
     task_data_scale: float = 1.0
     node_compute_capacity_scale: float = 1.0
     wired_link_bandwidth_scale: float = 1.0
+    topology_k_nearest: int = 6
+    deadline_scale: float = 1.0
     service_resource_fraction: float = 0.5
     request_aggregation_window_seconds: float = 1.0
     load_ewma_tau_minutes: float = 1.0
@@ -80,6 +142,10 @@ class EdgeEnvConfig:
             raise ValueError("node_compute_capacity_scale must be positive.")
         if self.wired_link_bandwidth_scale <= 0:
             raise ValueError("wired_link_bandwidth_scale must be positive.")
+        if not 1 <= self.topology_k_nearest < self.num_edge_nodes:
+            raise ValueError("topology_k_nearest must be in [1, num_edge_nodes).")
+        if self.deadline_scale <= 0:
+            raise ValueError("deadline_scale must be positive.")
         if not 0.0 < self.service_resource_fraction <= 1.0:
             raise ValueError("service_resource_fraction must be in (0, 1].")
         if not np.isclose(self.request_aggregation_window_seconds, 1.0):
@@ -114,6 +180,7 @@ class EdgeComputingEnv:
         self.link_load = np.zeros((self.config.num_edge_nodes, self.config.num_edge_nodes), dtype=np.float64)
         self.last_load_update_minute = 0.0
         self.last_migration_cost = 0.0
+        self._route_cache: dict[tuple[int, int], tuple[int, ...] | None] = {}
         self.metrics: dict[str, float] = {}
 
     def reset(self) -> dict[str, Any]:
@@ -133,6 +200,8 @@ class EdgeComputingEnv:
             max_service_stages=self.config.max_service_stages,
             node_compute_capacity_scale=self.config.node_compute_capacity_scale,
             wired_link_bandwidth_scale=self.config.wired_link_bandwidth_scale,
+            topology_k_nearest=self.config.topology_k_nearest,
+            deadline_scale=self.config.deadline_scale,
         )
         self.deployment = np.zeros(
             (self.config.num_service_types, self.config.max_service_stages, self.config.num_edge_nodes),
@@ -146,6 +215,7 @@ class EdgeComputingEnv:
         self.link_load = np.zeros((self.config.num_edge_nodes, self.config.num_edge_nodes), dtype=np.float64)
         self.last_load_update_minute = 0.0
         self.last_migration_cost = 0.0
+        self._route_cache.clear()
         self.metrics = {
             "requests": 0.0,
             "request_events": 0.0,
@@ -407,11 +477,14 @@ class EdgeComputingEnv:
         link_capacity[finite] *= np.clip(1.0 - 0.75 * self.link_load[finite], 0.10, 1.0)
 
         _, joint_compute_delays, _ = allocate_compute_kkt(all_compute_demands, node_capacity)
+        joint_compute_externalities = _compute_kkt_externality_delays(all_compute_demands, node_capacity)
         link_allocation_failed = False
         try:
             _, joint_link_delays, _ = allocate_link_kkt(all_link_demands, link_capacity)
+            joint_link_externalities = _link_kkt_externality_delays(all_link_demands, link_capacity)
         except ValueError:
             joint_link_delays = {}
+            joint_link_externalities = {}
             link_allocation_failed = True
 
         infos: list[dict[str, Any]] = []
@@ -424,10 +497,24 @@ class EdgeComputingEnv:
                 demand.demand_id.split(":", 1)[1]: joint_compute_delays[demand.demand_id]
                 for demand in group["joint_compute_demands"]
             }
-            link_delays = {
-                demand.demand_id.split(":", 1)[1]: joint_link_delays.get(demand.demand_id, 0.0)
-                for demand in group["joint_link_demands"]
+            link_delays: dict[str, float] = {}
+            for demand in group["joint_link_demands"]:
+                hop_key = demand.demand_id.split(":", 1)[1]
+                logical_key = hop_key.split("#", 1)[0]
+                link_delays[logical_key] = link_delays.get(logical_key, 0.0) + joint_link_delays.get(
+                    demand.demand_id, 0.0
+                )
+            compute_externality_delays = {
+                demand.demand_id.split(":", 1)[1]: joint_compute_externalities[demand.demand_id]
+                for demand in group["joint_compute_demands"]
             }
+            link_externality_delays: dict[str, float] = {}
+            for demand in group["joint_link_demands"]:
+                hop_key = demand.demand_id.split(":", 1)[1]
+                logical_key = hop_key.split("#", 1)[0]
+                link_externality_delays[logical_key] = link_externality_delays.get(logical_key, 0.0) + (
+                    joint_link_externalities.get(demand.demand_id, 0.0)
+                )
             compute_delay = float(sum(compute_delays.values()))
             link_delay = float(sum(link_delays.values()))
             penalty_latency_s = 0.0 if valid else self.config.invalid_action_penalty
@@ -446,11 +533,14 @@ class EdgeComputingEnv:
                     "link_delay_s": link_delay,
                     "access_delay_s": float(group["access_delay_s"]),
                     "propagation_delay_s": float(group["propagation_delay_s"]),
+                    "logical_propagation_delays": group["logical_propagation_delays"],
                     "physical_latency_s": physical_latency_s,
                     "penalty_latency_s": penalty_latency_s,
                     "latency_s": physical_latency_s + penalty_latency_s,
                     "compute_delays": compute_delays,
                     "link_delays": link_delays,
+                    "compute_externality_delays": compute_externality_delays,
+                    "link_externality_delays": link_externality_delays,
                     "compute_demands": group["compute_demands"],
                     "link_demands": group["link_demands"],
                     "load_penalty": float(group["load_penalty"]),
@@ -493,22 +583,35 @@ class EdgeComputingEnv:
             for stage_id, node_id in enumerate(nodes)
         ]
         link_demands: list[LinkDemand] = []
+        logical_propagation_delays: dict[str, float] = {}
+
+        def add_routed_link(demand_id: str, src_node: int, dst_node: int, data_mb: float) -> None:
+            nonlocal valid
+            if src_node == dst_node:
+                logical_propagation_delays[demand_id] = 0.0
+                return
+            path = self.shortest_path(src_node, dst_node)
+            if path is None:
+                valid = False
+                violations.append(f"no route {src_node}->{dst_node}")
+                logical_propagation_delays[demand_id] = 0.0
+                return
+            propagation_s = 0.0
+            for hop_id, (hop_src, hop_dst) in enumerate(zip(path, path[1:])):
+                link_demands.append(LinkDemand(f"{demand_id}#h{hop_id}", hop_src, hop_dst, data_mb))
+                propagation_s += float(self.scenario.propagation_ms[hop_src, hop_dst]) / 1000.0
+            logical_propagation_delays[demand_id] = propagation_s
+
         if nodes and nodes[0] != request.home_node:
-            link_demands.append(LinkDemand("ingress", request.home_node, nodes[0], request.input_mb))
+            add_routed_link("ingress", request.home_node, nodes[0], request.input_mb)
         for stage_id in range(max(len(nodes) - 1, 0)):
             if nodes[stage_id] != nodes[stage_id + 1]:
-                link_demands.append(
-                    LinkDemand(
-                        f"stage-{stage_id}",
-                        nodes[stage_id],
-                        nodes[stage_id + 1],
-                        request.stage_output_mb[stage_id],
-                    )
+                add_routed_link(
+                    f"stage-{stage_id}",
+                    nodes[stage_id],
+                    nodes[stage_id + 1],
+                    request.stage_output_mb[stage_id],
                 )
-        for demand in link_demands:
-            if not self.scenario.adjacency[demand.src_node, demand.dst_node]:
-                valid = False
-                violations.append(f"link {demand.src_node}->{demand.dst_node} is unavailable")
 
         count = float(request.request_count)
         joint_compute_demands = [
@@ -529,23 +632,15 @@ class EdgeComputingEnv:
                 multiplicity=count,
             )
             for demand in link_demands
-            if self.scenario.adjacency[demand.src_node, demand.dst_node]
         ]
         access_delay = self.config.radio_rtt_ms / 1000.0
         access_delay += request.input_mb / max(self.config.wireless_uplink_mbps / 8.0, 1e-9)
-        propagation_delay = float(
-            sum(
-                self.scenario.propagation_ms[demand.src_node, demand.dst_node] / 1000.0
-                for demand in link_demands
-                if self.scenario.adjacency[demand.src_node, demand.dst_node]
-            )
-        )
+        propagation_delay = float(sum(logical_propagation_delays.values()))
         load_penalty = float(
             sum(self.node_compute_load[node_id] for node_id in nodes)
             + sum(
                 self.link_load[demand.src_node, demand.dst_node]
                 for demand in link_demands
-                if self.scenario.adjacency[demand.src_node, demand.dst_node]
             )
         )
         return {
@@ -558,8 +653,58 @@ class EdgeComputingEnv:
             "joint_link_demands": joint_link_demands,
             "access_delay_s": access_delay,
             "propagation_delay_s": propagation_delay,
+            "logical_propagation_delays": logical_propagation_delays,
             "load_penalty": load_penalty,
         }
+
+    def shortest_path(self, src_node: int, dst_node: int) -> tuple[int, ...] | None:
+        """Return a cached minimum static-cost route over physical metro links."""
+
+        self._require_ready()
+        assert self.scenario is not None
+        src_node = int(src_node)
+        dst_node = int(dst_node)
+        if src_node == dst_node:
+            return (src_node,)
+        cache_key = (src_node, dst_node)
+        if cache_key in self._route_cache:
+            return self._route_cache[cache_key]
+
+        num_nodes = self.config.num_edge_nodes
+        distances = np.full(num_nodes, np.inf, dtype=np.float64)
+        previous = np.full(num_nodes, -1, dtype=np.int64)
+        visited = np.zeros(num_nodes, dtype=bool)
+        distances[src_node] = 0.0
+        for _ in range(num_nodes):
+            candidates = np.where(visited, np.inf, distances)
+            current = int(np.argmin(candidates))
+            if not np.isfinite(candidates[current]):
+                break
+            if current == dst_node:
+                break
+            visited[current] = True
+            for neighbor in np.flatnonzero(self.scenario.adjacency[current]):
+                neighbor = int(neighbor)
+                if neighbor == current or visited[neighbor]:
+                    continue
+                bandwidth = float(self.scenario.bandwidth_mb_s[current, neighbor])
+                if not np.isfinite(bandwidth) or bandwidth <= 0.0:
+                    continue
+                edge_cost = float(self.scenario.propagation_ms[current, neighbor]) / 1000.0 + 0.1 / bandwidth
+                candidate = distances[current] + edge_cost
+                if candidate < distances[neighbor]:
+                    distances[neighbor] = candidate
+                    previous[neighbor] = current
+        if not np.isfinite(distances[dst_node]):
+            self._route_cache[cache_key] = None
+            return None
+        route = [dst_node]
+        while route[-1] != src_node:
+            route.append(int(previous[route[-1]]))
+        path = tuple(reversed(route))
+        self._route_cache[cache_key] = path
+        self._route_cache[(dst_node, src_node)] = tuple(reversed(path))
+        return path
 
     def _generate_current_second_requests(self) -> list[TaskRequest]:
         expected_requests = self._arrival_rate_per_minute() / 60.0

@@ -4,7 +4,7 @@ import numpy as np
 
 from edge_drl.agents.hierarchical import build_baseline_agent
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
-from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
+from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig, _compute_kkt_externality_delays
 from edge_drl.env.scenario import generate_realistic_scenario
 
 
@@ -36,6 +36,18 @@ def test_kkt_compute_sqrt_rule():
     assert round(delays["a"], 6) == 1.0
     assert round(delays["b"], 6) == 1.5
     assert round(total, 6) == 2.5
+
+
+def test_kkt_externality_is_exact_difference_reward():
+    demands = [ComputeDemand("a", 0, 4.0), ComputeDemand("b", 0, 9.0)]
+    capacities = np.array([10.0])
+    _, delays, total = allocate_compute_kkt(demands, capacities)
+    externalities = _compute_kkt_externality_delays(demands, capacities)
+
+    _, _, total_without_a = allocate_compute_kkt([demands[1]], capacities)
+    _, _, total_without_b = allocate_compute_kkt([demands[0]], capacities)
+    assert np.isclose(delays["a"] + externalities["a"], total - total_without_a)
+    assert np.isclose(delays["b"] + externalities["b"], total - total_without_b)
 
 
 def test_kkt_link_sqrt_rule():
@@ -258,9 +270,20 @@ def test_city_links_include_heterogeneous_bottlenecks():
     )
     finite_bandwidth = scenario.bandwidth_mb_s[np.isfinite(scenario.bandwidth_mb_s) & (scenario.bandwidth_mb_s > 0)]
 
-    assert scenario.adjacency.all()
-    assert np.isfinite(scenario.bandwidth_mb_s[~np.eye(32, dtype=bool)]).all()
-    assert np.isfinite(scenario.propagation_ms[~np.eye(32, dtype=bool)]).all()
+    assert np.all(scenario.adjacency == scenario.adjacency.T)
+    assert np.all(np.diag(scenario.adjacency))
+    assert 0.10 < float(scenario.adjacency.mean()) < 0.50
+    assert np.all(scenario.bandwidth_mb_s[~scenario.adjacency] == 0.0)
+    visited = {0}
+    frontier = [0]
+    while frontier:
+        node = frontier.pop()
+        neighbors = set(np.flatnonzero(scenario.adjacency[node]).tolist()) - visited
+        visited.update(neighbors)
+        frontier.extend(neighbors)
+    assert len(visited) == 32
+    assert np.isfinite(scenario.propagation_ms[scenario.adjacency]).all()
+    assert np.isinf(scenario.propagation_ms[~scenario.adjacency]).all()
     assert finite_bandwidth.min() < 100.0
     assert finite_bandwidth.max() > 700.0
     assert finite_bandwidth.max() / finite_bandwidth.min() > 10.0

@@ -2,7 +2,7 @@ import numpy as np
 
 from edge_drl.agents.drl import HierarchicalPPOAgent, fast_obs_dim, slow_obs_dim
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
-from train_dual_ppo import rollout
+from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_costs, rollout
 
 
 def test_observation_dimensions():
@@ -60,6 +60,12 @@ def test_dual_ppo_rollout_and_update():
     assert np.isfinite(losses["slow"]["loss"])
     assert np.isfinite(losses["slow"]["count_loss"])
     assert np.isfinite(losses["slow"]["placement_loss"])
+    assert losses["slow"]["count_value_loss"] > 0.0
+    assert losses["slow"]["placement_value_loss"] > 0.0
+    assert np.isfinite(losses["slow"]["count_explained_variance"])
+    assert np.isfinite(losses["slow"]["placement_explained_variance"])
+    assert np.isfinite(losses["slow"]["count_post_explained_variance"])
+    assert np.isfinite(losses["slow"]["placement_post_explained_variance"])
     assert losses["slow"]["window_count"] == 1
     assert np.isfinite(losses["slow"]["critic_explained_variance"])
     assert np.isfinite(losses["fast"]["loss"])
@@ -98,6 +104,38 @@ def test_fast_batch_inference_keeps_request_major_buffer_order():
             )
             np.testing.assert_allclose(agent.fast_agent.ppo.buffer.states[offset], expected_state)
             offset += 1
+
+
+def test_fast_virtual_reservation_changes_later_microbatch_state():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=181,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        fast_reservation_microbatch_size=1,
+    )
+    agent.maybe_update_deployment(env, deterministic=True, record=False)
+    request = env.current_requests[0]
+    for stage_id in range(len(request.stage_compute_gcycles)):
+        env.deployment[request.service_id, stage_id] = True
+    schedules = agent.fast_agent.schedule_batch(env, [request, request], deterministic=True, record=True)
+    stage_count = len(request.stage_compute_gcycles)
+    first_state = agent.fast_agent.ppo.buffer.states[0]
+    second_state = agent.fast_agent.ppo.buffer.states[stage_count]
+    selected_node = schedules[0][0]
+    candidate_pressure_offset = 12 + selected_node * 9 + 8
+
+    assert not np.allclose(first_state, second_state)
+    assert second_state[candidate_pressure_offset] > first_state[candidate_pressure_offset]
 
 
 def test_fast_state_includes_current_compute_pressure():
@@ -164,6 +202,72 @@ def test_rollout_reports_latency_components():
         + stats["avg_propagation_latency_s"]
         + stats["avg_penalty_latency_s"],
     )
+
+
+def test_fast_stage_costs_sum_to_request_latency():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=21,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=6_000.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    agent.maybe_update_deployment(env)
+    request = env.current_requests[0]
+    schedule = agent.fast_agent.schedule(env, request=request, record=False)
+    info = env.evaluate_schedule(request, schedule)
+
+    stage_costs = _stage_latency_costs(info, env, request)
+    assert len(stage_costs) == len(request.stage_compute_gcycles)
+    assert all(cost >= 0.0 for cost in stage_costs)
+    assert np.isclose(sum(stage_costs), info["latency_s"])
+
+
+def test_fast_stage_externality_is_positive_under_shared_kkt_resources():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=211,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=6_000.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    agent.maybe_update_deployment(env, deterministic=True, record=False)
+    request = env.current_requests[0]
+    schedule = agent.fast_agent.schedule(env, request=request, deterministic=True, record=False)
+    infos = env.evaluate_batch_schedules([request, request], [schedule, schedule])
+
+    externality_costs = _stage_congestion_externality_costs(infos[0], env, request)
+    assert len(externality_costs) == len(request.stage_compute_gcycles)
+    assert sum(externality_costs) > 0.0
+
+
+def test_fast_terminal_reward_is_not_repeated_across_stages():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=22,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    agent.fast_agent.assign_last_schedule_reward(-2.0, stage_count=3, done=False)
+
+    assert agent.fast_agent.ppo.buffer.rewards == [0.0, 0.0, -2.0]
+    assert agent.fast_agent.ppo.buffer.dones == [False, False, True]
 
 
 def test_deterministic_eval_does_not_write_rollout_buffers():
@@ -299,14 +403,16 @@ def test_deterministic_slow_deployment_respects_count_policy():
     env.reset()
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
 
-    def count_three(state, mask, deterministic=False):
+    def count_three_probabilities(state, mask):
         assert mask[2]
-        return 2, 0.0, 0.0
+        probabilities = np.zeros_like(mask, dtype=np.float32)
+        probabilities[2] = 1.0
+        return probabilities, 0.0
 
     def first_available_node(state, mask, deterministic=False):
         return int(np.where(mask)[0][0]), 0.0, 0.0
 
-    agent.slow_agent.count_ppo.act = count_three
+    agent.slow_agent.count_ppo.action_probabilities = count_three_probabilities
     agent.slow_agent.placement_ppo.act = first_available_node
     deployment = agent.slow_agent.plan_deployment(env, deterministic=True, record=False)
 
@@ -315,6 +421,83 @@ def test_deterministic_slow_deployment_respects_count_policy():
             assert deployment[service.service_id, stage.stage_id].sum() == 3
     feasible, reason = env.check_deployment_feasible(deployment)
     assert feasible, reason
+
+
+def test_deterministic_slow_count_uses_conservative_distribution_mean():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=32,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+
+    def uniform_count_probabilities(state, mask):
+        probabilities = mask.astype(np.float32)
+        probabilities /= probabilities.sum()
+        return probabilities, 0.0
+
+    def first_available_node(state, mask, deterministic=False):
+        return int(np.where(mask)[0][0]), 0.0, 0.0
+
+    agent.slow_agent.count_ppo.action_probabilities = uniform_count_probabilities
+    agent.slow_agent.placement_ppo.act = first_available_node
+    deployment = agent.slow_agent.plan_deployment(env, deterministic=True, record=False)
+
+    # Uniform support over 1..4 has expectation 2.5; ceiling avoids the old
+    # arbitrary low-count argmax when Count has not learned yet.
+    for service in env.scenario.services:
+        for stage in service.stages:
+            assert deployment[service.service_id, stage.stage_id].sum() == 3
+
+
+def test_slow_count_return_uses_dense_latency_and_continuous_replica_credit():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=33,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_reward_scale=1.0,
+        slow_count_latency_coef=1.0,
+        slow_idle_replica_coef=1.0,
+        slow_count_shortage_coef=0.0,
+        slow_deployment_memory_coef=0.0,
+        slow_deployment_storage_coef=0.0,
+        slow_deadline_violation_coef=0.0,
+    )
+    service = env.scenario.services[0]
+    stage = service.stages[0]
+    stage_key = (service.service_id, stage.stage_id)
+    env.deployment[service.service_id, stage.stage_id] = False
+    env.deployment[service.service_id, stage.stage_id, :4] = True
+    agent.window_stage_latency_samples[stage_key] = [(0.2, 100.0)]
+    agent.window_stage_weights[stage_key] = 100.0
+
+    agent.window_stage_node_weights[stage_key] = {node_id: 25.0 for node_id in range(4)}
+    balanced_returns, _, balanced_metrics = agent._factorized_stage_returns(env)
+    assert np.isclose(balanced_metrics["slow_count_effective_replicas_per_stage"], 4.0)
+    assert np.isclose(balanced_metrics["slow_count_redundant_replica_fraction"], 0.0)
+    assert np.isclose(balanced_returns[stage_key], -0.2)
+
+    agent.window_stage_node_weights[stage_key] = {0: 100.0}
+    concentrated_returns, _, concentrated_metrics = agent._factorized_stage_returns(env)
+    assert np.isclose(concentrated_metrics["slow_count_effective_replicas_per_stage"], 1.0)
+    assert np.isclose(concentrated_metrics["slow_count_redundant_replica_fraction"], 0.75)
+    assert np.isclose(concentrated_returns[stage_key], -0.95)
 
 
 def test_slow_window_return_includes_tail_latency_feedback():
@@ -333,6 +516,7 @@ def test_slow_window_return_includes_tail_latency_feedback():
         env,
         replicas_per_stage=4,
         slow_tail_latency_coef=0.5,
+        slow_deadline_violation_coef=0.0,
     )
     agent.slow_agent.pending_window_id = 0
     agent.observe_step_reward(

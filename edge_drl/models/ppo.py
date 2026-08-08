@@ -722,6 +722,181 @@ class PPOAgent:
         self.buffer.clear()
         return last_metrics
 
+    def update_from_returns(
+        self,
+        returns: np.ndarray,
+        *,
+        sample_weights: np.ndarray | None = None,
+        progress_label: str = "",
+        progress_interval_seconds: float = 0.0,
+    ) -> dict[str, float]:
+        """Run PPO from externally supplied Monte-Carlo returns.
+
+        Composite slow-control actions are not consecutive environment steps,
+        so GAE over their component choices is invalid.  Each component still
+        has its own pre-action state and value prediction, however.  Training
+        that value head against the shared window return provides a much more
+        useful state-dependent baseline than assigning one window advantage to
+        every count and placement decision.
+        """
+
+        n = len(self.buffer)
+        if n == 0:
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "entropy": 0.0,
+                "approx_kl": 0.0,
+                "advantage_mean": 0.0,
+                "advantage_std": 0.0,
+                "explained_variance": 0.0,
+                "post_explained_variance": 0.0,
+            }
+        returns_np = np.asarray(returns, dtype=np.float32)
+        if returns_np.shape != (n,):
+            raise ValueError(f"returns must have shape ({n},), got {returns_np.shape}")
+        old_values_np = np.asarray(self.buffer.values, dtype=np.float32)
+        if old_values_np.shape != (n,):
+            raise ValueError("buffer value predictions do not match actions")
+        if sample_weights is None:
+            weights_np = np.ones(n, dtype=np.float32)
+        else:
+            weights_np = np.asarray(sample_weights, dtype=np.float32)
+            if weights_np.shape != (n,):
+                raise ValueError(f"sample_weights must have shape ({n},), got {weights_np.shape}")
+            if np.any(weights_np < 0.0) or not np.isfinite(weights_np).all():
+                raise ValueError("sample_weights must be finite and non-negative")
+        weights_np = weights_np / max(float(weights_np.mean()), 1e-8)
+
+        advantages_np = returns_np - old_values_np
+        advantage_mean = float(np.average(advantages_np, weights=weights_np))
+        advantage_variance = float(np.average((advantages_np - advantage_mean) ** 2, weights=weights_np))
+        advantage_std = float(np.sqrt(advantage_variance))
+        if advantage_std > 1e-8:
+            advantages_np = (advantages_np - advantage_mean) / (advantage_std + 1e-8)
+        else:
+            advantages_np = advantages_np - advantage_mean
+
+        return_variance = float(np.average((returns_np - np.average(returns_np, weights=weights_np)) ** 2, weights=weights_np))
+        residual_variance = float(
+            np.average(
+                ((returns_np - old_values_np) - np.average(returns_np - old_values_np, weights=weights_np)) ** 2,
+                weights=weights_np,
+            )
+        )
+        explained_variance = 0.0 if return_variance <= 1e-8 else 1.0 - residual_variance / return_variance
+
+        actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
+        old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
+        minibatch_size = max(1, min(self.minibatch_size, n))
+        batches_per_epoch = int(np.ceil(n / minibatch_size))
+        progress = None
+        if tqdm is not None and progress_interval_seconds > 0 and progress_label:
+            progress = tqdm(
+                total=self.k_epochs * batches_per_epoch,
+                desc=progress_label,
+                unit="mb",
+                dynamic_ncols=True,
+                mininterval=progress_interval_seconds,
+                leave=True,
+                bar_format="{desc}: {percentage:5.1f}%|{bar}| [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                file=sys.stdout,
+            )
+
+        last_metrics: dict[str, float] = {}
+        for epoch_idx in range(self.k_epochs):
+            order = np.random.permutation(n)
+            approx_kls: list[float] = []
+            for start in range(0, n, minibatch_size):
+                idx = order[start : start + minibatch_size]
+                states = torch.as_tensor(
+                    np.stack([self.buffer.states[i] for i in idx]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                masks = torch.as_tensor(
+                    np.stack([self.buffer.masks[i] for i in idx]),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
+                old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
+                advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
+                targets = torch.as_tensor(returns_np[idx], dtype=torch.float32, device=self.device)
+                batch_weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
+                denominator = batch_weights.sum().clamp_min(1e-8)
+
+                dist, values = self.policy(states, masks)
+                logprobs = dist.log_prob(actions)
+                entropies = dist.entropy()
+                ratios = torch.exp(logprobs - old_logprobs)
+                approx_kl = ((old_logprobs - logprobs) * batch_weights).sum() / denominator
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
+                policy_loss = -(torch.min(surr1, surr2) * batch_weights).sum() / denominator
+                value_loss = (((values - targets) ** 2) * batch_weights).sum() / denominator
+                entropy = (entropies * batch_weights).sum() / denominator
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self.optimizer.step()
+                approx_kls.append(float(approx_kl.item()))
+                last_metrics = {
+                    "loss": float(loss.item()),
+                    "policy_loss": float(policy_loss.item()),
+                    "value_loss": float(value_loss.item()),
+                    "entropy": float(entropy.item()),
+                    "approx_kl": float(approx_kl.item()),
+                    "advantage_mean": advantage_mean,
+                    "advantage_std": advantage_std,
+                    "explained_variance": explained_variance,
+                }
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix_str(
+                        "epoch={} loss={:.4f} kl={:.5f}".format(
+                            epoch_idx + 1,
+                            last_metrics["loss"],
+                            last_metrics["approx_kl"],
+                        ),
+                        refresh=False,
+                    )
+            if self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
+                break
+        if progress is not None:
+            progress.close()
+        post_values_parts: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, n, minibatch_size):
+                states = torch.as_tensor(
+                    np.stack(self.buffer.states[start : start + minibatch_size]),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                masks = torch.as_tensor(
+                    np.stack(self.buffer.masks[start : start + minibatch_size]),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                _, values = self.policy(states, masks)
+                post_values_parts.append(values.detach().cpu().numpy())
+        post_values_np = np.concatenate(post_values_parts).astype(np.float32, copy=False)
+        post_residual = returns_np - post_values_np
+        post_residual_variance = float(
+            np.average(
+                (post_residual - np.average(post_residual, weights=weights_np)) ** 2,
+                weights=weights_np,
+            )
+        )
+        last_metrics["post_explained_variance"] = (
+            0.0 if return_variance <= 1e-8 else 1.0 - post_residual_variance / return_variance
+        )
+        self.buffer.clear()
+        return last_metrics
+
     def behavior_clone(
         self,
         states: np.ndarray,

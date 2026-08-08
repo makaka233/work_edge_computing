@@ -10,7 +10,7 @@ scenario:
   num_service_types: 10
   max_service_stages: 3
   episode_hours: 4
-  scenario_refresh_episodes: 20
+  scenario_refresh_episodes: 4
   scenario_refresh_scope: demand_only
   demand_sampling_mode: episode
 
@@ -31,14 +31,16 @@ traffic:
   load_multipliers: [1.0]
   pressure_profile: baseline
   # mec-moderate preset: active_ratio=0.20, active_rate=1.75/min,
-  # task_compute=1.5, task_data=2.0, node_capacity=0.65,
-  # wired_bandwidth=0.35, service_resource_fraction=0.45.
+  # task_compute=1.35, task_data=2.5, node_capacity=0.75,
+  # wired_bandwidth=0.25, service_resource_fraction=0.35, deadline_scale=2.5.
   rollout_start_mode: beginning
   eval_rollout_start_mode: same
   task_compute_scale: 1.0
   task_data_scale: 1.0
   node_compute_capacity_scale: 1.0
   wired_link_bandwidth_scale: 1.0
+  topology_k_nearest: 6
+  deadline_scale: 1.0
   service_resource_fraction: 0.5
   request_aggregation_window_seconds: 1.0
   load_ewma_tau_minutes: 1.0
@@ -64,7 +66,11 @@ agent:
   drl:
     type: dual_agent_ppo
     optimizer_reward_scale: 10.0
-    rollouts_per_update: 1
+    fast_windows_per_update: 1
+    slow_windows_per_update: 32
+    joint_training_schedule: alternating
+    fast_updates_per_cycle: 3
+    slow_warmup_updates: 4
     synchronized_window_block: 0
     slow_agent_decision: every_10_minutes
     fast_agent_decision: per_request
@@ -79,13 +85,20 @@ agent:
     slow_value_coef: 0.5
     slow_critic_lr: 0.0003
     slow_critic_k_epochs: 4
-    slow_composite_action_return: one_return_per_10min_window
+    slow_composite_action_return: factorized_service_stage_return_per_10min_window
     slow_deployment_memory_coef: 0.03
     slow_deployment_storage_coef: 0.01
     slow_migration_coef: 0.0
+    slow_idle_replica_coef: 0.25
+    slow_count_shortage_coef: 0.25
+    slow_count_latency_coef: 1.0
+    slow_deterministic_count_mode: expected
+    slow_deadline_violation_coef: 0.10
+    fast_congestion_credit_coef: 1.0
+    fast_reservation_microbatch_size: 16
     reward:
-      fast: negative_physical_latency_seconds
-      slow: window_mean_p95_latency_plus_deployment_and_migration_cost
+      fast: stage_latency_plus_exact_kkt_marginal_externality
+      slow: factorized_stage_tail_latency_plus_continuous_replica_efficiency_and_deadline_cost
       resource_shaping_scope: diagnostics_only
       compute_hotspot_threshold: 0.60
       link_hotspot_threshold: 0.60
