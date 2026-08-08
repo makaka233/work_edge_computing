@@ -97,16 +97,29 @@ edge nodes because duplicate placement on the same node is masked. Continuous
 compute and bandwidth allocation remains outside the neural policy and is solved
 by the KKT module.
 
+Replica count is an ordered action rather than 32 unrelated classes. The Count
+head predicts a distribution center and scale, which define a masked discretized
+Gaussian over feasible replica counts. Nearby counts therefore share statistical
+strength and the deterministic expected-count decoder remains consistent with the
+stochastic training policy. Its initial scale is one sixth of the action range,
+which preserves local exploration without keeping a 32-count policy nearly uniform.
+
 Slow deployment is trained from one 10-minute window at a time, but Count and
 Placement no longer receive one undifferentiated return for every component
-action. Placement receives service-stage mean/P95 latency and deadline return.
+action. Placement receives service-stage mean/P95 latency, deadline return, and
+the observed cross-node transition rate of the adjacent stages owned by that
+placement action. The colocation term is therefore stage-local actor credit rather
+than only a global window diagnostic.
 Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
 and deadline violations penalize under-provisioning, while a continuous effective-
 replica measure based on request shares penalizes replicas that add little usable
 capacity. This avoids treating a replica as fully useful merely because it handled
-one request during a high-traffic window. Both PPO policies train their own value
-heads from these factorized Monte-Carlo targets. The separate window critic remains as a
-high-level diagnostic. Fast PPO receives an additive stage-local latency reward
+one request during a high-traffic window. Placement still trains its value head.
+Count instead uses direct stage-centered returns with
+`--slow-count-value-coef 0` by default, so its failed critic cannot dominate the
+shared graph encoder; value loss and explained variance remain logged for ablation
+diagnostics but are not optimized. The
+separate window critic remains as a high-level diagnostic. Fast PPO receives an additive stage-local latency reward
 plus the exact KKT difference reward for compute/link congestion imposed on other
 requests. Requests are inferred in microbatches (default 16); after each
 microbatch a virtual workload ledger reserves the selected-node work so later
@@ -119,16 +132,23 @@ to `--slow-tail-latency-coef` (default 0.35) with deployment, idle-replica, dead
 and migration costs.
 Migration changes remain logged, but `--slow-migration-coef` defaults to zero for
 the current convergence experiments.
-Fast and Slow PPO use alternating frozen-controller phases by default. Four Slow
-warm-up updates first collect 32 windows each with Fast frozen. Afterwards, three
-Fast updates collect stochastic Fast actions under deterministic Slow deployment;
+Fast and Slow PPO use alternating frozen-controller phases by default. Four Fast
+warm-up updates first learn under the conservative expected-count Slow deployment.
+Four Slow warm-up updates then collect 32 windows each with the now-trained Fast
+policy frozen. Afterwards, three Fast updates collect stochastic Fast actions
+under deterministic Slow deployment;
 the next Slow update freezes Fast deterministically and collects 32 independent
 window returns. Because replica count is ordinal, deterministic Slow deployment
 uses the ceiling of the Count distribution's expected replica count instead of an
 unstable categorical argmax; use `--slow-deterministic-count-mode mode` only for an
 explicit mode ablation. This prevents one Slow PPO batch from mixing returns
-produced by several different Fast policies. Configure the cadence with
-`--slow-warmup-updates`, `--fast-updates-per-cycle`,
+produced by several different Fast policies. Count actor advantages use direct
+Monte-Carlo returns centered within each service stage before normalization, so
+intrinsic latency differences between easy and expensive stages do not overwhelm
+the replica-count comparison. Set a nonzero `--slow-count-value-coef` only for a
+critic ablation; doing so reintroduces shared-backbone critic gradients.
+Configure the cadence with `--fast-warmup-updates`, `--slow-warmup-updates`,
+`--fast-updates-per-cycle`,
 `--fast-windows-per-update`, and `--slow-windows-per-update`; use
 `--joint-training-schedule simultaneous` only for legacy ablations. The log field
 `training_phase` records which policy was active.
@@ -190,9 +210,9 @@ of the fixed physical scenario for a run and remain tied to `--physical-seed`.
 
 For reproducible pressure experiments, `--pressure-profile mec-moderate` applies
 the following fixed-run operating point: 20% active users, 1.75 requests per active
-user per minute, 1.5x task compute, 2x task data, 0.65x node compute capacity,
-0.35x wired-link bandwidth, 0.45 service resource fraction, and rollout load
-multipliers `0.8,1.1,1.4,1.7`. This keeps the topology, node locations, node
+user per minute, 1.65x task compute, 2.5x task data, 0.65x node compute capacity,
+0.15x wired-link bandwidth, 0.25 service resource fraction, and rollout load
+multipliers `0.8,1.1,1.4,1.7` with 2.75x deadline scale. This keeps the topology, node locations, node
 tiers, service catalogue, and link classes fixed while making both compute and
 network pressure visible. `--pressure-profile mec-stress` is a stronger bounded
 ablation. Explicit scale flags override a profile, and the resolved values are

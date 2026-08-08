@@ -29,12 +29,12 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
         "active_user_request_rate_per_minute": 1.75,
         "traffic_scale": 1.0,
         "load_multipliers": "0.8,1.1,1.4,1.7",
-        "task_compute_scale": 1.35,
+        "task_compute_scale": 1.65,
         "task_data_scale": 2.5,
-        "node_compute_capacity_scale": 0.75,
-        "wired_link_bandwidth_scale": 0.25,
-        "service_resource_fraction": 0.35,
-        "deadline_scale": 2.5,
+        "node_compute_capacity_scale": 0.65,
+        "wired_link_bandwidth_scale": 0.15,
+        "service_resource_fraction": 0.25,
+        "deadline_scale": 2.75,
     },
     # Validate moderate pressure first; this profile is a bounded stress case
     # rather than a saturation-first experiment.
@@ -43,11 +43,11 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
         "active_user_request_rate_per_minute": 2.0,
         "traffic_scale": 1.0,
         "load_multipliers": "0.8,1.1,1.4,1.7",
-        "task_compute_scale": 2.5,
-        "task_data_scale": 3.0,
-        "node_compute_capacity_scale": 0.45,
-        "wired_link_bandwidth_scale": 0.15,
-        "service_resource_fraction": 0.35,
+        "task_compute_scale": 2.75,
+        "task_data_scale": 4.0,
+        "node_compute_capacity_scale": 0.35,
+        "wired_link_bandwidth_scale": 0.04,
+        "service_resource_fraction": 0.20,
         "deadline_scale": 3.0,
     },
 }
@@ -261,6 +261,12 @@ def parse_args() -> argparse.Namespace:
         help="Requests per Fast inference microbatch before virtual compute reservations are updated.",
     )
     parser.add_argument("--slow-value-coef", type=float, default=0.5)
+    parser.add_argument(
+        "--slow-count-value-coef",
+        type=float,
+        default=0.0,
+        help="Count critic loss coefficient. Keep at 0 when the actor uses direct stage-centered returns.",
+    )
     parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
     parser.add_argument("--slow-critic-k-epochs", type=int, default=4)
     parser.add_argument("--slow-deployment-memory-coef", type=float, default=0.03)
@@ -321,10 +327,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of Fast-only updates before one frozen-Fast Slow update in alternating mode.",
     )
     parser.add_argument(
+        "--fast-warmup-updates",
+        type=int,
+        default=4,
+        help="Number of deterministic-Slow Fast updates before Slow warm-up starts.",
+    )
+    parser.add_argument(
         "--slow-warmup-updates",
         type=int,
         default=4,
-        help="Number of frozen-Fast Slow updates collected before alternating joint training starts.",
+        help="Number of frozen-Fast Slow updates after Fast warm-up and before alternating training.",
     )
     parser.add_argument(
         "--synchronized-window-block",
@@ -401,8 +413,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("Slow shaping coefficients must be >= 0")
     if args.fast_updates_per_cycle < 1:
         parser.error("--fast-updates-per-cycle must be >= 1")
-    if args.slow_warmup_updates < 0:
-        parser.error("--slow-warmup-updates must be >= 0")
+    if args.fast_warmup_updates < 0 or args.slow_warmup_updates < 0:
+        parser.error("--fast-warmup-updates and --slow-warmup-updates must be >= 0")
     if args.joint_training_schedule == "alternating" and args.rollout_unit != "window":
         args.joint_training_schedule = "simultaneous"
     if args.slow_critic_k_epochs < 1:
@@ -411,6 +423,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-tail-latency-coef must be in [0, 1]")
     if args.slow_colocation_coef < 0.0:
         parser.error("--slow-colocation-coef must be >= 0")
+    if args.slow_count_value_coef < 0.0:
+        parser.error("--slow-count-value-coef must be >= 0")
     if args.synchronized_window_block < 0:
         parser.error("--synchronized-window-block must be >= 0")
     if args.episode_hours < 1:
@@ -2129,6 +2143,7 @@ def main() -> None:
         slow_placement_entropy_coef=args.slow_placement_entropy_coef,
         fast_entropy_coef=args.fast_entropy_coef,
         slow_value_coef=args.slow_value_coef,
+        slow_count_value_coef=args.slow_count_value_coef,
         slow_critic_lr=args.slow_critic_lr,
         slow_critic_k_epochs=args.slow_critic_k_epochs,
         fast_value_coef=args.fast_value_coef,
@@ -2183,7 +2198,8 @@ def main() -> None:
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
     print(
         f"  joint_training_schedule={args.joint_training_schedule} "
-        f"fast_updates_per_cycle={args.fast_updates_per_cycle} slow_warmup_updates={args.slow_warmup_updates}"
+        f"fast_updates_per_cycle={args.fast_updates_per_cycle} "
+        f"fast_warmup_updates={args.fast_warmup_updates} slow_warmup_updates={args.slow_warmup_updates}"
     )
     print(
         f"  fast_congestion_credit={args.fast_congestion_credit_coef} "
@@ -2193,6 +2209,10 @@ def main() -> None:
     print(f"  synchronized_window_block={args.synchronized_window_block or 'disabled'}")
     print(f"  slow_tail_latency_coef={args.slow_tail_latency_coef:.2f} (P95 weight)")
     print(f"  slow_colocation_coef={args.slow_colocation_coef:.3f} (cross-stage transition penalty)")
+    print(
+        f"  slow_count_value_coef={args.slow_count_value_coef:.3f} "
+        "(0 isolates Count actor from failed critic gradients)"
+    )
     deployment_windows = max(
         int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
         1,
@@ -2437,12 +2457,16 @@ def main() -> None:
             "slow_critic_explained_variance": np.nan,
             "slow_window_critic_explained_variance": np.nan,
             "slow_count_loss": 0.0,
+            "slow_count_advantage_mean": np.nan,
+            "slow_count_advantage_std": np.nan,
             "slow_count_value_loss": 0.0,
             "slow_count_explained_variance": np.nan,
             "slow_count_post_explained_variance": np.nan,
             "slow_count_entropy": 0.0,
             "slow_count_approx_kl": 0.0,
             "slow_placement_loss": 0.0,
+            "slow_placement_advantage_mean": np.nan,
+            "slow_placement_advantage_std": np.nan,
             "slow_placement_value_loss": 0.0,
             "slow_placement_explained_variance": np.nan,
             "slow_placement_post_explained_variance": np.nan,
@@ -2541,8 +2565,11 @@ def main() -> None:
     )
     for update in range(args.updates):
         alternating_joint = args.train_mode == "joint" and args.joint_training_schedule == "alternating"
-        slow_warmup_phase = alternating_joint and update < args.slow_warmup_updates
-        alternating_update = update - args.slow_warmup_updates
+        fast_warmup_phase = alternating_joint and update < args.fast_warmup_updates
+        slow_warmup_start = args.fast_warmup_updates
+        slow_warmup_end = slow_warmup_start + args.slow_warmup_updates
+        slow_warmup_phase = alternating_joint and slow_warmup_start <= update < slow_warmup_end
+        alternating_update = update - slow_warmup_end
         scheduled_slow_phase = (
             alternating_joint
             and alternating_update >= 0
@@ -2550,7 +2577,9 @@ def main() -> None:
         )
         slow_phase = slow_warmup_phase or scheduled_slow_phase
         training_phase = (
-            "slow_warmup"
+            "fast_warmup"
+            if fast_warmup_phase
+            else "slow_warmup"
             if slow_warmup_phase
             else "slow"
             if slow_phase
@@ -2831,6 +2860,8 @@ def main() -> None:
                 "window_critic_explained_variance", np.nan
             ),
             "slow_count_loss": losses["slow"].get("count_loss", np.nan),
+            "slow_count_advantage_mean": losses["slow"].get("count_advantage_mean", np.nan),
+            "slow_count_advantage_std": losses["slow"].get("count_advantage_std", np.nan),
             "slow_count_value_loss": losses["slow"].get("count_value_loss", np.nan),
             "slow_count_explained_variance": losses["slow"].get("count_explained_variance", np.nan),
             "slow_count_post_explained_variance": losses["slow"].get(
@@ -2839,6 +2870,12 @@ def main() -> None:
             "slow_count_entropy": losses["slow"].get("count_entropy", np.nan),
             "slow_count_approx_kl": losses["slow"].get("count_approx_kl", np.nan),
             "slow_placement_loss": losses["slow"].get("placement_loss", np.nan),
+            "slow_placement_advantage_mean": losses["slow"].get(
+                "placement_advantage_mean", np.nan
+            ),
+            "slow_placement_advantage_std": losses["slow"].get(
+                "placement_advantage_std", np.nan
+            ),
             "slow_placement_value_loss": losses["slow"].get("placement_value_loss", np.nan),
             "slow_placement_explained_variance": losses["slow"].get(
                 "placement_explained_variance", np.nan

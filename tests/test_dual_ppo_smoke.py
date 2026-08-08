@@ -2,12 +2,83 @@ import numpy as np
 
 from edge_drl.agents.drl import HierarchicalPPOAgent, fast_obs_dim, slow_obs_dim
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
+from edge_drl.models.ppo import PPOAgent, _center_advantages_by_group
 from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_costs, rollout
 
 
 def test_observation_dimensions():
     assert slow_obs_dim(16, 3) == 17 + 16 * (6 + 3) + 16 * 16 * 4
     assert fast_obs_dim(16) == 12 + 16 * 9 + 16 * 16 * 3
+
+
+def test_count_advantages_are_centered_within_service_stage():
+    advantages = np.asarray([10.0, 14.0, -5.0, 3.0], dtype=np.float32)
+    weights = np.asarray([1.0, 3.0, 2.0, 2.0], dtype=np.float32)
+    group_ids = np.asarray([0, 0, 1, 1], dtype=np.int64)
+
+    centered = _center_advantages_by_group(advantages, weights, group_ids)
+
+    assert np.allclose(centered, [-3.0, 1.0, -4.0, 4.0])
+    assert np.isclose(np.average(centered[:2], weights=weights[:2]), 0.0)
+    assert np.isclose(np.average(centered[2:], weights=weights[2:]), 0.0)
+
+
+def test_count_actor_can_bypass_failed_value_baseline():
+    ppo = PPOAgent(obs_dim=2, action_dim=2, hidden_dim=8, k_epochs=1, minibatch_size=4)
+    states = [np.asarray([float(index), 1.0], dtype=np.float32) for index in range(4)]
+    mask = np.asarray([True, True])
+    for state in states:
+        action, logprob, _ = ppo.act(state, mask, deterministic=False)
+        ppo.buffer.states.append(state)
+        ppo.buffer.masks.append(mask.copy())
+        ppo.buffer.actions.append(action)
+        ppo.buffer.logprobs.append(logprob)
+    # Deliberately unusable critic predictions must not alter the direct-return
+    # Count actor advantages.
+    ppo.buffer.values.extend([100.0, -100.0, 50.0, -50.0])
+    metrics = ppo.update_from_returns(
+        np.asarray([10.0, 14.0, -5.0, 3.0], dtype=np.float32),
+        advantage_group_ids=np.asarray([0, 0, 1, 1], dtype=np.int64),
+        actor_use_value_baseline=False,
+    )
+    assert np.isclose(metrics["advantage_mean"], 0.0)
+    assert np.isclose(metrics["advantage_std"], np.sqrt(10.0))
+
+
+def test_disabled_count_critic_does_not_update_critic_head():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=10,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    ppo = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4).slow_agent.count_ppo
+    mask = np.ones(4, dtype=bool)
+    for index in range(4):
+        state = np.zeros(slow_obs_dim(16, 3), dtype=np.float32)
+        state[index] = 1.0
+        action, logprob, value = ppo.act(state, mask, deterministic=False)
+        ppo.buffer.states.append(state)
+        ppo.buffer.masks.append(mask.copy())
+        ppo.buffer.actions.append(action)
+        ppo.buffer.logprobs.append(logprob)
+        ppo.buffer.values.append(value)
+    critic_before = [parameter.detach().cpu().numpy().copy() for parameter in ppo.policy.critic.parameters()]
+
+    ppo.update_from_returns(
+        np.asarray([1.0, -1.0, 2.0, -2.0], dtype=np.float32),
+        advantage_group_ids=np.asarray([0, 0, 1, 1], dtype=np.int64),
+        actor_use_value_baseline=False,
+    )
+
+    critic_after = [parameter.detach().cpu().numpy() for parameter in ppo.policy.critic.parameters()]
+    assert ppo.value_coef == 0.0
+    assert all(np.array_equal(before, after) for before, after in zip(critic_before, critic_after))
 
 
 def test_dual_ppo_rollout_and_update():
@@ -368,7 +439,9 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     )
     env.reset()
     agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
-    assert agent.slow_agent.count_ppo.policy.actor[-1].out_features == 4
+    assert agent.slow_agent.count_ppo.policy.actor[-1].out_features == 2
+    assert agent.slow_agent.count_ppo.policy.action_dim == 4
+    assert agent.slow_agent.count_ppo.value_coef == 0.0
     assert agent.slow_agent.placement_ppo.policy.actor[-1].out_features == 1
 
     def count_two(state, mask, deterministic=False):
@@ -421,6 +494,33 @@ def test_deterministic_slow_deployment_respects_count_policy():
             assert deployment[service.service_id, stage.stage_id].sum() == 3
     feasible, reason = env.check_deployment_feasible(deployment)
     assert feasible, reason
+
+
+def test_slow_count_policy_is_unimodal_over_ordered_replica_actions():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=30,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, replicas_per_stage=8)
+    state = np.zeros(slow_obs_dim(16, 3), dtype=np.float32)
+    probabilities, _ = agent.slow_agent.count_ppo.action_probabilities(
+        state,
+        np.ones(8, dtype=bool),
+    )
+
+    peak = int(np.argmax(probabilities))
+    assert np.all(np.diff(probabilities[: peak + 1]) >= -1e-7)
+    assert np.all(np.diff(probabilities[peak:]) <= 1e-7)
+    assert np.isclose(probabilities.sum(), 1.0)
+    initial_scale = float(np.exp(agent.slow_agent.count_ppo.policy.actor[-1].bias[1].item()))
+    assert np.isclose(initial_scale, 8.0 / 6.0)
 
 
 def test_deterministic_slow_count_uses_conservative_distribution_mean():
@@ -578,3 +678,49 @@ def test_slow_reward_tracks_cross_stage_colocation():
     assert np.isclose(agent.last_slow_window_metrics["slow_colocation_rate"], 0.5)
     assert np.isclose(agent.last_slow_window_metrics["slow_colocation_cost"], 0.025)
     assert np.isclose(agent.slow_agent.window_returns[0], -0.1 - 0.025)
+
+
+def test_factorized_placement_return_receives_local_colocation_credit():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=39,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_reward_scale=1.0,
+        slow_tail_latency_coef=0.0,
+        slow_colocation_coef=0.2,
+        slow_deadline_violation_coef=0.0,
+    )
+    service = next(service for service in env.scenario.services if len(service.stages) >= 2)
+    agent.observe_step_reward(
+        reward=-0.2,
+        stage_count=2,
+        done=False,
+        record_fast=False,
+        weight=1.0,
+        latency_s=0.2,
+        deadline_s=1.0,
+        cross_stage_transitions=1.0,
+        stage_transitions=1.0,
+        service_id=service.service_id,
+        stage_nodes=[0, 1],
+        slow_stage_costs=[0.1, 0.1],
+    )
+
+    _, placement_returns, _ = agent._factorized_stage_returns(env)
+
+    first_key = (service.service_id, 0)
+    second_key = (service.service_id, 1)
+    assert np.isclose(agent.window_stage_cross_transitions[first_key], 1.0)
+    assert np.isclose(agent.window_stage_cross_transitions[second_key], 1.0)
+    assert np.isclose(placement_returns[first_key], -0.3)
+    assert np.isclose(placement_returns[second_key], -0.3)

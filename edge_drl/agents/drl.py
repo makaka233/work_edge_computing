@@ -68,6 +68,7 @@ class SlowDeploymentPPOAgent:
     count_entropy_coef: float | None = None
     placement_entropy_coef: float | None = None
     value_coef: float = 0.5
+    count_value_coef: float = 0.0
     critic_lr: float | None = None
     critic_k_epochs: int = 4
     target_kl: float | None = 0.03
@@ -86,6 +87,7 @@ class SlowDeploymentPPOAgent:
     pending_placement_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     count_action_returns: list[float] = field(default_factory=list)
     placement_action_returns: list[float] = field(default_factory=list)
+    count_action_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     count_window_ids: list[int] = field(default_factory=list)
     placement_window_ids: list[int] = field(default_factory=list)
     window_states: list[np.ndarray] = field(default_factory=list)
@@ -107,7 +109,10 @@ class SlowDeploymentPPOAgent:
             gamma=0.99,
             k_epochs=self.k_epochs,
             entropy_coef=self.entropy_coef if self.count_entropy_coef is None else self.count_entropy_coef,
-            value_coef=self.value_coef,
+            # Count uses direct stage-centered Monte-Carlo returns.  Its
+            # consistently failed value head must not dominate the shared
+            # graph encoder with critic gradients.
+            value_coef=self.count_value_coef,
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
             policy_kind="slow_gat_count",
@@ -308,6 +313,7 @@ class SlowDeploymentPPOAgent:
         self.count_action_returns.extend(
             float(count_stage_returns.get(stage_key, reward)) for stage_key in self.pending_count_stage_keys
         )
+        self.count_action_stage_keys.extend(self.pending_count_stage_keys)
         self.placement_action_returns.extend(
             float(placement_stage_returns.get(stage_key, reward)) for stage_key in self.pending_placement_stage_keys
         )
@@ -335,6 +341,8 @@ class SlowDeploymentPPOAgent:
         placement_ids = np.asarray(self.placement_window_ids, dtype=np.int64)
         if len(self.count_action_returns) != len(self.count_ppo.buffer.actions):
             raise ValueError("slow count action returns are misaligned")
+        if len(self.count_action_stage_keys) != len(self.count_ppo.buffer.actions):
+            raise ValueError("slow count action stage keys are misaligned")
         if len(self.placement_action_returns) != len(self.placement_ppo.buffer.actions):
             raise ValueError("slow placement action returns are misaligned")
         count_returns = np.asarray(self.count_action_returns, dtype=np.float32)
@@ -342,6 +350,14 @@ class SlowDeploymentPPOAgent:
         count_metrics = self.count_ppo.update_from_returns(
             count_returns,
             sample_weights=self._equal_window_action_weights(count_ids),
+            advantage_group_ids=np.asarray(
+                [
+                    service_id * self.max_service_stages + stage_id
+                    for service_id, stage_id in self.count_action_stage_keys
+                ],
+                dtype=np.int64,
+            ),
+            actor_use_value_baseline=False,
             progress_label=f"{progress_label} count",
             progress_interval_seconds=progress_interval_seconds,
         )
@@ -357,6 +373,7 @@ class SlowDeploymentPPOAgent:
         self.placement_window_ids.clear()
         self.count_action_returns.clear()
         self.placement_action_returns.clear()
+        self.count_action_stage_keys.clear()
         self.window_states.clear()
         self.window_old_values.clear()
         self.window_returns.clear()
@@ -386,6 +403,8 @@ class SlowDeploymentPPOAgent:
             ),
             "window_critic_explained_variance": critic_metrics["explained_variance"],
             "count_loss": count_metrics["loss"],
+            "count_advantage_mean": count_metrics.get("advantage_mean", 0.0),
+            "count_advantage_std": count_metrics.get("advantage_std", 0.0),
             "count_policy_loss": count_metrics["policy_loss"],
             "count_value_loss": count_metrics["value_loss"],
             "count_entropy": count_metrics["entropy"],
@@ -393,6 +412,8 @@ class SlowDeploymentPPOAgent:
             "count_explained_variance": count_metrics.get("explained_variance", 0.0),
             "count_post_explained_variance": count_metrics.get("post_explained_variance", 0.0),
             "placement_loss": placement_metrics["loss"],
+            "placement_advantage_mean": placement_metrics.get("advantage_mean", 0.0),
+            "placement_advantage_std": placement_metrics.get("advantage_std", 0.0),
             "placement_policy_loss": placement_metrics["policy_loss"],
             "placement_value_loss": placement_metrics["value_loss"],
             "placement_entropy": placement_metrics["entropy"],
@@ -422,6 +443,8 @@ class SlowDeploymentPPOAgent:
             "critic_explained_variance": 0.0,
             "window_critic_explained_variance": 0.0,
             "count_loss": 0.0,
+            "count_advantage_mean": 0.0,
+            "count_advantage_std": 0.0,
             "count_policy_loss": 0.0,
             "count_value_loss": 0.0,
             "count_entropy": 0.0,
@@ -429,6 +452,8 @@ class SlowDeploymentPPOAgent:
             "count_explained_variance": 0.0,
             "count_post_explained_variance": 0.0,
             "placement_loss": 0.0,
+            "placement_advantage_mean": 0.0,
+            "placement_advantage_std": 0.0,
             "placement_policy_loss": 0.0,
             "placement_value_loss": 0.0,
             "placement_entropy": 0.0,
@@ -1134,6 +1159,8 @@ class HierarchicalPPOAgent:
     window_stage_latency_samples: dict[tuple[int, int], list[tuple[float, float]]] = field(default_factory=dict)
     window_stage_deadline_violations: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_weights: dict[tuple[int, int], float] = field(default_factory=dict)
+    window_stage_cross_transitions: dict[tuple[int, int], float] = field(default_factory=dict)
+    window_stage_transition_weights: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_used_nodes: dict[tuple[int, int], set[int]] = field(default_factory=dict)
     window_stage_node_weights: dict[tuple[int, int], dict[int, float]] = field(default_factory=dict)
     slow_reward_scale: float = 1.0
@@ -1166,6 +1193,7 @@ class HierarchicalPPOAgent:
         slow_placement_entropy_coef: float | None = None,
         fast_entropy_coef: float = 0.0,
         slow_value_coef: float = 0.5,
+        slow_count_value_coef: float = 0.0,
         slow_critic_lr: float | None = None,
         slow_critic_k_epochs: int = 4,
         fast_value_coef: float = 0.5,
@@ -1199,6 +1227,7 @@ class HierarchicalPPOAgent:
                 count_entropy_coef=slow_count_entropy_coef,
                 placement_entropy_coef=slow_placement_entropy_coef,
                 value_coef=slow_value_coef,
+                count_value_coef=slow_count_value_coef,
                 critic_lr=slow_critic_lr,
                 critic_k_epochs=slow_critic_k_epochs,
                 target_kl=slow_target_kl,
@@ -1327,6 +1356,20 @@ class HierarchicalPPOAgent:
                 self.window_stage_used_nodes.setdefault(stage_key, set()).add(int(node_id))
                 node_weights = self.window_stage_node_weights.setdefault(stage_key, {})
                 node_weights[int(node_id)] = node_weights.get(int(node_id), 0.0) + float(weight)
+            # Give the placement actions that own each adjacent pair a local
+            # cross-node credit.  The previous global window penalty never
+            # reached factorized Placement returns, so the actor could not
+            # learn colocation even though the diagnostic reported it.
+            for transition_id in range(1, len(stage_nodes)):
+                crossed = float(int(stage_nodes[transition_id - 1]) != int(stage_nodes[transition_id]))
+                for endpoint_stage_id in (transition_id - 1, transition_id):
+                    stage_key = (int(service_id), int(endpoint_stage_id))
+                    self.window_stage_cross_transitions[stage_key] = (
+                        self.window_stage_cross_transitions.get(stage_key, 0.0) + crossed * float(weight)
+                    )
+                    self.window_stage_transition_weights[stage_key] = (
+                        self.window_stage_transition_weights.get(stage_key, 0.0) + float(weight)
+                    )
         if done:
             self.flush_slow_window_reward(done=True, env=env)
 
@@ -1428,6 +1471,8 @@ class HierarchicalPPOAgent:
         self.window_stage_latency_samples.clear()
         self.window_stage_deadline_violations.clear()
         self.window_stage_weights.clear()
+        self.window_stage_cross_transitions.clear()
+        self.window_stage_transition_weights.clear()
         self.window_stage_used_nodes.clear()
         self.window_stage_node_weights.clear()
         self.window_deployment_memory_fraction = 0.0
@@ -1486,6 +1531,9 @@ class HierarchicalPPOAgent:
                 violation_rate = self.window_stage_deadline_violations.get(stage_key, 0.0) / max(
                     self.window_stage_weights.get(stage_key, 0.0), 1e-9
                 )
+                stage_cross_transition_rate = self.window_stage_cross_transitions.get(stage_key, 0.0) / max(
+                    self.window_stage_transition_weights.get(stage_key, 0.0), 1e-9
+                )
                 count_cost = (
                     self.slow_count_latency_coef * tail_cost
                     + self.slow_deployment_memory_coef * memory_fraction
@@ -1493,7 +1541,11 @@ class HierarchicalPPOAgent:
                     + self.slow_idle_replica_coef * redundant_replica_fraction
                     + self.slow_count_shortage_coef * violation_rate
                 )
-                placement_cost = tail_cost + self.slow_deadline_violation_coef * violation_rate
+                placement_cost = (
+                    tail_cost
+                    + self.slow_deadline_violation_coef * violation_rate
+                    + self.slow_colocation_coef * stage_cross_transition_rate
+                )
                 count_returns[stage_key] = -self.slow_reward_scale * float(count_cost)
                 placement_returns[stage_key] = -self.slow_reward_scale * float(placement_cost)
         return count_returns, placement_returns, {

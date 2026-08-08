@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import sys
 
 import numpy as np
@@ -11,6 +12,35 @@ try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover - only used when tqdm is unavailable.
     tqdm = None
+
+
+def _center_advantages_by_group(
+    advantages: np.ndarray,
+    weights: np.ndarray,
+    group_ids: np.ndarray,
+) -> np.ndarray:
+    """Remove each comparison group's weighted advantage mean.
+
+    Slow Count actions for different service stages have very different base
+    latency scales.  Centering within a stage makes the actor compare replica
+    counts for the same stage instead of learning that intrinsically expensive
+    stages are globally bad actions.
+    """
+
+    centered = np.asarray(advantages, dtype=np.float32).copy()
+    weights_np = np.asarray(weights, dtype=np.float32)
+    groups_np = np.asarray(group_ids)
+    if centered.ndim != 1 or weights_np.shape != centered.shape or groups_np.shape != centered.shape:
+        raise ValueError("advantages, weights, and group_ids must have the same 1D shape")
+    for group_id in np.unique(groups_np):
+        group_mask = groups_np == group_id
+        group_weights = weights_np[group_mask]
+        denominator = float(group_weights.sum())
+        if denominator <= 1e-8:
+            continue
+        group_mean = float(np.sum(centered[group_mask] * group_weights) / denominator)
+        centered[group_mask] -= group_mean
+    return centered
 
 
 @dataclass
@@ -261,12 +291,13 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
 
 
 class GraphAttentionActorCritic(nn.Module):
-    """Graph actor-critic for either node placement or scalar count actions.
+    """Graph actor-critic for either node placement or ordered count actions.
 
     Slow deployment has two action heads: placement scores every node, while
-    replica count is a scalar categorical action. Both heads consume the same
-    topology-aware graph representation so they can see resource pressure and
-    execution feedback over the whole edge network.
+    replica count is represented by a discretized Gaussian over the ordered
+    actions. Both heads consume the same topology-aware graph representation so
+    they can see resource pressure and execution feedback over the whole edge
+    network.
     """
 
     def __init__(
@@ -287,6 +318,7 @@ class GraphAttentionActorCritic(nn.Module):
         self.node_feature_dim = node_feature_dim
         self.edge_feature_dim = edge_feature_dim
         self.num_nodes = num_nodes
+        self.action_dim = action_dim
         self.action_mode = action_mode
         self.node_offset = global_dim
         self.edge_offset = global_dim + num_nodes * node_feature_dim
@@ -321,8 +353,17 @@ class GraphAttentionActorCritic(nn.Module):
             self.actor = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
+                # Predict an ordered distribution center and log scale instead
+                # of one unrelated logit per possible replica count.
+                nn.Linear(hidden_dim, 2),
             )
+            with torch.no_grad():
+                self.actor[-1].bias[0] = 0.0
+                # Start broad enough to explore nearby replica counts without
+                # making the center gradient vanish across the full action
+                # range.  The previous action_dim / 3 scale kept 32-count
+                # policies close to uniform and diluted the ordinal signal.
+                self.actor[-1].bias[1] = math.log(max(float(action_dim) / 6.0, 1.0))
         self.critic = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
@@ -355,7 +396,20 @@ class GraphAttentionActorCritic(nn.Module):
                 dim=-1,
             )).squeeze(-1)
         else:
-            logits = self.actor(graph_context)
+            count_parameters = self.actor(graph_context)
+            center = torch.sigmoid(count_parameters[:, 0]) * max(float(self.action_dim - 1), 0.0)
+            log_scale = torch.clamp(
+                count_parameters[:, 1],
+                min=math.log(0.35),
+                max=math.log(max(float(self.action_dim), 1.0)),
+            )
+            scale = torch.exp(log_scale)
+            count_indices = torch.arange(
+                self.action_dim,
+                dtype=graph_context.dtype,
+                device=graph_context.device,
+            ).unsqueeze(0)
+            logits = -0.5 * torch.square((count_indices - center.unsqueeze(1)) / scale.unsqueeze(1))
 
         safe_masks = masks.bool()
         fallback = torch.zeros_like(safe_masks)
@@ -727,6 +781,8 @@ class PPOAgent:
         returns: np.ndarray,
         *,
         sample_weights: np.ndarray | None = None,
+        advantage_group_ids: np.ndarray | None = None,
+        actor_use_value_baseline: bool = True,
         progress_label: str = "",
         progress_interval_seconds: float = 0.0,
     ) -> dict[str, float]:
@@ -769,7 +825,20 @@ class PPOAgent:
                 raise ValueError("sample_weights must be finite and non-negative")
         weights_np = weights_np / max(float(weights_np.mean()), 1e-8)
 
-        advantages_np = returns_np - old_values_np
+        # A poor component critic can make an otherwise useful Monte-Carlo
+        # signal noisier. Count can therefore train its actor from direct
+        # returns centered within comparable service stages, while the value
+        # head still learns the original absolute returns below.
+        advantages_np = returns_np - old_values_np if actor_use_value_baseline else returns_np.copy()
+        if advantage_group_ids is not None:
+            group_ids_np = np.asarray(advantage_group_ids)
+            if group_ids_np.shape != (n,):
+                raise ValueError(f"advantage_group_ids must have shape ({n},), got {group_ids_np.shape}")
+            advantages_np = _center_advantages_by_group(
+                advantages_np,
+                weights_np,
+                group_ids_np,
+            )
         advantage_mean = float(np.average(advantages_np, weights=weights_np))
         advantage_variance = float(np.average((advantages_np - advantage_mean) ** 2, weights=weights_np))
         advantage_std = float(np.sqrt(advantage_variance))

@@ -31,8 +31,8 @@ traffic:
   load_multipliers: [1.0]
   pressure_profile: baseline
   # mec-moderate preset: active_ratio=0.20, active_rate=1.75/min,
-  # task_compute=1.35, task_data=2.5, node_capacity=0.75,
-  # wired_bandwidth=0.25, service_resource_fraction=0.35, deadline_scale=2.5.
+  # task_compute=1.65, task_data=2.5, node_capacity=0.65,
+  # wired_bandwidth=0.15, service_resource_fraction=0.25, deadline_scale=2.75.
   rollout_start_mode: beginning
   eval_rollout_start_mode: same
   task_compute_scale: 1.0
@@ -70,6 +70,7 @@ agent:
     slow_windows_per_update: 32
     joint_training_schedule: alternating
     fast_updates_per_cycle: 3
+    fast_warmup_updates: 4
     slow_warmup_updates: 4
     synchronized_window_block: 0
     slow_agent_decision: every_10_minutes
@@ -83,9 +84,15 @@ agent:
     slow_placement_entropy_coef: null
     slow_tail_latency_coef: 0.35
     slow_value_coef: 0.5
+    slow_count_value_coef: 0.0
     slow_critic_lr: 0.0003
     slow_critic_k_epochs: 4
     slow_composite_action_return: factorized_service_stage_return_per_10min_window
+    slow_count_advantage: centered_within_service_stage
+    slow_count_policy: ordered_discretized_gaussian
+    slow_count_initial_scale: action_dimension_divided_by_6
+    slow_count_actor_baseline: direct_stage_return
+    slow_count_critic_gradient: disabled
     slow_deployment_memory_coef: 0.03
     slow_deployment_storage_coef: 0.01
     slow_migration_coef: 0.0
@@ -98,7 +105,7 @@ agent:
     fast_reservation_microbatch_size: 16
     reward:
       fast: stage_latency_plus_exact_kkt_marginal_externality
-      slow: factorized_stage_tail_latency_plus_continuous_replica_efficiency_and_deadline_cost
+      slow: factorized_count_efficiency_and_placement_latency_plus_local_colocation_credit
       resource_shaping_scope: diagnostics_only
       compute_hotspot_threshold: 0.60
       link_hotspot_threshold: 0.60

@@ -32,12 +32,12 @@ def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
 
     assert args.active_user_ratio == 0.20
     assert args.active_user_request_rate_per_minute == 1.75
-    assert args.task_compute_scale == 1.35
+    assert args.task_compute_scale == 1.65
     assert args.task_data_scale == 2.5
-    assert args.node_compute_capacity_scale == 0.75
-    assert args.wired_link_bandwidth_scale == 0.25
-    assert args.service_resource_fraction == 0.35
-    assert args.deadline_scale == 2.5
+    assert args.node_compute_capacity_scale == 0.65
+    assert args.wired_link_bandwidth_scale == 0.15
+    assert args.service_resource_fraction == 0.25
+    assert args.deadline_scale == 2.75
     assert args.load_multipliers == "0.8,1.1,1.4,1.7"
 
 
@@ -666,6 +666,8 @@ def test_alternating_schedule_freezes_one_controller_per_phase(tmp_path):
         "alternating",
         "--fast-updates-per-cycle",
         "2",
+        "--fast-warmup-updates",
+        "0",
         "--slow-warmup-updates",
         "0",
         "--episode-hours",
@@ -701,14 +703,14 @@ def test_alternating_schedule_freezes_one_controller_per_phase(tmp_path):
     assert float(rows[2]["slow_count_return_std"]) > 0.0
 
 
-def test_alternating_schedule_runs_slow_warmup_before_fast_updates(tmp_path):
+def test_alternating_schedule_runs_fast_then_slow_warmup(tmp_path):
     log_dir = tmp_path / "logs"
     save_dir = tmp_path / "savedModels"
     command = [
         sys.executable,
         "train_dual_ppo.py",
         "--updates",
-        "3",
+        "5",
         "--rollout-unit",
         "window",
         "--fast-windows-per-update",
@@ -718,6 +720,8 @@ def test_alternating_schedule_runs_slow_warmup_before_fast_updates(tmp_path):
         "--joint-training-schedule",
         "alternating",
         "--fast-updates-per-cycle",
+        "2",
+        "--fast-warmup-updates",
         "2",
         "--slow-warmup-updates",
         "2",
@@ -746,11 +750,20 @@ def test_alternating_schedule_runs_slow_warmup_before_fast_updates(tmp_path):
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert [row["training_phase"] for row in rows] == ["slow_warmup", "slow_warmup", "fast"]
-    assert [row["slow_updated"] for row in rows] == ["1", "1", "0"]
-    assert [float(row["fast_loss"]) == 0.0 for row in rows] == [True, True, False]
+    assert [row["training_phase"] for row in rows] == [
+        "fast_warmup",
+        "fast_warmup",
+        "slow_warmup",
+        "slow_warmup",
+        "fast",
+    ]
+    assert [row["slow_updated"] for row in rows] == ["0", "0", "1", "1", "0"]
+    assert any(float(row["fast_loss"]) != 0.0 for row in rows[:2])
+    assert [float(row["fast_loss"]) == 0.0 for row in rows[2:4]] == [True, True]
+    assert float(rows[4]["fast_loss"]) != 0.0
     assert "slow_count_effective_replicas_per_stage" in rows[0]
     assert "slow_count_redundant_replica_fraction" in rows[0]
+    assert "slow_count_advantage_std" in rows[0]
 
 
 def test_convergence_analyzer_reads_training_log(tmp_path):
