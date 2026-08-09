@@ -13,6 +13,8 @@ scenario:
   scenario_refresh_episodes: 4
   scenario_refresh_scope: demand_only
   demand_sampling_mode: episode
+  demand_scenario_schedule: shuffled-pool
+  demand_scenario_pool_size: 8
 
 time_scales:
   slow_deployment_interval_minutes: 10
@@ -74,6 +76,7 @@ agent:
     slow_warmup_updates: 4
     synchronized_window_block: 0
     slow_agent_decision: every_10_minutes
+    slow_fast_collection_mode: stochastic_frozen
     fast_agent_decision: per_request
     optimizer_update: after_rollout_batch
     max_replicas_per_stage: null
@@ -81,7 +84,12 @@ agent:
     masked_actions: true
     feasibility_repair: true
     slow_count_entropy_coef: null
-    slow_placement_entropy_coef: null
+    slow_placement_entropy_coef: 0.003
+    slow_count_lr: 0.00015
+    slow_placement_lr: 0.00015
+    slow_count_target_kl: 0.015
+    slow_placement_target_kl: 0.015
+    fast_target_kl: 0.015
     slow_tail_latency_coef: 0.35
     slow_value_coef: 0.5
     slow_count_value_coef: 0.0
@@ -89,14 +97,18 @@ agent:
     slow_critic_k_epochs: 4
     slow_composite_action_return: factorized_service_stage_return_per_10min_window
     slow_count_advantage: centered_within_service_stage
+    slow_placement_advantage: per_node_direct_return_centered_within_service_stage
     slow_count_policy: ordered_discretized_gaussian
     slow_count_initial_scale: action_dimension_divided_by_6
+    slow_count_minimum_scale: action_dimension_divided_by_12
     slow_count_actor_baseline: direct_stage_return
     slow_count_critic_gradient: disabled
     slow_deployment_memory_coef: 0.03
     slow_deployment_storage_coef: 0.01
     slow_migration_coef: 0.0
     slow_idle_replica_coef: 0.25
+    slow_placement_idle_coef: 0.10
+    slow_placement_compute_coef: 0.20
     slow_count_shortage_coef: 0.25
     slow_count_latency_coef: 1.0
     slow_deterministic_count_mode: expected
@@ -105,7 +117,7 @@ agent:
     fast_reservation_microbatch_size: 16
     reward:
       fast: stage_latency_plus_exact_kkt_marginal_externality
-      slow: factorized_count_efficiency_and_placement_latency_plus_local_colocation_credit
+      slow: factorized_count_efficiency_and_per_node_placement_latency_utilization_colocation_credit
       resource_shaping_scope: diagnostics_only
       compute_hotspot_threshold: 0.60
       link_hotspot_threshold: 0.60

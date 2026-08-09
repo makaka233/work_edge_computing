@@ -103,13 +103,22 @@ Gaussian over feasible replica counts. Nearby counts therefore share statistical
 strength and the deterministic expected-count decoder remains consistent with the
 stochastic training policy. Its initial scale is one sixth of the action range,
 which preserves local exploration without keeping a 32-count policy nearly uniform.
+A one-twelfth-range scale floor prevents Count entropy from collapsing while it
+is still adapting to a changing Fast policy. Count also uses an independent
+`1.5e-4` learning rate and `0.015` KL limit by default.
 
 Slow deployment is trained from one 10-minute window at a time, but Count and
 Placement no longer receive one undifferentiated return for every component
-action. Placement receives service-stage mean/P95 latency, deadline return, and
-the observed cross-node transition rate of the adjacent stages owned by that
-placement action. The colocation term is therefore stage-local actor credit rather
-than only a global window diagnostic.
+action. Each Placement node action receives its own mean/P95 latency, actual
+traffic usage, adjacent-stage cross-node result, and node-local compute-load
+cost (`--slow-placement-compute-coef`, default 0.20). An unused selected node
+receives a node-local idle penalty, while an unused node's colocation credit falls
+back to deployment overlap with adjacent stages. Placement critic gradients are
+detached from the actor graph encoder so value fitting cannot flatten node scores.
+Placement actor returns are centered within the same service stage before
+normalization, making the policy compare alternative nodes rather than unrelated
+absolute latency scales across stages. Placement uses an independent `1.5e-4`
+learning rate, `0.015` KL limit, and `0.003` entropy coefficient by default.
 Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
 and deadline violations penalize under-provisioning, while a continuous effective-
 replica measure based on request shares penalizes replicas that add little usable
@@ -135,9 +144,11 @@ the current convergence experiments.
 Fast and Slow PPO use alternating frozen-controller phases by default. Four Fast
 warm-up updates first learn under the conservative expected-count Slow deployment.
 Four Slow warm-up updates then collect 32 windows each with the now-trained Fast
-policy frozen. Afterwards, three Fast updates collect stochastic Fast actions
+policy frozen but still sampled stochastically. This exposes the utility of
+alternative replicas instead of labelling everything outside deterministic Fast's
+top choice as redundant. Afterwards, three Fast updates collect stochastic Fast actions
 under deterministic Slow deployment;
-the next Slow update freezes Fast deterministically and collects 32 independent
+the next Slow update freezes Fast parameters, samples its policy, and collects 32 independent
 window returns. Because replica count is ordinal, deterministic Slow deployment
 uses the ceiling of the Count distribution's expected replica count instead of an
 unstable categorical argmax; use `--slow-deterministic-count-mode mode` only for an
@@ -150,6 +161,7 @@ critic ablation; doing so reintroduces shared-backbone critic gradients.
 Configure the cadence with `--fast-warmup-updates`, `--slow-warmup-updates`,
 `--fast-updates-per-cycle`,
 `--fast-windows-per-update`, and `--slow-windows-per-update`; use
+`--slow-fast-collection-mode deterministic` only for the former deterministic-Fast ablation.
 `--joint-training-schedule simultaneous` only for legacy ablations. The log field
 `training_phase` records which policy was active.
 For a synchronized training block, use `--synchronized-window-block 4`; this
@@ -189,6 +201,15 @@ not change. Request samples still change every rollout. Eval seeds therefore
 check demand generalization on the same edge infrastructure, not a different
 physical network.
 
+Training demand seeds come from a deterministic shuffled pool by default
+(`--demand-scenario-schedule shuffled-pool --demand-scenario-pool-size 8`).
+Every pool cycle visits each demand scenario once in a new order, preventing
+harder service-popularity draws from being accidentally aligned with later PPO
+updates. Use `--demand-scenario-schedule sequential` only to reproduce the old
+monotonic seed schedule. Logs include expected compute, data, deadline, and
+service-popularity entropy for the active demand mix, so policy changes can be
+separated from scenario difficulty without a separate evaluation rollout.
+
 Training logs include deployment size and resource diagnostics: node compute
 EWMA load, wired-link EWMA load, memory/storage deployment utilization, and the
 fraction of nodes with at least one deployed stage. They also include load
@@ -198,6 +219,12 @@ latency. Scheduler utilization diagnostics report whether fast scheduling uses
 the deployed service replicas: `used_replica_rate`, `idle_replica_rate`,
 `used_replicas_per_stage`, normalized replica-use entropy,
 top-1 replica-use share, and cross-node stage transition rate.
+
+Fast optimizer diagnostics additionally report full-batch policy entropy,
+non-negative sampled KL, clip fraction, raw advantage mean/standard deviation,
+completed epochs, and KL early stops. Fast uses a `0.015` KL limit by default;
+the optimizer stops within an epoch when a later minibatch has already crossed
+that limit instead of averaging positive and negative signed estimates.
 
 Demand-side load can be raised without changing physical infrastructure. Use
 `--traffic-scale`, `--active-user-ratio`, and

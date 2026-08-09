@@ -7,10 +7,12 @@ from pathlib import Path
 from train_dual_ppo import (
     apply_pressure_profile,
     demand_seed_for_training_rollout,
+    demand_profile_summary,
     effective_replicas_per_stage,
     load_multiplier_for_rollout,
     rollout_start_minute,
     scenario_seed_for_offset,
+    use_deterministic_fast_collection,
 )
 
 
@@ -64,6 +66,12 @@ def test_pressure_profile_does_not_override_explicit_scale():
     assert args.task_data_scale == 2.5
 
 
+def test_slow_collection_uses_frozen_stochastic_fast_by_default():
+    assert not use_deterministic_fast_collection(True, "stochastic")
+    assert use_deterministic_fast_collection(True, "deterministic")
+    assert not use_deterministic_fast_collection(False, "deterministic")
+
+
 def test_scenario_refresh_groups_training_episodes():
     args = Namespace(seed=2026, fixed_scenario=False, scenario_refresh_episodes=20)
 
@@ -81,6 +89,57 @@ def test_demand_sampling_mode_controls_training_demand_seed():
     assert demand_seed_for_training_rollout(episode_args, rollout_idx=20, episode_idx=1) == 2026
     assert demand_seed_for_training_rollout(rollout_args, rollout_idx=19, episode_idx=0) == 2045
     assert demand_seed_for_training_rollout(rollout_args, rollout_idx=20, episode_idx=1) == 2046
+
+
+def test_shuffled_demand_pool_reuses_each_seed_once_per_cycle():
+    args = Namespace(
+        seed=2026,
+        fixed_scenario=False,
+        scenario_refresh_episodes=2,
+        demand_sampling_mode="episode",
+        demand_scenario_schedule="shuffled-pool",
+        demand_scenario_pool_size=4,
+    )
+
+    first_cycle = [
+        demand_seed_for_training_rollout(args, rollout_idx=0, episode_idx=episode)
+        for episode in range(0, 8, 2)
+    ]
+    second_cycle = [
+        demand_seed_for_training_rollout(args, rollout_idx=0, episode_idx=episode)
+        for episode in range(8, 16, 2)
+    ]
+
+    assert sorted(first_cycle) == [2026, 2027, 2028, 2029]
+    assert sorted(second_cycle) == [2026, 2027, 2028, 2029]
+    assert first_cycle == [
+        demand_seed_for_training_rollout(args, rollout_idx=0, episode_idx=episode)
+        for episode in range(0, 8, 2)
+    ]
+
+
+def test_demand_profile_summary_exposes_policy_independent_difficulty():
+    from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
+
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=2026,
+            physical_seed=2026,
+            scenario_seed=2030,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+        )
+    )
+    env.reset()
+
+    summary = demand_profile_summary(env)
+
+    assert summary["demand_expected_compute_gcycles"] > 0.0
+    assert summary["demand_expected_data_mb"] > 0.0
+    assert summary["demand_expected_deadline_s"] > 0.0
+    assert summary["demand_service_popularity_entropy"] > 0.0
 
 
 def test_zero_replica_cap_uses_node_count():

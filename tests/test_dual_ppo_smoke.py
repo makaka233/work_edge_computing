@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 from edge_drl.agents.drl import HierarchicalPPOAgent, fast_obs_dim, slow_obs_dim
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
@@ -43,6 +44,42 @@ def test_count_actor_can_bypass_failed_value_baseline():
     )
     assert np.isclose(metrics["advantage_mean"], 0.0)
     assert np.isclose(metrics["advantage_std"], np.sqrt(10.0))
+
+
+def test_fast_ppo_reports_full_batch_diagnostics_and_strict_kl_stop():
+    torch.manual_seed(7)
+    np.random.seed(7)
+    ppo = PPOAgent(
+        obs_dim=2,
+        action_dim=2,
+        hidden_dim=8,
+        lr=0.05,
+        k_epochs=4,
+        minibatch_size=4,
+        target_kl=1e-8,
+    )
+    mask = np.asarray([True, True])
+    for index in range(16):
+        state = np.asarray([float(index % 2), float(index // 2) / 8.0], dtype=np.float32)
+        probabilities, value = ppo.action_probabilities(state, mask)
+        action = index % 2
+        ppo.buffer.states.append(state)
+        ppo.buffer.masks.append(mask.copy())
+        ppo.buffer.actions.append(action)
+        ppo.buffer.logprobs.append(float(np.log(probabilities[action])))
+        ppo.buffer.values.append(value)
+        ppo.buffer.rewards.append(1.0 if action == int(state[0]) else -1.0)
+        ppo.buffer.dones.append(True)
+        ppo.buffer.weights.append(1.0)
+
+    metrics = ppo.update()
+
+    assert metrics["entropy"] >= 0.0
+    assert metrics["approx_kl"] >= 0.0
+    assert 0.0 <= metrics["clip_fraction"] <= 1.0
+    assert metrics["advantage_std"] > 0.0
+    assert metrics["epochs_completed"] <= 4.0
+    assert metrics["kl_early_stop"] == 1.0
 
 
 def test_disabled_count_critic_does_not_update_critic_head():
@@ -442,7 +479,12 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     assert agent.slow_agent.count_ppo.policy.actor[-1].out_features == 2
     assert agent.slow_agent.count_ppo.policy.action_dim == 4
     assert agent.slow_agent.count_ppo.value_coef == 0.0
+    assert np.isclose(agent.slow_agent.count_ppo.optimizer.param_groups[0]["lr"], 1.5e-4)
+    assert np.isclose(agent.slow_agent.count_ppo.target_kl, 0.015)
     assert agent.slow_agent.placement_ppo.policy.actor[-1].out_features == 1
+    assert agent.slow_agent.placement_ppo.policy.detach_critic_backbone
+    assert np.isclose(agent.slow_agent.placement_ppo.optimizer.param_groups[0]["lr"], 1.5e-4)
+    assert np.isclose(agent.slow_agent.placement_ppo.target_kl, 0.015)
 
     def count_two(state, mask, deterministic=False):
         assert mask[1]
@@ -521,6 +563,7 @@ def test_slow_count_policy_is_unimodal_over_ordered_replica_actions():
     assert np.isclose(probabilities.sum(), 1.0)
     initial_scale = float(np.exp(agent.slow_agent.count_ppo.policy.actor[-1].bias[1].item()))
     assert np.isclose(initial_scale, 8.0 / 6.0)
+    assert np.isclose(agent.slow_agent.count_ppo.policy.count_min_scale, 1.0)
 
 
 def test_deterministic_slow_count_uses_conservative_distribution_mean():
@@ -698,6 +741,7 @@ def test_factorized_placement_return_receives_local_colocation_credit():
         slow_reward_scale=1.0,
         slow_tail_latency_coef=0.0,
         slow_colocation_coef=0.2,
+        slow_placement_compute_coef=0.0,
         slow_deadline_violation_coef=0.0,
     )
     service = next(service for service in env.scenario.services if len(service.stages) >= 2)
@@ -724,3 +768,70 @@ def test_factorized_placement_return_receives_local_colocation_credit():
     assert np.isclose(agent.window_stage_cross_transitions[second_key], 1.0)
     assert np.isclose(placement_returns[first_key], -0.3)
     assert np.isclose(placement_returns[second_key], -0.3)
+
+
+def test_factorized_placement_returns_distinguish_selected_nodes():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=40,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_reward_scale=1.0,
+        slow_tail_latency_coef=0.0,
+        slow_colocation_coef=0.2,
+        slow_placement_idle_coef=0.1,
+        slow_placement_compute_coef=0.5,
+        slow_deadline_violation_coef=0.0,
+    )
+    service = next(service for service in env.scenario.services if len(service.stages) >= 2)
+    env.deployment[service.service_id, 0] = False
+    env.deployment[service.service_id, 1] = False
+    env.deployment[service.service_id, 0, [0, 2]] = True
+    env.deployment[service.service_id, 1, [1, 2]] = True
+    env.node_compute_load[[0, 1, 2]] = [0.4, 0.6, 0.1]
+    agent.observe_step_reward(
+        reward=-0.4,
+        stage_count=2,
+        done=False,
+        record_fast=False,
+        weight=3.0,
+        latency_s=0.4,
+        deadline_s=1.0,
+        cross_stage_transitions=3.0,
+        stage_transitions=3.0,
+        service_id=service.service_id,
+        stage_nodes=[0, 1],
+        slow_stage_costs=[0.1, 0.3],
+    )
+    agent.observe_step_reward(
+        reward=-0.4,
+        stage_count=2,
+        done=False,
+        record_fast=False,
+        weight=1.0,
+        latency_s=0.4,
+        deadline_s=1.0,
+        cross_stage_transitions=0.0,
+        stage_transitions=1.0,
+        service_id=service.service_id,
+        stage_nodes=[2, 2],
+        slow_stage_costs=[0.2, 0.2],
+    )
+
+    _, placement_returns, credit_metrics = agent._factorized_stage_returns(env)
+
+    assert np.isclose(placement_returns[(service.service_id, 0, 0)], -0.5)
+    assert np.isclose(placement_returns[(service.service_id, 0, 2)], -0.25)
+    assert np.isclose(placement_returns[(service.service_id, 1, 1)], -0.8)
+    assert np.isclose(placement_returns[(service.service_id, 1, 2)], -0.25)
+    assert np.isclose(credit_metrics["slow_placement_node_compute_load"], 0.3)
+    assert np.isclose(credit_metrics["slow_placement_node_compute_cost"], 0.15)

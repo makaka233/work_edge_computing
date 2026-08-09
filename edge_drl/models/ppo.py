@@ -310,6 +310,7 @@ class GraphAttentionActorCritic(nn.Module):
         action_dim: int,
         action_mode: str,
         hidden_dim: int = 128,
+        detach_critic_backbone: bool = False,
     ):
         super().__init__()
         if action_mode not in {"node", "count"}:
@@ -320,6 +321,8 @@ class GraphAttentionActorCritic(nn.Module):
         self.num_nodes = num_nodes
         self.action_dim = action_dim
         self.action_mode = action_mode
+        self.detach_critic_backbone = detach_critic_backbone
+        self.count_min_scale = max(float(action_dim) / 12.0, 1.0)
         self.node_offset = global_dim
         self.edge_offset = global_dim + num_nodes * node_feature_dim
 
@@ -400,7 +403,7 @@ class GraphAttentionActorCritic(nn.Module):
             center = torch.sigmoid(count_parameters[:, 0]) * max(float(self.action_dim - 1), 0.0)
             log_scale = torch.clamp(
                 count_parameters[:, 1],
-                min=math.log(0.35),
+                min=math.log(self.count_min_scale),
                 max=math.log(max(float(self.action_dim), 1.0)),
             )
             scale = torch.exp(log_scale)
@@ -417,7 +420,8 @@ class GraphAttentionActorCritic(nn.Module):
         safe_masks = torch.where(safe_masks.any(dim=1, keepdim=True), safe_masks, fallback)
         logits = logits.masked_fill(~safe_masks, -1e9)
         dist = Categorical(logits=logits)
-        values = self.critic(graph_context).squeeze(-1)
+        critic_context = graph_context.detach() if self.detach_critic_backbone else graph_context
+        values = self.critic(critic_context).squeeze(-1)
         return dist, values
 
     def _graph_attention(self, node_emb: torch.Tensor, edge_features: torch.Tensor) -> torch.Tensor:
@@ -455,6 +459,7 @@ class PPOAgent:
         node_feature_dim: int | None = None,
         edge_feature_dim: int | None = None,
         num_nodes: int | None = None,
+        detach_critic_backbone: bool = False,
         device: str = "cpu",
     ):
         self.gamma = gamma
@@ -498,11 +503,28 @@ class PPOAgent:
                 action_dim=action_dim,
                 action_mode="node" if policy_kind == "slow_gat_node" else "count",
                 hidden_dim=hidden_dim,
+                detach_critic_backbone=detach_critic_backbone,
             ).to(self.device)
         else:
             raise ValueError(f"unknown policy_kind: {policy_kind}")
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
         self.buffer = RolloutBuffer()
+
+    def _clip_policy_gradients(self, max_norm: float = 0.5) -> None:
+        """Clip detached actor/backbone and critic gradients independently."""
+
+        if not bool(getattr(self.policy, "detach_critic_backbone", False)):
+            nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm)
+            return
+        critic_parameters = list(self.policy.critic.parameters())
+        critic_parameter_ids = {id(parameter) for parameter in critic_parameters}
+        actor_parameters = [
+            parameter
+            for parameter in self.policy.parameters()
+            if id(parameter) not in critic_parameter_ids
+        ]
+        nn.utils.clip_grad_norm_(actor_parameters, max_norm)
+        nn.utils.clip_grad_norm_(critic_parameters, max_norm)
 
     def act(self, state: np.ndarray, mask: np.ndarray, deterministic: bool = False) -> tuple[int, float, float]:
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -566,9 +588,66 @@ class PPOAgent:
             probs = dist.probs.squeeze(0).detach().cpu().numpy()
         return probs, float(value.item())
 
+    def _buffer_policy_diagnostics(
+        self,
+        actions_np: np.ndarray,
+        old_logprobs_np: np.ndarray,
+        weights_np: np.ndarray,
+    ) -> dict[str, float]:
+        """Measure the final policy against the complete behavior-policy batch."""
+
+        weighted_entropy = 0.0
+        weighted_kl = 0.0
+        weighted_clip = 0.0
+        total_weight = 0.0
+        batch_size = max(1, min(self.minibatch_size, len(actions_np)))
+        with torch.no_grad():
+            for start in range(0, len(actions_np), batch_size):
+                end = start + batch_size
+                states = torch.as_tensor(
+                    np.stack(self.buffer.states[start:end]), dtype=torch.float32, device=self.device
+                )
+                masks = torch.as_tensor(
+                    np.stack(self.buffer.masks[start:end]), dtype=torch.bool, device=self.device
+                )
+                actions = torch.as_tensor(actions_np[start:end], dtype=torch.long, device=self.device)
+                old_logprobs = torch.as_tensor(
+                    old_logprobs_np[start:end], dtype=torch.float32, device=self.device
+                )
+                batch_weights = torch.as_tensor(
+                    weights_np[start:end], dtype=torch.float32, device=self.device
+                )
+                dist, _ = self.policy(states, masks)
+                logprobs = dist.log_prob(actions)
+                log_ratios = logprobs - old_logprobs
+                ratios = torch.exp(log_ratios)
+                kl_values = (ratios - 1.0) - log_ratios
+                clip_values = (torch.abs(ratios - 1.0) > self.eps_clip).float()
+                weighted_entropy += float((dist.entropy() * batch_weights).sum().item())
+                weighted_kl += float((kl_values * batch_weights).sum().item())
+                weighted_clip += float((clip_values * batch_weights).sum().item())
+                total_weight += float(batch_weights.sum().item())
+        denominator = max(total_weight, 1e-8)
+        return {
+            "entropy": weighted_entropy / denominator,
+            "approx_kl": weighted_kl / denominator,
+            "clip_fraction": weighted_clip / denominator,
+        }
+
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         if len(self.buffer) == 0:
-            return {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
+            return {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "entropy": 0.0,
+                "approx_kl": 0.0,
+                "clip_fraction": 0.0,
+                "advantage_mean": 0.0,
+                "advantage_std": 0.0,
+                "epochs_completed": 0.0,
+                "kl_early_stop": 0.0,
+            }
         if len(self.buffer.rewards) != len(self.buffer.actions):
             raise ValueError("buffer contains pending transitions without rewards")
 
@@ -582,7 +661,8 @@ class PPOAgent:
         weights_np /= max(float(weights_np.mean()), 1e-8)
         advantage_mean = float(np.average(advantages_np, weights=weights_np))
         advantage_variance = float(np.average((advantages_np - advantage_mean) ** 2, weights=weights_np))
-        advantages_np = (advantages_np - advantage_mean) / (np.sqrt(advantage_variance) + 1e-8)
+        advantage_std = float(np.sqrt(advantage_variance))
+        advantages_np = (advantages_np - advantage_mean) / (advantage_std + 1e-8)
 
         actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
@@ -602,7 +682,19 @@ class PPOAgent:
                 file=sys.stdout,
             )
 
-        last_metrics: dict[str, float] = {}
+        last_metrics: dict[str, float] = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "approx_kl": 0.0,
+            "clip_fraction": 0.0,
+            "advantage_mean": advantage_mean,
+            "advantage_std": advantage_std,
+        }
+        optimizer_steps = 0
+        epochs_completed = 0
+        kl_early_stop = False
         for epoch_idx in range(self.k_epochs):
             order = np.random.permutation(n)
             approx_kls: list[float] = []
@@ -621,8 +713,16 @@ class PPOAgent:
                 logprobs = dist.log_prob(actions)
                 entropy_values = dist.entropy()
                 entropy = (entropy_values * sample_weights).mean()
-                ratios = torch.exp(logprobs - old_logprobs)
-                approx_kl = ((old_logprobs - logprobs) * sample_weights).mean()
+                log_ratios = logprobs - old_logprobs
+                ratios = torch.exp(log_ratios)
+                approx_kl = (((ratios - 1.0) - log_ratios) * sample_weights).mean()
+                clip_fraction = (
+                    (torch.abs(ratios - 1.0) > self.eps_clip).float() * sample_weights
+                ).mean()
+
+                if self.target_kl is not None and optimizer_steps > 0 and float(approx_kl.item()) > self.target_kl:
+                    kl_early_stop = True
+                    break
 
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
@@ -632,8 +732,9 @@ class PPOAgent:
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self._clip_policy_gradients()
                 self.optimizer.step()
+                optimizer_steps += 1
                 approx_kls.append(float(approx_kl.item()))
                 last_metrics = {
                     "loss": float(loss.item()),
@@ -641,6 +742,9 @@ class PPOAgent:
                     "value_loss": float(value_loss.item()),
                     "entropy": float(entropy.item()),
                     "approx_kl": float(approx_kl.item()),
+                    "clip_fraction": float(clip_fraction.item()),
+                    "advantage_mean": advantage_mean,
+                    "advantage_std": advantage_std,
                 }
                 if progress is not None:
                     progress.update(1)
@@ -652,11 +756,18 @@ class PPOAgent:
                         ),
                         refresh=False,
                     )
+            epochs_completed = epoch_idx + 1
+            if kl_early_stop:
+                break
             if self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
+                kl_early_stop = True
                 break
         if progress is not None:
             progress.close()
 
+        last_metrics.update(self._buffer_policy_diagnostics(actions_np, old_logprobs_np, weights_np))
+        last_metrics["epochs_completed"] = float(epochs_completed)
+        last_metrics["kl_early_stop"] = float(kl_early_stop)
         self.buffer.clear()
         return last_metrics
 
@@ -749,7 +860,7 @@ class PPOAgent:
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self._clip_policy_gradients()
                 self.optimizer.step()
                 approx_kls.append(float(approx_kl.item()))
                 last_metrics = {
@@ -873,7 +984,19 @@ class PPOAgent:
                 file=sys.stdout,
             )
 
-        last_metrics: dict[str, float] = {}
+        last_metrics: dict[str, float] = {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "approx_kl": 0.0,
+            "clip_fraction": 0.0,
+            "advantage_mean": advantage_mean,
+            "advantage_std": advantage_std,
+        }
+        optimizer_steps = 0
+        epochs_completed = 0
+        kl_early_stop = False
         for epoch_idx in range(self.k_epochs):
             order = np.random.permutation(n)
             approx_kls: list[float] = []
@@ -899,8 +1022,15 @@ class PPOAgent:
                 dist, values = self.policy(states, masks)
                 logprobs = dist.log_prob(actions)
                 entropies = dist.entropy()
-                ratios = torch.exp(logprobs - old_logprobs)
-                approx_kl = ((old_logprobs - logprobs) * batch_weights).sum() / denominator
+                log_ratios = logprobs - old_logprobs
+                ratios = torch.exp(log_ratios)
+                approx_kl = (((ratios - 1.0) - log_ratios) * batch_weights).sum() / denominator
+                clip_fraction = (
+                    (torch.abs(ratios - 1.0) > self.eps_clip).float() * batch_weights
+                ).sum() / denominator
+                if self.target_kl is not None and optimizer_steps > 0 and float(approx_kl.item()) > self.target_kl:
+                    kl_early_stop = True
+                    break
                 surr1 = ratios * advantages
                 surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
                 policy_loss = -(torch.min(surr1, surr2) * batch_weights).sum() / denominator
@@ -910,8 +1040,9 @@ class PPOAgent:
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self._clip_policy_gradients()
                 self.optimizer.step()
+                optimizer_steps += 1
                 approx_kls.append(float(approx_kl.item()))
                 last_metrics = {
                     "loss": float(loss.item()),
@@ -919,6 +1050,7 @@ class PPOAgent:
                     "value_loss": float(value_loss.item()),
                     "entropy": float(entropy.item()),
                     "approx_kl": float(approx_kl.item()),
+                    "clip_fraction": float(clip_fraction.item()),
                     "advantage_mean": advantage_mean,
                     "advantage_std": advantage_std,
                     "explained_variance": explained_variance,
@@ -933,7 +1065,11 @@ class PPOAgent:
                         ),
                         refresh=False,
                     )
+            epochs_completed = epoch_idx + 1
+            if kl_early_stop:
+                break
             if self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
+                kl_early_stop = True
                 break
         if progress is not None:
             progress.close()
@@ -963,6 +1099,9 @@ class PPOAgent:
         last_metrics["post_explained_variance"] = (
             0.0 if return_variance <= 1e-8 else 1.0 - post_residual_variance / return_variance
         )
+        last_metrics.update(self._buffer_policy_diagnostics(actions_np, old_logprobs_np, weights_np))
+        last_metrics["epochs_completed"] = float(epochs_completed)
+        last_metrics["kl_early_stop"] = float(kl_early_stop)
         self.buffer.clear()
         return last_metrics
 
@@ -992,7 +1131,7 @@ class PPOAgent:
                 loss = -dist.log_prob(actions_t[idx]).mean()
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+                self._clip_policy_gradients()
                 self.optimizer.step()
                 with torch.no_grad():
                     pred = torch.argmax(dist.probs, dim=-1)
