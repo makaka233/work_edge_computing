@@ -68,7 +68,7 @@ class SlowDeploymentPPOAgent:
     k_epochs: int = 3
     entropy_coef: float = 0.001
     count_entropy_coef: float | None = None
-    placement_entropy_coef: float | None = None
+    placement_entropy_coef: float | None = 0.005
     value_coef: float = 0.5
     count_value_coef: float = 0.0
     critic_lr: float | None = None
@@ -730,9 +730,9 @@ class FastSchedulingPPOAgent:
     num_nodes: int
     max_service_stages: int
     policy_kind: str = "gat_node_scorer"
-    lr: float = 3e-4
+    lr: float = 2e-4
     k_epochs: int = 4
-    entropy_coef: float = 0.0
+    entropy_coef: float = 0.001
     value_coef: float = 0.5
     target_kl: float | None = 0.015
     minibatch_size: int = 512
@@ -1226,13 +1226,13 @@ class HierarchicalPPOAgent:
         slow_lr: float = 3e-4,
         slow_count_lr: float = 1.5e-4,
         slow_placement_lr: float = 1.5e-4,
-        fast_lr: float = 3e-4,
+        fast_lr: float = 2e-4,
         slow_k_epochs: int = 3,
         fast_k_epochs: int = 4,
         slow_entropy_coef: float = 0.001,
         slow_count_entropy_coef: float | None = None,
-        slow_placement_entropy_coef: float | None = None,
-        fast_entropy_coef: float = 0.0,
+        slow_placement_entropy_coef: float | None = 0.005,
+        fast_entropy_coef: float = 0.001,
         slow_value_coef: float = 0.5,
         slow_count_value_coef: float = 0.0,
         slow_critic_lr: float | None = None,

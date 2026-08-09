@@ -485,6 +485,9 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     assert agent.slow_agent.placement_ppo.policy.detach_critic_backbone
     assert np.isclose(agent.slow_agent.placement_ppo.optimizer.param_groups[0]["lr"], 1.5e-4)
     assert np.isclose(agent.slow_agent.placement_ppo.target_kl, 0.015)
+    assert np.isclose(agent.slow_agent.placement_ppo.entropy_coef, 0.005)
+    assert np.isclose(agent.fast_agent.ppo.optimizer.param_groups[0]["lr"], 2e-4)
+    assert np.isclose(agent.fast_agent.ppo.entropy_coef, 0.001)
 
     def count_two(state, mask, deterministic=False):
         assert mask[1]

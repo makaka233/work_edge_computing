@@ -118,7 +118,9 @@ detached from the actor graph encoder so value fitting cannot flatten node score
 Placement actor returns are centered within the same service stage before
 normalization, making the policy compare alternative nodes rather than unrelated
 absolute latency scales across stages. Placement uses an independent `1.5e-4`
-learning rate, `0.015` KL limit, and `0.003` entropy coefficient by default.
+learning rate, `0.015` KL limit, and `0.005` entropy coefficient by default. The
+slightly stronger entropy term is intended to keep node exploration from
+collapsing while the shuffled demand pool changes the active traffic mix.
 Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
 and deadline violations penalize under-provisioning, while a continuous effective-
 replica measure based on request shares penalizes replicas that add little usable
@@ -222,9 +224,12 @@ top-1 replica-use share, and cross-node stage transition rate.
 
 Fast optimizer diagnostics additionally report full-batch policy entropy,
 non-negative sampled KL, clip fraction, raw advantage mean/standard deviation,
-completed epochs, and KL early stops. Fast uses a `0.015` KL limit by default;
-the optimizer stops within an epoch when a later minibatch has already crossed
-that limit instead of averaging positive and negative signed estimates.
+completed epochs, and KL early stops. Fast uses a `2e-4` learning rate, `0.001`
+entropy coefficient, and `0.015` KL limit by default. The smaller optimizer step
+reduces repeated KL-bound overshoot, while the entropy term slows premature
+loss of per-state scheduling exploration. The optimizer stops within an epoch
+when a later minibatch has already crossed that limit instead of averaging
+positive and negative signed estimates.
 
 Demand-side load can be raised without changing physical infrastructure. Use
 `--traffic-scale`, `--active-user-ratio`, and

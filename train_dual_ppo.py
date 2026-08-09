@@ -264,12 +264,12 @@ def parse_args() -> argparse.Namespace:
         default=1.5e-4,
         help="Independent Placement actor learning rate; conservative by default to avoid node-policy collapse.",
     )
-    parser.add_argument("--fast-lr", type=float, default=3e-4)
+    parser.add_argument("--fast-lr", type=float, default=2e-4)
     parser.add_argument("--slow-k-epochs", type=int, default=3)
     parser.add_argument("--fast-k-epochs", type=int, default=4)
     parser.add_argument("--slow-entropy-coef", type=float, default=0.001)
     parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
-    parser.add_argument("--slow-placement-entropy-coef", type=float, default=0.003)
+    parser.add_argument("--slow-placement-entropy-coef", type=float, default=0.005)
     parser.add_argument(
         "--slow-tail-latency-coef",
         type=float,
@@ -282,7 +282,7 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Penalty in seconds-equivalent for cross-node transitions between adjacent stages in the Slow return.",
     )
-    parser.add_argument("--fast-entropy-coef", type=float, default=0.0)
+    parser.add_argument("--fast-entropy-coef", type=float, default=0.001)
     parser.add_argument(
         "--fast-congestion-credit-coef",
         type=float,

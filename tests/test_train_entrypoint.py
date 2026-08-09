@@ -10,10 +10,20 @@ from train_dual_ppo import (
     demand_profile_summary,
     effective_replicas_per_stage,
     load_multiplier_for_rollout,
+    parse_args,
     rollout_start_minute,
     scenario_seed_for_offset,
     use_deterministic_fast_collection,
 )
+
+
+def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["train_dual_ppo.py"])
+    args = parse_args()
+
+    assert args.fast_lr == 2e-4
+    assert args.fast_entropy_coef == 0.001
+    assert args.slow_placement_entropy_coef == 0.005
 
 
 def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
