@@ -9,8 +9,8 @@ scenario:
   num_edge_nodes: 32
   num_service_types: 10
   max_service_stages: 3
-  episode_hours: 4
-  scenario_refresh_episodes: 4
+  episode_minutes: 10
+  scenario_refresh_episodes: 1
   scenario_refresh_scope: demand_only
   demand_sampling_mode: episode
   demand_scenario_schedule: shuffled-pool

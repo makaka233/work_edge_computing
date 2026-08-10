@@ -12,16 +12,17 @@ def test_default_episode_uses_one_second_steps_and_ten_minute_deployment():
     config = EdgeEnvConfig()
     env = EdgeComputingEnv(config)
 
-    assert config.episode_hours == 4
+    assert config.episode_minutes == 10
+    assert config.episode_hours is None
     assert config.deployment_interval_minutes == 10
     assert config.request_aggregation_window_seconds == 1.0
     assert config.arrival_profile == "stationary"
     env.current_time_minute = 0.0
     initial_rate = env._arrival_rate_per_minute()
-    env.current_time_minute = 180.0
+    env.current_time_minute = 9.0
     assert env._arrival_rate_per_minute() == initial_rate
     assert not env.done
-    env.current_time_minute = 240.0
+    env.current_time_minute = 10.0
     assert env.done
 
 

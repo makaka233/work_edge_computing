@@ -590,7 +590,7 @@ class SlowDeploymentPPOAgent:
             service_id / max(self.num_service_types - 1, 1),
             stage_id / max(self.max_service_stages - 1, 1),
             replica_idx / max(self.replicas_per_stage - 1, 1),
-            env.current_time_minute / max(env.config.episode_hours * 60, 1),
+            env.current_time_minute / max(env.config.episode_minutes, 1),
             len(env.scenario.services[service_id].stages) / self.max_service_stages,
             np.log1p(env._arrival_rate_per_minute()) / np.log1p(20_000.0),
             np.log1p(env._arrival_rate_per_minute() * env.config.deployment_interval_minutes)
@@ -641,7 +641,7 @@ class SlowDeploymentPPOAgent:
         mean_link_load = float(np.mean(finite_link_load)) if finite_link_load.size else 0.0
         max_link_load = float(np.max(finite_link_load)) if finite_link_load.size else 0.0
         scalars = [
-            env.current_time_minute / max(env.config.episode_hours * 60, 1),
+            env.current_time_minute / max(env.config.episode_minutes, 1),
             np.log1p(env._arrival_rate_per_minute()) / np.log1p(20_000.0),
             np.log1p(env._arrival_rate_per_minute() * env.config.deployment_interval_minutes)
             / np.log1p(5_000_000.0),
@@ -1006,7 +1006,7 @@ class FastSchedulingPPOAgent:
             request.stage_compute_gcycles[stage_id] / 8.0,
             request.deadline_s / 0.6,
             request.request_count / 100.0,
-            env.current_time_minute / max(env.config.episode_hours * 60, 1),
+            env.current_time_minute / max(env.config.episode_minutes, 1),
             len(request.stage_compute_gcycles) / self.max_service_stages,
             np.log1p(tick_request_count) / np.log1p(5_000.0),
             tick_request_event_count / max(env.config.num_edge_nodes * env.config.num_service_types, 1),
@@ -1364,6 +1364,16 @@ class HierarchicalPPOAgent:
             self.window_deployment_memory_fraction = memory_fraction
             self.window_deployment_storage_fraction = storage_fraction
             self.window_migration_fraction = float(migration_count / possible_placements)
+
+    def reset_episode_context(self) -> None:
+        """Drop feedback that belongs to a completed independent episode.
+
+        PPO buffers intentionally remain intact because one optimizer update
+        batches several ten-minute episodes.
+        """
+
+        self.slow_agent.last_window_feedback = {}
+        self.last_slow_window_metrics = {}
 
     def act(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> list[int]:
         self.maybe_update_deployment(env, deterministic=deterministic, record=record)

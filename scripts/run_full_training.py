@@ -14,9 +14,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-users", type=int, default=10_000)
     parser.add_argument("--num-edge-nodes", type=int, default=32)
     parser.add_argument("--num-service-types", type=int, default=10)
-    parser.add_argument("--episode-hours", type=int, default=4)
+    parser.add_argument("--episode-minutes", type=int, default=10)
+    parser.add_argument("--episode-hours", type=float, default=None, help="Deprecated legacy trajectory override.")
     parser.add_argument("--deployment-interval-minutes", type=int, default=10)
-    parser.add_argument("--scenario-refresh-episodes", type=int, default=20)
+    parser.add_argument("--scenario-refresh-episodes", type=int, default=1)
     parser.add_argument("--demand-sampling-mode", choices=["episode", "rollout"], default="episode")
     parser.add_argument("--mean-requests-per-minute", type=float, default=None)
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
@@ -96,8 +97,8 @@ def main() -> None:
         str(args.num_edge_nodes),
         "--num-service-types",
         str(args.num_service_types),
-        "--episode-hours",
-        str(args.episode_hours),
+        "--episode-minutes",
+        str(int(round(args.episode_hours * 60.0)) if args.episode_hours is not None else args.episode_minutes),
         "--deployment-interval-minutes",
         str(args.deployment_interval_minutes),
         "--scenario-refresh-episodes",

@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import csv
+import math
 from argparse import Namespace
 from pathlib import Path
 
@@ -27,6 +28,9 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.slow_placement_entropy_coef == 0.005
     assert args.slow_placement_entropy_final_coef == 0.003
     assert args.slow_placement_entropy_decay_updates == 16
+    assert args.episode_minutes == 10
+    assert args.episode_hours is None
+    assert args.scenario_refresh_episodes == 1
 
 
 def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
@@ -233,6 +237,7 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "diag_res=" in result.stdout
     assert "slowR=" in result.stdout
     assert (log_dir / "training.csv").exists()
+    assert (log_dir / "episode_metrics.csv").exists()
     assert (save_dir / "last.pt").exists()
     assert (save_dir / "best.pt").exists()
 
@@ -248,6 +253,19 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "avg_service_memory_util" in rows[0]
     assert "active_node_rate" in rows[0]
     assert "hot_link_rate" in rows[0]
+
+    with (log_dir / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        episode_rows = list(csv.DictReader(handle))
+    assert len(episode_rows) == 1
+    episode_row = episode_rows[0]
+    assert episode_row["episode"] == "1"
+    assert episode_row["update_start"] == "1"
+    assert episode_row["update_end"] == "1"
+    assert episode_row["rollouts_collected"] == "1"
+    assert "avg_reward" in episode_row
+    assert "total_reward" in episode_row
+    assert "avg_latency_s" in episode_row
+    assert "p95_latency_s" in episode_row
 
 
 def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):
@@ -425,6 +443,19 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
     assert "cross_node_stage_transition_rate" in rows[0]
     assert "max_node_memory_util" in rows[0]
 
+    with (log_dir / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        episode_rows = list(csv.DictReader(handle))
+    assert len(episode_rows) == 1
+    episode_row = episode_rows[0]
+    assert episode_row["episode"] == "1"
+    assert episode_row["update_start"] == "1"
+    assert episode_row["update_end"] == "2"
+    assert episode_row["rollouts_collected"] == "2"
+    assert episode_row["window_start"] == "1"
+    assert episode_row["window_end"] == "2"
+    assert episode_row["episode_complete"] == "1.0"
+    assert float(episode_row["requests"]) == sum(float(row["requests"]) for row in rows)
+
 
 def test_window_rollout_demand_sampling_resets_each_update(tmp_path):
     log_dir = tmp_path / "logs"
@@ -510,15 +541,126 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     assert "fast_windows_per_update=2" in result.stdout
     assert "slow_windows_per_update=32" in result.stdout
-    assert "episode_horizon=4h deployment_windows=24" in result.stdout
+    assert "episode_horizon=10min deployment_windows=1" in result.stdout
     assert "arrival_profile=stationary" in result.stdout
-    assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=0 window=01" in result.stdout
+    assert "update=001 episodes=001-002 demand_seed=2026-2027 load=1.00-1.00 start_min=0-0 rollouts=2 complete=1 window=01" in result.stdout
 
     with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert rows[-1]["rollouts_collected"] == "2"
+    assert rows[-1]["episodes_collected"] == "2"
+    assert rows[-1]["episode_start"] == "1"
+    assert rows[-1]["episode_end"] == "2"
     assert rows[-1]["demand_seed"] == "2026"
     assert rows[-1]["demand_seed_end"] == "2027"
+
+
+def test_ten_minute_episode_mode_advances_episode_and_demand_pool(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--slow-warmup-updates",
+        "0",
+        "--rollout-unit",
+        "window",
+        "--demand-sampling-mode",
+        "episode",
+        "--demand-scenario-schedule",
+        "sequential",
+        "--fast-windows-per-update",
+        "2",
+        "--mean-requests-per-minute",
+        "2",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert "episode_horizon=10min deployment_windows=1" in result.stdout
+    assert "update=001 episodes=001-002 demand_seed=2026-2027" in result.stdout
+    assert "rollouts=2 complete=1 window=01" in result.stdout
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        row = list(csv.DictReader(handle))[-1]
+    assert row["episode_start"] == "1"
+    assert row["episode_end"] == "2"
+    assert row["episodes_collected"] == "2"
+    assert row["episode_complete"] == "1"
+    assert row["demand_seed"] == "2026"
+    assert row["demand_seed_end"] == "2027"
+
+    with (log_dir / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        episode_rows = list(csv.DictReader(handle))
+    assert [episode_row["episode"] for episode_row in episode_rows] == ["1", "2"]
+    assert [episode_row["demand_seed"] for episode_row in episode_rows] == ["2026", "2027"]
+    assert all(episode_row["update_start"] == "1" for episode_row in episode_rows)
+    assert all(episode_row["update_end"] == "1" for episode_row in episode_rows)
+    assert all(episode_row["rollouts_collected"] == "1" for episode_row in episode_rows)
+    assert all(episode_row["episode_complete"] == "1.0" for episode_row in episode_rows)
+    weighted_latency = sum(
+        float(episode_row["avg_latency_s"]) * float(episode_row["requests"])
+        for episode_row in episode_rows
+    ) / sum(float(episode_row["requests"]) for episode_row in episode_rows)
+    assert math.isclose(weighted_latency, float(row["avg_latency_s"]))
+
+
+def test_ten_minute_slow_episode_flushes_exactly_one_window(tmp_path):
+    log_dir = tmp_path / "logs"
+    save_dir = tmp_path / "savedModels"
+    command = [
+        sys.executable,
+        "train_dual_ppo.py",
+        "--updates",
+        "1",
+        "--fast-warmup-updates",
+        "0",
+        "--slow-warmup-updates",
+        "1",
+        "--slow-windows-per-update",
+        "1",
+        "--episode-minutes",
+        "10",
+        "--sampled-seconds-per-window",
+        "2",
+        "--mean-requests-per-minute",
+        "2",
+        "--num-users",
+        "10000",
+        "--num-edge-nodes",
+        "16",
+        "--num-service-types",
+        "3",
+        "--max-replicas-per-stage",
+        "2",
+        "--progress-interval-seconds",
+        "0",
+        "--log-dir",
+        str(log_dir),
+        "--save-dir",
+        str(save_dir),
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+
+    with (log_dir / "training.csv").open(newline="", encoding="utf-8") as handle:
+        row = list(csv.DictReader(handle))[-1]
+    assert row["training_phase"] == "slow_warmup"
+    assert row["episode_complete"] == "1"
+    assert row["slow_updated"] == "1"
+    assert row["slow_window_count"] == "1.0"
+    assert row["slow_placement_updates_completed"] == "1"
 
 
 def test_rollouts_per_update_batches_pressure_levels_and_start_windows(tmp_path):

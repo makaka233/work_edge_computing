@@ -92,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scenario-refresh-episodes",
         type=int,
-        default=4,
+        default=1,
         help="Without --fixed-scenario, reuse one scenario instance for this many training episodes.",
     )
     parser.add_argument(
@@ -132,10 +132,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of demand-only scenarios in the shuffled training pool.",
     )
     parser.add_argument(
-        "--episode-hours",
+        "--episode-minutes",
         type=int,
-        default=4,
-        help="Environment episode horizon in hours. One episode contains one-second environment steps.",
+        default=10,
+        help="Environment episode horizon in minutes. The default aligns one episode with one Slow window.",
+    )
+    parser.add_argument(
+        "--episode-hours",
+        type=float,
+        default=None,
+        help="Deprecated compatibility override for legacy multi-hour trajectories.",
     )
     parser.add_argument(
         "--deployment-interval-minutes",
@@ -147,7 +153,7 @@ def parse_args() -> argparse.Namespace:
         "--arrival-profile",
         choices=["stationary", "daily"],
         default="stationary",
-        help="Use stationary demand for independent 4h episodes, or the legacy 24h morning/lunch/evening profile.",
+        help="Use stationary demand for independent episodes, or the legacy daily profile.",
     )
     parser.add_argument("--mean-requests-per-minute", type=float, default=None)
     parser.add_argument("--active-user-ratio", type=float, default=0.15)
@@ -365,7 +371,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Collect this many windows before each Fast PPO update. "
+            "Collect this many ten-minute episodes before each Fast PPO update. "
             "--rollouts-per-update is retained as a compatibility alias."
         ),
     )
@@ -373,7 +379,7 @@ def parse_args() -> argparse.Namespace:
         "--slow-windows-per-update",
         type=int,
         default=32,
-        help="Accumulate this many completed deployment windows before each Slow PPO update.",
+        help="Accumulate this many completed ten-minute episodes before each Slow PPO update.",
     )
     parser.add_argument(
         "--joint-training-schedule",
@@ -448,7 +454,10 @@ def parse_args() -> argparse.Namespace:
         default=10.0,
         help="Print in-rollout terminal progress every N seconds. Use 0 to disable.",
     )
-    args = apply_pressure_profile(parser.parse_args())
+    args = parser.parse_args()
+    if args.episode_hours is not None:
+        args.episode_minutes = int(round(float(args.episode_hours) * 60.0))
+    args = apply_pressure_profile(args)
     if args.synchronized_window_block > 0:
         args.fast_windows_per_update = args.synchronized_window_block
         args.slow_windows_per_update = args.synchronized_window_block
@@ -508,8 +517,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-placement-entropy-decay-updates must be >= 1")
     if args.synchronized_window_block < 0:
         parser.error("--synchronized-window-block must be >= 0")
-    if args.episode_hours < 1:
-        parser.error("--episode-hours must be >= 1")
+    if args.episode_minutes < 1:
+        parser.error("--episode-minutes must be >= 1")
     if args.deployment_interval_minutes < 1:
         parser.error("--deployment-interval-minutes must be >= 1")
     if not np.isclose(args.request_aggregation_window_seconds, 1.0):
@@ -546,6 +555,16 @@ def load_multiplier_for_rollout(args: argparse.Namespace, rollout_idx: int) -> f
     return multipliers[int(rollout_idx) % len(multipliers)]
 
 
+def episode_minutes_for_args(args: argparse.Namespace) -> int:
+    minutes = getattr(args, "episode_minutes", None)
+    if minutes is not None:
+        return max(int(minutes), 1)
+    hours = getattr(args, "episode_hours", None)
+    if hours is not None:
+        return max(int(round(float(hours) * 60.0)), 1)
+    return 10
+
+
 def rollout_start_minute(args: argparse.Namespace, rollout_idx: int, *, eval_mode: bool = False) -> float:
     if getattr(args, "arrival_profile", "daily") == "stationary":
         return 0.0
@@ -556,7 +575,7 @@ def rollout_start_minute(args: argparse.Namespace, rollout_idx: int, *, eval_mod
     if mode == "beginning":
         return 0.0
     interval = int(getattr(args, "deployment_interval_minutes", 10))
-    total_minutes = int(getattr(args, "episode_hours", 24) * 60)
+    total_minutes = episode_minutes_for_args(args)
     starts = list(range(0, max(total_minutes - interval + 1, 1), interval))
     if not starts:
         return 0.0
@@ -611,7 +630,7 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             num_users=args.num_users,
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
-            episode_hours=args.episode_hours,
+            episode_minutes=episode_minutes_for_args(args),
             deployment_interval_minutes=args.deployment_interval_minutes,
             arrival_profile=args.arrival_profile,
             mean_requests_per_minute=args.mean_requests_per_minute,
@@ -644,7 +663,7 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             num_users=args.num_users,
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
-            episode_hours=args.episode_hours,
+            episode_minutes=episode_minutes_for_args(args),
             deployment_interval_minutes=args.deployment_interval_minutes,
             arrival_profile=args.arrival_profile,
             mean_requests_per_minute=args.mean_requests_per_minute,
@@ -670,7 +689,7 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
 def traffic_rate_summary(env: EdgeComputingEnv) -> dict[str, float]:
     rates = []
     original_time = env.current_time_minute
-    episode_minutes = max(int(env.config.episode_hours * 60), 1)
+    episode_minutes = max(int(env.config.episode_minutes), 1)
     for minute in range(episode_minutes):
         env.current_time_minute = float(minute)
         rates.append(env._arrival_rate_per_minute())
@@ -724,7 +743,7 @@ class RolloutProgress:
         label: str,
         target_requests: int | None,
         interval_seconds: float,
-        episode_hours: int,
+        episode_minutes: int,
         rollout_unit: str,
         deployment_interval_minutes: int,
         rollout_start_minute: float = 0.0,
@@ -734,7 +753,7 @@ class RolloutProgress:
         self.label = label
         self.target_requests = target_requests
         self.interval_seconds = max(interval_seconds, 0.0) if tqdm is not None else 0.0
-        self.episode_hours = episode_hours
+        self.episode_minutes = episode_minutes
         self.rollout_unit = rollout_unit
         self.deployment_interval_minutes = deployment_interval_minutes
         self.rollout_start_minute = rollout_start_minute
@@ -750,7 +769,7 @@ class RolloutProgress:
             self.tqdm_bar = tqdm(
                 total=total_units,
                 desc=self.label,
-                unit="h" if self.rollout_unit in {"episode", "window"} else "req",
+                unit="min" if self.rollout_unit in {"episode", "window"} else "req",
                 dynamic_ncols=True,
                 mininterval=self.interval_seconds,
                 leave=True,
@@ -823,8 +842,7 @@ class RolloutProgress:
         assert self.tqdm_bar is not None
         requests = max(float(env.metrics.get("requests", 0.0)) - self.start_requests, 0.0)
         request_events = int(max(float(env.metrics.get("request_events", 0.0)) - self.start_request_events, 0.0))
-        sim_hours = env.current_time_minute / 60.0
-        episode_fraction = sim_hours / max(float(self.episode_hours), 1e-9)
+        episode_fraction = env.current_time_minute / max(float(self.episode_minutes), 1e-9)
         if self.rollout_unit == "episode":
             progress = min(episode_fraction, 1.0)
         elif self.rollout_unit == "window":
@@ -839,7 +857,7 @@ class RolloutProgress:
         if avg_penalty_latency_s is None:
             avg_penalty_latency_s = env.metrics["total_penalty_latency_s"] / max(requests, 1.0)
         elapsed = max(now - self.started_at, 1e-9)
-        total_windows = max(int(np.ceil(self.episode_hours * 60.0 / max(self.deployment_interval_minutes, 1))), 1)
+        total_windows = max(int(np.ceil(self.episode_minutes / max(self.deployment_interval_minutes, 1))), 1)
         current_window = min(int(env.current_time_minute // max(self.deployment_interval_minutes, 1)) + 1, total_windows)
         wall_event_rate = request_events / elapsed
         units = self._progress_units(env)
@@ -855,7 +873,7 @@ class RolloutProgress:
             f"VLat={avg_valid_latency_s * 1000:.1f}ms "
             f"Pen={avg_penalty_latency_s * 1000:.1f}ms "
             f"win={current_window}/{total_windows} "
-            f"t={sim_hours:.1f}/{self.episode_hours}h "
+            f"t={env.current_time_minute:.1f}/{self.episode_minutes}min "
             f"req={_format_count(requests)}/{_format_count(request_target)} "
             f"speed={wall_event_rate:.1f}ev/s"
         )
@@ -867,17 +885,17 @@ class RolloutProgress:
 
     def _total_progress_units(self) -> float:
         if self.rollout_unit == "episode":
-            return max(float(self.episode_hours), 1.0)
+            return max(float(self.episode_minutes), 1.0)
         if self.rollout_unit == "window":
-            return max(float(self.deployment_interval_minutes) / 60.0, 1e-9)
+            return max(float(self.deployment_interval_minutes), 1e-9)
         return max(float(self.target_requests or 1), 1.0)
 
     def _progress_units(self, env: EdgeComputingEnv) -> float:
         if self.rollout_unit == "episode":
-            return min(max(env.current_time_minute / 60.0, 0.0), self._total_progress_units())
+            return min(max(env.current_time_minute, 0.0), self._total_progress_units())
         if self.rollout_unit == "window":
-            elapsed_window_hours = max(env.current_time_minute - self.rollout_start_minute, 0.0) / 60.0
-            return min(elapsed_window_hours, self._total_progress_units())
+            elapsed_window_minutes = max(env.current_time_minute - self.rollout_start_minute, 0.0)
+            return min(elapsed_window_minutes, self._total_progress_units())
         return min(float(env.metrics.get("requests", 0.0)), self._total_progress_units())
 
 
@@ -910,7 +928,7 @@ def _format_count(value: float) -> str:
 def estimate_episode_requests(env: EdgeComputingEnv) -> int:
     original_time = env.current_time_minute
     expected = 0.0
-    total_minutes = int(env.config.episode_hours * 60)
+    total_minutes = int(env.config.episode_minutes)
     for minute in range(total_minutes):
         env.current_time_minute = float(minute)
         expected += env._arrival_rate_per_minute()
@@ -974,6 +992,8 @@ def rollout(
     deterministic_slow = deterministic if deterministic_slow is None else bool(deterministic_slow)
     if reset_env:
         env.reset()
+    if env.current_time_minute <= 1e-9:
+        agent.reset_episode_context()
     if record:
         agent.last_slow_window_metrics = {}
     if frozen_slow_policy is None:
@@ -1012,7 +1032,7 @@ def rollout(
     if rollout_unit == "window":
         stop_time_minute = min(
             rollout_start_minute + float(env.config.deployment_interval_minutes),
-            float(env.config.episode_hours * 60),
+            float(env.config.episode_minutes),
         )
     represented_seconds = 1.0
     if record and rollout_unit == "window":
@@ -1024,7 +1044,7 @@ def rollout(
         target_requests = max_requests
     elif rollout_unit == "window":
         target_requests = max(
-            int(round(estimate_episode_requests(env) * env.config.deployment_interval_minutes / max(env.config.episode_hours * 60.0, 1.0))),
+            int(round(estimate_episode_requests(env) * env.config.deployment_interval_minutes / max(env.config.episode_minutes, 1.0))),
             1,
         )
     else:
@@ -1033,7 +1053,7 @@ def rollout(
         label=progress_label,
         target_requests=target_requests,
         interval_seconds=progress_interval_seconds,
-        episode_hours=env.config.episode_hours,
+        episode_minutes=env.config.episode_minutes,
         rollout_unit=rollout_unit,
         deployment_interval_minutes=env.config.deployment_interval_minutes,
         rollout_start_minute=rollout_start_minute,
@@ -1167,7 +1187,11 @@ def rollout(
         avg_valid_latency_s=_weighted_mean(valid_latencies, valid_weights),
         avg_penalty_latency_s=_weighted_mean(penalty_latencies, weights),
     )
-    if record_slow and (env.done or env.needs_deployment_update):
+    if (
+        record_slow
+        and agent.slow_agent.pending_window_id is not None
+        and (env.done or env.needs_deployment_update)
+    ):
         agent.flush_slow_window_reward(done=env.done, env=env)
     slow_window_metrics = {
         "slow_window_return": float("nan"),
@@ -1221,7 +1245,7 @@ def rollout(
         "logical_steps": rollout_logical_steps,
         "temporal_sampling_fraction": float(rollout_settlement_steps / max(rollout_logical_steps, 1.0)),
         "simulated_hours": float(rollout_duration_minutes / 60.0),
-        "episode_fraction": float(env.current_time_minute / max(env.config.episode_hours * 60.0, 1e-9)),
+        "episode_fraction": float(env.current_time_minute / max(env.config.episode_minutes, 1e-9)),
         "episode_complete": float(env.done),
         "avg_reward": _weighted_mean(rewards, weights),
         "avg_train_reward": _weighted_mean(train_rewards, weights),
@@ -1622,6 +1646,40 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
     return aggregated
 
 
+def build_episode_metrics_row(
+    rollouts: list[dict[str, float]],
+    contexts: list[dict[str, float | int | str]],
+) -> dict[str, float | int | str]:
+    """Build one episode-level record from one or more collected rollout windows."""
+    if not rollouts or len(rollouts) != len(contexts):
+        raise ValueError("episode metrics require equally sized, non-empty rollout and context lists")
+    stats = aggregate_rollout_stats(rollouts)
+    first = contexts[0]
+    last = contexts[-1]
+    requests = float(stats["requests"])
+    return {
+        "episode": int(first["episode"]),
+        "update_start": int(first["update"]),
+        "update_end": int(last["update"]),
+        "training_phase_start": str(first["training_phase"]),
+        "training_phase_end": str(last["training_phase"]),
+        "demand_seed": int(first["demand_seed"]),
+        "demand_seed_end": int(last["demand_seed"]),
+        "load_multiplier": float(first["load_multiplier"]),
+        "load_multiplier_end": float(last["load_multiplier"]),
+        "start_minute": float(first["start_minute"]),
+        "start_minute_end": float(last["start_minute"]),
+        "rollout_start": int(first["rollout"]),
+        "rollout_end": int(last["rollout"]),
+        "rollouts_collected": len(rollouts),
+        "window_start": int(first["window"]),
+        "window_end": int(last["window"]),
+        "total_reward": float(stats["avg_reward"] * requests),
+        "total_train_reward": float(stats["avg_train_reward"] * requests),
+        **stats,
+    }
+
+
 def _resource_reward_components(
     env: EdgeComputingEnv,
     args: argparse.Namespace,
@@ -2014,7 +2072,7 @@ def evaluate_policy_diagnostics(
             label=f"diag-det seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
             target_requests=det_target_requests,
             interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
-            episode_hours=env.config.episode_hours,
+            episode_minutes=env.config.episode_minutes,
             rollout_unit=rollout_unit,
             deployment_interval_minutes=env.config.deployment_interval_minutes,
         )
@@ -2022,7 +2080,7 @@ def evaluate_policy_diagnostics(
         if rollout_unit == "window":
             det_stop_time_minute = min(
                 env.current_time_minute + float(env.config.deployment_interval_minutes),
-                float(env.config.episode_hours * 60),
+                float(env.config.episode_minutes),
             )
         while _rollout_active(
             env,
@@ -2327,11 +2385,11 @@ def main() -> None:
     print("  reference_style=DRL-AC-Allocation masked PPO with joint per-second settlement")
     print(f"  users={args.num_users}, nodes={args.num_edge_nodes}, services={args.num_service_types}")
     print(
-        "  traffic avg={:.2f}/s min={:.2f}/s peak={:.2f}/s expected_episode({}h)={:.0f}".format(
+        "  traffic avg={:.2f}/s min={:.2f}/s peak={:.2f}/s expected_episode({}min)={:.0f}".format(
             traffic["avg_requests_per_second"],
             traffic["min_requests_per_second"],
             traffic["max_requests_per_second"],
-            args.episode_hours,
+            args.episode_minutes,
             traffic["expected_requests_per_episode"],
         )
     )
@@ -2370,10 +2428,10 @@ def main() -> None:
         f"slow_fast_collection={args.slow_fast_collection_mode}"
     )
     deployment_windows = max(
-        int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
+        int(np.ceil(args.episode_minutes / args.deployment_interval_minutes)),
         1,
     )
-    print(f"  episode_horizon={args.episode_hours}h deployment_windows={deployment_windows}")
+    print(f"  episode_horizon={args.episode_minutes}min deployment_windows={deployment_windows}")
     print("  environment_step=1s request_granularity=individual batch_settlement=joint")
     window_seconds = args.deployment_interval_minutes * 60
     effective_sampled_seconds = (
@@ -2464,8 +2522,11 @@ def main() -> None:
     start = datetime.now().replace(microsecond=0)
     run_name, run_dir, log_dir, save_dir = make_run_paths(args)
     log_path = log_dir / "training.csv"
-    if log_path.exists() and not args.append_log:
-        log_path.unlink()
+    episode_log_path = log_dir / "episode_metrics.csv"
+    if not args.append_log:
+        for path in (log_path, episode_log_path):
+            if path.exists():
+                path.unlink()
     write_metadata(run_dir, args, bc_metrics, loaded_metadata)
     best_latency = float("inf")
 
@@ -2498,6 +2559,9 @@ def main() -> None:
             "update": 0,
             "training_phase": "eval",
             "episode": 0,
+            "episode_start": 0,
+            "episode_end": 0,
+            "episodes_collected": 0,
             "demand_seed": scenario_seed_for_offset(args, 0),
             "demand_seed_end": scenario_seed_for_offset(args, 0),
             "load_multiplier": load_multiplier_for_rollout(args, 0),
@@ -2739,8 +2803,10 @@ def main() -> None:
     train_env: EdgeComputingEnv | None = None
     train_episode_idx = 0
     training_rollout_idx = 0
+    episode_rollout_stats: list[dict[str, float]] = []
+    episode_rollout_contexts: list[dict[str, float | int | str]] = []
     total_windows = max(
-        int(np.ceil(args.episode_hours * 60.0 / args.deployment_interval_minutes)),
+        int(np.ceil(args.episode_minutes / args.deployment_interval_minutes)),
         1,
     )
     for update in range(args.updates):
@@ -2866,10 +2932,43 @@ def main() -> None:
             start_minutes.append(start_minute)
             episode_numbers.append(episode_number)
             window_numbers.append(window_in_episode)
+            episode_context = {
+                "episode": episode_number,
+                "update": update + 1,
+                "training_phase": training_phase,
+                "demand_seed": demand_seed,
+                "load_multiplier": load_multiplier,
+                "start_minute": start_minute,
+                "rollout": rollout_idx + 1,
+                "window": window_in_episode,
+            }
+            if (
+                episode_rollout_contexts
+                and int(episode_rollout_contexts[-1]["episode"]) != episode_number
+            ):
+                append_log(
+                    episode_log_path,
+                    build_episode_metrics_row(episode_rollout_stats, episode_rollout_contexts),
+                )
+                episode_rollout_stats.clear()
+                episode_rollout_contexts.clear()
+            episode_rollout_stats.append(one_stats)
+            episode_rollout_contexts.append(episode_context)
+            continues_same_episode = (
+                args.rollout_unit == "window" and args.demand_sampling_mode == "episode"
+            )
+            if one_stats["episode_complete"] or not continues_same_episode:
+                append_log(
+                    episode_log_path,
+                    build_episode_metrics_row(episode_rollout_stats, episode_rollout_contexts),
+                )
+                episode_rollout_stats.clear()
+                episode_rollout_contexts.clear()
 
         stats = aggregate_rollout_stats(rollout_stats)
         episode_start_number = episode_numbers[0]
         episode_number = episode_numbers[-1]
+        episodes_collected = len(set(episode_numbers))
         window_in_episode = window_numbers[-1]
         demand_seed = demand_seeds[0]
         demand_seed_end = demand_seeds[-1]
@@ -2916,6 +3015,9 @@ def main() -> None:
             "update": update + 1,
             "training_phase": training_phase,
             "episode": episode_number,
+            "episode_start": episode_start_number,
+            "episode_end": episode_number,
+            "episodes_collected": episodes_collected,
             "demand_seed": demand_seed,
             "demand_seed_end": demand_seed_end,
             "load_multiplier": load_multiplier,
@@ -3277,6 +3379,12 @@ def main() -> None:
             },
         )
 
+    if episode_rollout_stats:
+        append_log(
+            episode_log_path,
+            build_episode_metrics_row(episode_rollout_stats, episode_rollout_contexts),
+        )
+
     if args.deterministic_eval:
         stats = evaluate_agent(
             args,
@@ -3313,6 +3421,7 @@ def main() -> None:
             },
         )
         print(f"log={log_path}")
+        print(f"episode_log={episode_log_path}")
         print(f"checkpoint={save_dir / 'last.pt'}")
     print(f"elapsed={datetime.now().replace(microsecond=0) - start}")
 

@@ -77,7 +77,7 @@ def _daily_arrival_factor(minute_of_day: float) -> float:
     return float(night_factor * (0.58 + 0.58 * morning_peak + 0.25 * lunch_peak + 0.82 * evening_peak))
 
 
-# Keep stationary 4h episodes at the mean traffic level of the legacy daily profile.
+# Keep stationary episodes at the mean traffic level of the legacy daily profile.
 _STATIONARY_ARRIVAL_FACTOR = float(np.mean([_daily_arrival_factor(float(minute)) for minute in range(24 * 60)]))
 
 
@@ -90,7 +90,10 @@ class EdgeEnvConfig:
     num_edge_nodes: int = 48
     num_service_types: int = 5
     max_service_stages: int = 3
-    episode_hours: int = 4
+    episode_minutes: int = 10
+    # Compatibility override for older callers and archived commands. New
+    # experiments should use episode_minutes so sub-hour horizons are explicit.
+    episode_hours: float | None = None
     deployment_interval_minutes: int = 10
     arrival_profile: str = "stationary"
     mean_requests_per_minute: float | None = None
@@ -120,8 +123,12 @@ class EdgeEnvConfig:
             raise ValueError("max_service_stages must be <= 3.")
         if self.deployment_interval_minutes <= 0:
             raise ValueError("deployment_interval_minutes must be positive.")
-        if self.episode_hours <= 0:
-            raise ValueError("episode_hours must be positive.")
+        if self.episode_hours is not None:
+            if self.episode_hours <= 0:
+                raise ValueError("episode_hours must be positive when provided.")
+            self.episode_minutes = int(round(float(self.episode_hours) * 60.0))
+        if self.episode_minutes <= 0:
+            raise ValueError("episode_minutes must be positive.")
         if self.arrival_profile not in {"stationary", "daily"}:
             raise ValueError("arrival_profile must be 'stationary' or 'daily'.")
         if self.mean_requests_per_minute is not None and self.mean_requests_per_minute <= 0:
@@ -236,7 +243,7 @@ class EdgeComputingEnv:
 
     @property
     def done(self) -> bool:
-        return self.current_time_minute >= self.config.episode_hours * 60
+        return self.current_time_minute >= self.config.episode_minutes
 
     @property
     def needs_deployment_update(self) -> bool:

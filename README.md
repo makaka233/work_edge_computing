@@ -22,8 +22,8 @@ kept thin. The problem model is different, so the code is specialized for:
   RTT so average single-task latency is expected to fall in the tens to hundreds
   of milliseconds range.
 - City-scale traffic derived from active users. The default training episode is
-  a stationary 4-hour trajectory containing 24 slow-deployment windows; the legacy daily
-  morning/lunch/evening curve remains available with `--arrival-profile daily`.
+  one stationary 10-minute Slow-deployment interval; the legacy multi-hour daily
+  trajectory remains available through the compatibility `--episode-hours` option.
   Use `--traffic-scale` above 1.0 to create heavier congestion.
 - Demand pressure can be deliberately batched across PPO rollouts with
   `--load-multipliers`, so one update can cover multiple traffic levels and
@@ -64,18 +64,19 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-hours 4 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode episode --fast-windows-per-update 1 --slow-windows-per-update 12 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 1.0 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-lr 0.0001 --slow-k-epochs 2 --slow-count-entropy-coef 0.02 --slow-placement-entropy-coef 0.005 --fast-k-epochs 2 --fast-minibatch-size 512 --device cuda --run-name joint_gat_decoupled_updates --save-best --progress-interval-seconds 10
-python scripts/run_full_training.py --scenario-refresh-episodes 20 --traffic-scale 1.6
+python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-minutes 10 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode episode --scenario-refresh-episodes 1 --fast-windows-per-update 4 --slow-windows-per-update 16 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 0.8,1.1,1.4,1.7 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-k-epochs 3 --fast-k-epochs 4 --fast-minibatch-size 512 --device cuda --run-name joint_gat_ten_minute_episodes --save-best --progress-interval-seconds 10
+python scripts/run_full_training.py --episode-minutes 10 --scenario-refresh-episodes 1 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
 python -m pytest tests
 ```
 
-For the current convergence experiments, one 4-hour episode contains 14,400
-one-second steps and 24 ten-minute slow-deployment windows. Prefer
-`--rollout-unit window --episode-hours 4` with `--demand-sampling-mode rollout`:
-each rollout samples one independent ten-minute demand window while the physical
-edge network stays fixed. `train_dual_ppo.py` prints
+For the current convergence experiments, one episode is one ten-minute Slow
+deployment interval containing 600 logical one-second steps. Training samples 60
+settlement seconds by default and weights them to represent the full interval.
+With `--demand-sampling-mode episode --scenario-refresh-episodes 1`, each rollout
+is an independent episode from the shuffled demand pool while the physical edge
+network stays fixed. `train_dual_ppo.py` prints
 in-rollout terminal progress by default every 10 seconds. The progress line
 reports update progress, real request count, request event count, simulated
 hours, deployment updates, average latency, elapsed time, and ETA. Use
@@ -140,22 +141,23 @@ requests. Requests are inferred in microbatches (default 16); after each
 microbatch a virtual workload ledger reserves the selected-node work so later
 requests do not see stale batch load. Both Slow actors use a topology-aware
 graph-attention encoder; the placement head scores nodes and the count head scores
-replica-count actions. The Slow state includes node/link capacity and load plus
-the previous window's mean latency, P95 latency, penalty latency, and deadline
-feedback. The global slow window diagnostic combines mean and P95 latency according
+replica-count actions. The Slow state includes node/link capacity and demand.
+Legacy continuous trajectories may also use previous-window feedback; independent
+ten-minute episodes clear that feedback before the next deployment. The global
+slow window diagnostic combines mean and P95 latency according
 to `--slow-tail-latency-coef` (default 0.35) with deployment, idle-replica, deadline,
 and migration costs.
 Migration changes remain logged, but `--slow-migration-coef` defaults to zero for
 the current convergence experiments.
 Fast and Slow PPO use alternating frozen-controller phases by default. Four Fast
 warm-up updates first learn under the conservative expected-count Slow deployment.
-Four Slow warm-up updates then collect 32 windows each with the now-trained Fast
+Four Slow warm-up updates then collect the configured episode batch with the now-trained Fast
 policy frozen but still sampled stochastically. This exposes the utility of
 alternative replicas instead of labelling everything outside deterministic Fast's
 top choice as redundant. Afterwards, three Fast updates collect stochastic Fast actions
 under deterministic Slow deployment;
-the next Slow update freezes Fast parameters, samples its policy, and collects 32 independent
-window returns. Because replica count is ordinal, deterministic Slow deployment
+the next Slow update freezes Fast parameters, samples its policy, and collects independent
+episode returns. Because replica count is ordinal, deterministic Slow deployment
 uses the ceiling of the Count distribution's expected replica count instead of an
 unstable categorical argmax; use `--slow-deterministic-count-mode mode` only for an
 explicit mode ablation. This prevents one Slow PPO batch from mixing returns
@@ -171,22 +173,29 @@ Configure the cadence with `--fast-warmup-updates`, `--slow-warmup-updates`,
 `--joint-training-schedule simultaneous` only for legacy ablations. The log field
 `training_phase` records which policy was active.
 For a synchronized training block, use `--synchronized-window-block 4`; this
-sets both PPO update periods to four windows and selects simultaneous mode. Four windows are useful for a quick
+sets both PPO update periods to four episodes and selects simultaneous mode. Four episodes are useful for a quick
 smoke run, but are usually too few for Slow PPO when four load multipliers are
 cycled because each pressure level contributes only one sample. Prefer independent
-alternating collection with at least 32 Slow windows for convergence runs. With `--demand-sampling-mode episode`
+alternating collection with at least 16 Slow episodes for convergence runs. With `--demand-sampling-mode episode`
 and multiple `--load-multipliers`, the fixed user distribution is retained while
 each window in the block receives the next load multiplier, for example
 `0.8,1.1,1.4,1.7`.
-Training windows use stratified temporal approximation by default:
+Training episodes use stratified temporal approximation by default:
 `--sampled-seconds-per-window 60` performs 60 neural-policy/KKT settlements that
 represent all 600 logical seconds in a ten-minute window. Instantaneous KKT
 contention still uses one sampled second of arrivals; request metrics, the Slow
 return, and EWMA load evolution use the represented-time weight. This creates
-one Slow transition per logical window, not 60 Slow transitions. Periodic eval
+one Slow transition per episode, not 60 Slow transitions. Periodic eval
 always executes the full window. Use `--sampled-seconds-per-window 0` to restore
 full training rollouts. Logs distinguish `settlement_steps`, `logical_steps`,
 and `temporal_sampling_fraction`.
+Each run also writes `logs/episode_metrics.csv` with one row per episode. It
+records the exact demand seed and load, collection update/phase, average and P95
+latency, average and total reward, reward components, request counts, resource
+utilization, replica usage, and completion state. If an episode spans multiple
+deployment windows or PPO updates, its windows are accumulated into one row when
+the episode completes; an unfinished final episode is flushed with
+`episode_complete=0`.
 `--service-resource-fraction` fixes the share of each physical
 node's memory/storage available to this controller, representing system and
 co-tenant reservations without imposing a per-service replica-count cap.
@@ -198,9 +207,9 @@ treating all edge nodes as directly connected.
 When `--fixed-scenario` is omitted, demand-side variation can be sampled in two
 ways while the physical edge network remains fixed by `--physical-seed`.
 `--demand-sampling-mode episode` reuses one demand scenario for
-`--scenario-refresh-episodes N` training episodes. `--demand-sampling-mode
-rollout` samples a new demand scenario for every PPO rollout. With the default
-4-hour horizon, an episode contains multiple rollout windows. In both modes, only user
+`--scenario-refresh-episodes N` training episodes. With the default refresh of
+one, each ten-minute episode advances the shuffled pool. `--demand-sampling-mode
+rollout` remains a compatibility synonym for resetting demand on every rollout. In both modes, only user
 locations, home-node assignment, and service
 preferences may change; nodes, capacities, service catalogue, and wired links do
 not change. Request samples still change every rollout. Eval seeds therefore
