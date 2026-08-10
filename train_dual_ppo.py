@@ -365,6 +365,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-minibatch-size", type=int, default=2048)
     parser.add_argument("--fast-minibatch-size", type=int, default=512)
     parser.add_argument(
+        "--fast-load-balanced-updates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stratify Fast minibatches by load and equalize total optimizer weight across load levels.",
+    )
+    parser.add_argument(
+        "--fast-full-batch-kl-stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Check Fast KL after a complete epoch over the full buffer instead of stopping on one minibatch.",
+    )
+    parser.add_argument(
         "--fast-windows-per-update",
         "--rollouts-per-update",
         dest="fast_windows_per_update",
@@ -2288,6 +2300,16 @@ def write_single_row_csv(path: Path, row: dict[str, float | int | str]) -> None:
         writer.writerow(row)
 
 
+def format_group_diagnostics(
+    diagnostics: dict[float, dict[str, float]],
+    metric: str,
+) -> str:
+    return ";".join(
+        f"{group_id:g}={values.get(metric, float('nan')):.8g}"
+        for group_id, values in sorted(diagnostics.items())
+    )
+
+
 def make_run_paths(args: argparse.Namespace) -> tuple[str, Path, Path, Path]:
     mode_tag = args.train_mode.replace("-", "_")
     run_name = args.run_name or (
@@ -2357,6 +2379,8 @@ def main() -> None:
         fast_minibatch_size=args.fast_minibatch_size,
         fast_policy_kind=args.fast_policy_kind,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
+        fast_load_balanced_updates=args.fast_load_balanced_updates,
+        fast_full_batch_kl_stop=args.fast_full_batch_kl_stop,
         slow_reward_scale=args.reward_scale,
         slow_tail_latency_coef=args.slow_tail_latency_coef,
         slow_colocation_coef=args.slow_colocation_coef,
@@ -2505,6 +2529,10 @@ def main() -> None:
         )
     )
     print(f"  ppo_minibatch slow={args.slow_minibatch_size} fast={args.fast_minibatch_size}")
+    print(
+        f"  fast_load_balanced_updates={args.fast_load_balanced_updates} "
+        f"fast_full_batch_kl_stop={args.fast_full_batch_kl_stop}"
+    )
     print(
         f"  ppo_target_kl count={args.slow_count_target_kl} "
         f"placement={args.slow_placement_target_kl} fast={args.fast_target_kl}"
@@ -2720,6 +2748,18 @@ def main() -> None:
             "fast_advantage_std": np.nan,
             "fast_epochs_completed": 0.0,
             "fast_kl_early_stop": 0.0,
+            "fast_optimizer_steps": 0.0,
+            "fast_minibatches_completed": 0.0,
+            "fast_minibatches_planned": 0.0,
+            "fast_samples_seen_fraction": 0.0,
+            "fast_min_group_seen_fraction": 0.0,
+            "fast_full_batch_kl_checks": 0.0,
+            "fast_group_count": 0.0,
+            "fast_max_group_approx_kl": 0.0,
+            "fast_min_group_approx_kl": 0.0,
+            "fast_group_approx_kl_std": 0.0,
+            "fast_load_approx_kl": "",
+            "fast_load_clip_fraction": "",
             "eval_avg_latency_s": eval_stats["eval_avg_latency_s"],
             "eval_avg_latency_std": eval_stats["eval_avg_latency_std"],
             "eval_p95_latency_s": eval_stats["eval_p95_latency_s"],
@@ -3011,6 +3051,7 @@ def main() -> None:
                 rollout_unit=eval_rollout_unit,
             )
         diagnostic_stats = {}
+        fast_group_diagnostics = agent.fast_agent.ppo.last_group_diagnostics
         log_row = {
             "update": update + 1,
             "training_phase": training_phase,
@@ -3190,6 +3231,24 @@ def main() -> None:
             "fast_advantage_std": losses["fast"].get("advantage_std", np.nan),
             "fast_epochs_completed": losses["fast"].get("epochs_completed", 0.0),
             "fast_kl_early_stop": losses["fast"].get("kl_early_stop", 0.0),
+            "fast_optimizer_steps": losses["fast"].get("optimizer_steps", 0.0),
+            "fast_minibatches_completed": losses["fast"].get("minibatches_completed", 0.0),
+            "fast_minibatches_planned": losses["fast"].get("minibatches_planned", 0.0),
+            "fast_samples_seen_fraction": losses["fast"].get("samples_seen_fraction", 0.0),
+            "fast_min_group_seen_fraction": losses["fast"].get("min_group_seen_fraction", 0.0),
+            "fast_full_batch_kl_checks": losses["fast"].get("full_batch_kl_checks", 0.0),
+            "fast_group_count": losses["fast"].get("group_count", 0.0),
+            "fast_max_group_approx_kl": losses["fast"].get("max_group_approx_kl", 0.0),
+            "fast_min_group_approx_kl": losses["fast"].get("min_group_approx_kl", 0.0),
+            "fast_group_approx_kl_std": losses["fast"].get("group_approx_kl_std", 0.0),
+            "fast_load_approx_kl": format_group_diagnostics(
+                fast_group_diagnostics,
+                "approx_kl",
+            ),
+            "fast_load_clip_fraction": format_group_diagnostics(
+                fast_group_diagnostics,
+                "clip_fraction",
+            ),
             "eval_avg_latency_s": eval_stats.get("eval_avg_latency_s", np.nan),
             "eval_avg_latency_std": eval_stats.get("eval_avg_latency_std", np.nan),
             "eval_p95_latency_s": eval_stats.get("eval_p95_latency_s", np.nan),
@@ -3264,7 +3323,8 @@ def main() -> None:
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
             "node_load={:.1%}/{:.1%} active={:.1%} hot={:.1%} link_load={:.2%}/{:.1%} active_link={:.1%} hot_link={:.1%} mem={:.1%}/{:.1%} storage={:.1%}/{:.1%} service_mem={:.1%}/{:.1%} service_storage={:.1%}/{:.1%} idle_deployed={:.1%} "
-            "slow_update={} slow_buffer={}/{} slow_loss={:.4f} slow_windows={:.0f} critic_ev={:.3f} fast_loss={:.4f}".format(
+            "slow_update={} slow_buffer={}/{} slow_loss={:.4f} slow_windows={:.0f} critic_ev={:.3f} "
+            "fast_loss={:.4f} fast_epochs={:.0f} fast_steps={:.0f} fast_cover={:.1%} fast_kl={:.5f}/{:.5f}".format(
                 update + 1,
                 episode_label,
                 demand_seed,
@@ -3325,6 +3385,11 @@ def main() -> None:
                 losses["slow"].get("window_count", 0.0),
                 losses["slow"].get("critic_explained_variance", 0.0),
                 losses["fast"]["loss"],
+                losses["fast"].get("epochs_completed", 0.0),
+                losses["fast"].get("optimizer_steps", 0.0),
+                losses["fast"].get("min_group_seen_fraction", 0.0),
+                losses["fast"].get("approx_kl", 0.0),
+                losses["fast"].get("max_group_approx_kl", 0.0),
             )
         )
         if eval_stats:

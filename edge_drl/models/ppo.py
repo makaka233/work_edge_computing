@@ -43,6 +43,81 @@ def _center_advantages_by_group(
     return centered
 
 
+def _normalize_advantages_by_group(
+    advantages: np.ndarray,
+    weights: np.ndarray,
+    group_ids: np.ndarray,
+) -> np.ndarray:
+    """Normalize advantages independently so each operating regime has usable scale."""
+
+    normalized = np.asarray(advantages, dtype=np.float32).copy()
+    weights_np = np.asarray(weights, dtype=np.float32)
+    groups_np = np.asarray(group_ids)
+    if normalized.ndim != 1 or weights_np.shape != normalized.shape or groups_np.shape != normalized.shape:
+        raise ValueError("advantages, weights, and group_ids must have the same 1D shape")
+    for group_id in np.unique(groups_np):
+        group_mask = groups_np == group_id
+        group_weights = weights_np[group_mask]
+        denominator = float(group_weights.sum())
+        if denominator <= 1e-8:
+            continue
+        group_values = normalized[group_mask]
+        group_mean = float(np.sum(group_values * group_weights) / denominator)
+        group_variance = float(
+            np.sum(np.square(group_values - group_mean) * group_weights) / denominator
+        )
+        normalized[group_mask] = (group_values - group_mean) / (np.sqrt(group_variance) + 1e-8)
+    return normalized
+
+
+def _balance_group_weights(weights: np.ndarray, group_ids: np.ndarray) -> np.ndarray:
+    """Give every sampled operating regime equal total optimizer weight."""
+
+    balanced = np.asarray(weights, dtype=np.float32).copy()
+    groups_np = np.asarray(group_ids)
+    if balanced.ndim != 1 or groups_np.shape != balanced.shape:
+        raise ValueError("weights and group_ids must have the same 1D shape")
+    unique_groups = np.unique(groups_np)
+    if unique_groups.size <= 1:
+        return balanced
+    total_weight = float(balanced.sum())
+    target_weight = total_weight / float(unique_groups.size)
+    for group_id in unique_groups:
+        group_mask = groups_np == group_id
+        group_weight = float(balanced[group_mask].sum())
+        if group_weight > 1e-8:
+            balanced[group_mask] *= target_weight / group_weight
+    return balanced
+
+
+def _stratified_minibatches(
+    sample_count: int,
+    minibatch_size: int,
+    group_ids: np.ndarray,
+) -> list[np.ndarray]:
+    """Shuffle within groups and spread every group across a complete epoch."""
+
+    if sample_count < 1:
+        return []
+    groups_np = np.asarray(group_ids)
+    if groups_np.shape != (sample_count,):
+        raise ValueError("group_ids must contain one entry per sample")
+    batch_count = int(np.ceil(sample_count / max(int(minibatch_size), 1)))
+    unique_groups = np.unique(groups_np)
+    group_chunks = {
+        group_id: np.array_split(np.random.permutation(np.flatnonzero(groups_np == group_id)), batch_count)
+        for group_id in unique_groups
+    }
+    batches: list[np.ndarray] = []
+    for batch_idx in range(batch_count):
+        parts = [group_chunks[group_id][batch_idx] for group_id in unique_groups]
+        non_empty = [part for part in parts if len(part)]
+        if not non_empty:
+            continue
+        batches.append(np.random.permutation(np.concatenate(non_empty)))
+    return batches
+
+
 @dataclass
 class RolloutBuffer:
     states: list[np.ndarray] = field(default_factory=list)
@@ -53,6 +128,7 @@ class RolloutBuffer:
     dones: list[bool] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
     weights: list[float] = field(default_factory=list)
+    sample_groups: list[float] = field(default_factory=list)
 
     def add(
         self,
@@ -65,6 +141,7 @@ class RolloutBuffer:
         done: bool,
         value: float,
         weight: float = 1.0,
+        sample_group: float | None = None,
     ) -> None:
         self.states.append(np.asarray(state, dtype=np.float32))
         self.masks.append(np.asarray(mask, dtype=bool))
@@ -74,6 +151,8 @@ class RolloutBuffer:
         self.dones.append(bool(done))
         self.values.append(float(value))
         self.weights.append(float(weight))
+        if sample_group is not None:
+            self.sample_groups.append(float(sample_group))
 
     def extend_rewards_for_pending(self, reward: float, done: bool, weight: float = 1.0) -> None:
         missing = len(self.actions) - len(self.rewards)
@@ -91,6 +170,7 @@ class RolloutBuffer:
         self.dones.clear()
         self.values.clear()
         self.weights.clear()
+        self.sample_groups.clear()
 
     def __len__(self) -> int:
         return len(self.actions)
@@ -460,6 +540,8 @@ class PPOAgent:
         edge_feature_dim: int | None = None,
         num_nodes: int | None = None,
         detach_critic_backbone: bool = False,
+        group_balanced_updates: bool = False,
+        full_batch_kl_stop: bool = False,
         device: str = "cpu",
     ):
         self.gamma = gamma
@@ -470,7 +552,10 @@ class PPOAgent:
         self.value_coef = value_coef
         self.target_kl = target_kl
         self.minibatch_size = minibatch_size
+        self.group_balanced_updates = bool(group_balanced_updates)
+        self.full_batch_kl_stop = bool(full_batch_kl_stop)
         self.device = torch.device(device)
+        self.last_group_diagnostics: dict[float, dict[str, float]] = {}
         if policy_kind == "flat":
             self.policy = MaskedActorCritic(obs_dim, action_dim, hidden_dim).to(self.device)
         elif policy_kind == "node_scorer":
@@ -593,6 +678,7 @@ class PPOAgent:
         actions_np: np.ndarray,
         old_logprobs_np: np.ndarray,
         weights_np: np.ndarray,
+        group_ids_np: np.ndarray | None = None,
     ) -> dict[str, float]:
         """Measure the final policy against the complete behavior-policy batch."""
 
@@ -600,6 +686,7 @@ class PPOAgent:
         weighted_kl = 0.0
         weighted_clip = 0.0
         total_weight = 0.0
+        group_sums: dict[float, dict[str, float]] = {}
         batch_size = max(1, min(self.minibatch_size, len(actions_np)))
         with torch.no_grad():
             for start in range(0, len(actions_np), batch_size):
@@ -627,15 +714,52 @@ class PPOAgent:
                 weighted_kl += float((kl_values * batch_weights).sum().item())
                 weighted_clip += float((clip_values * batch_weights).sum().item())
                 total_weight += float(batch_weights.sum().item())
+                if group_ids_np is not None:
+                    batch_groups = group_ids_np[start:end]
+                    for group_id in np.unique(batch_groups):
+                        group_mask = torch.as_tensor(
+                            batch_groups == group_id,
+                            dtype=torch.bool,
+                            device=self.device,
+                        )
+                        group_weight = float(batch_weights[group_mask].sum().item())
+                        sums = group_sums.setdefault(
+                            float(group_id),
+                            {"weight": 0.0, "kl": 0.0, "clip": 0.0, "entropy": 0.0},
+                        )
+                        sums["weight"] += group_weight
+                        sums["kl"] += float(
+                            (kl_values[group_mask] * batch_weights[group_mask]).sum().item()
+                        )
+                        sums["clip"] += float(
+                            (clip_values[group_mask] * batch_weights[group_mask]).sum().item()
+                        )
+                        sums["entropy"] += float(
+                            (dist.entropy()[group_mask] * batch_weights[group_mask]).sum().item()
+                        )
         denominator = max(total_weight, 1e-8)
+        self.last_group_diagnostics = {
+            group_id: {
+                "approx_kl": sums["kl"] / max(sums["weight"], 1e-8),
+                "clip_fraction": sums["clip"] / max(sums["weight"], 1e-8),
+                "entropy": sums["entropy"] / max(sums["weight"], 1e-8),
+            }
+            for group_id, sums in sorted(group_sums.items())
+        }
+        group_kls = [metrics["approx_kl"] for metrics in self.last_group_diagnostics.values()]
         return {
             "entropy": weighted_entropy / denominator,
             "approx_kl": weighted_kl / denominator,
             "clip_fraction": weighted_clip / denominator,
+            "group_count": float(len(group_kls)),
+            "max_group_approx_kl": float(max(group_kls)) if group_kls else 0.0,
+            "min_group_approx_kl": float(min(group_kls)) if group_kls else 0.0,
+            "group_approx_kl_std": float(np.std(group_kls)) if group_kls else 0.0,
         }
 
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         if len(self.buffer) == 0:
+            self.last_group_diagnostics = {}
             return {
                 "loss": 0.0,
                 "policy_loss": 0.0,
@@ -647,6 +771,16 @@ class PPOAgent:
                 "advantage_std": 0.0,
                 "epochs_completed": 0.0,
                 "kl_early_stop": 0.0,
+                "optimizer_steps": 0.0,
+                "minibatches_completed": 0.0,
+                "minibatches_planned": 0.0,
+                "samples_seen_fraction": 0.0,
+                "min_group_seen_fraction": 0.0,
+                "full_batch_kl_checks": 0.0,
+                "group_count": 0.0,
+                "max_group_approx_kl": 0.0,
+                "min_group_approx_kl": 0.0,
+                "group_approx_kl_std": 0.0,
             }
         if len(self.buffer.rewards) != len(self.buffer.actions):
             raise ValueError("buffer contains pending transitions without rewards")
@@ -658,11 +792,22 @@ class PPOAgent:
             weights_np = np.asarray(self.buffer.weights, dtype=np.float32)
         else:
             weights_np = np.ones(len(self.buffer.actions), dtype=np.float32)
+        if self.buffer.sample_groups:
+            if len(self.buffer.sample_groups) != len(self.buffer.actions):
+                raise ValueError("buffer sample groups do not match actions")
+            group_ids_np = np.asarray(self.buffer.sample_groups, dtype=np.float32)
+        else:
+            group_ids_np = np.zeros(len(self.buffer.actions), dtype=np.float32)
+        if self.group_balanced_updates:
+            weights_np = _balance_group_weights(weights_np, group_ids_np)
         weights_np /= max(float(weights_np.mean()), 1e-8)
         advantage_mean = float(np.average(advantages_np, weights=weights_np))
         advantage_variance = float(np.average((advantages_np - advantage_mean) ** 2, weights=weights_np))
         advantage_std = float(np.sqrt(advantage_variance))
-        advantages_np = (advantages_np - advantage_mean) / (advantage_std + 1e-8)
+        if self.group_balanced_updates and np.unique(group_ids_np).size > 1:
+            advantages_np = _normalize_advantages_by_group(advantages_np, weights_np, group_ids_np)
+        else:
+            advantages_np = (advantages_np - advantage_mean) / (advantage_std + 1e-8)
 
         actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
@@ -695,11 +840,19 @@ class PPOAgent:
         optimizer_steps = 0
         epochs_completed = 0
         kl_early_stop = False
+        minibatches_completed = 0
+        full_batch_kl_checks = 0
+        samples_seen = np.zeros(n, dtype=bool)
+        final_diagnostics: dict[str, float] | None = None
         for epoch_idx in range(self.k_epochs):
-            order = np.random.permutation(n)
+            if self.group_balanced_updates and np.unique(group_ids_np).size > 1:
+                epoch_batches = _stratified_minibatches(n, minibatch_size, group_ids_np)
+            else:
+                order = np.random.permutation(n)
+                epoch_batches = [order[start : start + minibatch_size] for start in range(0, n, minibatch_size)]
             approx_kls: list[float] = []
-            for start in range(0, n, minibatch_size):
-                idx = order[start : start + minibatch_size]
+            epoch_complete = True
+            for idx in epoch_batches:
                 states = torch.as_tensor(np.stack([self.buffer.states[i] for i in idx]), dtype=torch.float32, device=self.device)
                 masks = torch.as_tensor(np.stack([self.buffer.masks[i] for i in idx]), dtype=torch.bool, device=self.device)
                 actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
@@ -720,8 +873,14 @@ class PPOAgent:
                     (torch.abs(ratios - 1.0) > self.eps_clip).float() * sample_weights
                 ).mean()
 
-                if self.target_kl is not None and optimizer_steps > 0 and float(approx_kl.item()) > self.target_kl:
+                if (
+                    not self.full_batch_kl_stop
+                    and self.target_kl is not None
+                    and optimizer_steps > 0
+                    and float(approx_kl.item()) > self.target_kl
+                ):
                     kl_early_stop = True
+                    epoch_complete = False
                     break
 
                 surr1 = ratios * advantages
@@ -735,6 +894,8 @@ class PPOAgent:
                 self._clip_policy_gradients()
                 self.optimizer.step()
                 optimizer_steps += 1
+                minibatches_completed += 1
+                samples_seen[idx] = True
                 approx_kls.append(float(approx_kl.item()))
                 last_metrics = {
                     "loss": float(loss.item()),
@@ -756,18 +917,51 @@ class PPOAgent:
                         ),
                         refresh=False,
                     )
-            epochs_completed = epoch_idx + 1
+            if epoch_complete:
+                epochs_completed += 1
             if kl_early_stop:
                 break
-            if self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
+            if self.full_batch_kl_stop:
+                final_diagnostics = self._buffer_policy_diagnostics(
+                    actions_np,
+                    old_logprobs_np,
+                    weights_np,
+                    group_ids_np,
+                )
+                full_batch_kl_checks += 1
+                kl_for_stop = max(
+                    final_diagnostics["approx_kl"],
+                    final_diagnostics["max_group_approx_kl"],
+                )
+                if self.target_kl is not None and kl_for_stop > self.target_kl:
+                    kl_early_stop = True
+                    break
+            elif self.target_kl is not None and approx_kls and float(np.mean(approx_kls)) > self.target_kl:
                 kl_early_stop = True
                 break
         if progress is not None:
             progress.close()
 
-        last_metrics.update(self._buffer_policy_diagnostics(actions_np, old_logprobs_np, weights_np))
+        if final_diagnostics is None:
+            final_diagnostics = self._buffer_policy_diagnostics(
+                actions_np,
+                old_logprobs_np,
+                weights_np,
+                group_ids_np,
+            )
+        last_metrics.update(final_diagnostics)
+        group_coverages = [
+            float(np.mean(samples_seen[group_ids_np == group_id]))
+            for group_id in np.unique(group_ids_np)
+        ]
         last_metrics["epochs_completed"] = float(epochs_completed)
         last_metrics["kl_early_stop"] = float(kl_early_stop)
+        last_metrics["optimizer_steps"] = float(optimizer_steps)
+        last_metrics["minibatches_completed"] = float(minibatches_completed)
+        last_metrics["minibatches_planned"] = float(self.k_epochs * batches_per_epoch)
+        last_metrics["samples_seen_fraction"] = float(np.mean(samples_seen))
+        last_metrics["min_group_seen_fraction"] = float(min(group_coverages)) if group_coverages else 0.0
+        last_metrics["full_batch_kl_checks"] = float(full_batch_kl_checks)
         self.buffer.clear()
         return last_metrics
 

@@ -770,6 +770,8 @@ class FastSchedulingPPOAgent:
     target_kl: float | None = 0.015
     minibatch_size: int = 512
     reservation_microbatch_size: int = 16
+    load_balanced_updates: bool = True
+    full_batch_kl_stop: bool = True
     device: str = "cpu"
     ppo: PPOAgent = field(init=False)
     _workload_cache_key: tuple[object, ...] | None = field(default=None, init=False, repr=False)
@@ -798,6 +800,8 @@ class FastSchedulingPPOAgent:
             node_feature_dim=FAST_NODE_FEATURE_DIM,
             edge_feature_dim=FAST_EDGE_FEATURE_DIM,
             num_nodes=self.num_nodes,
+            group_balanced_updates=self.load_balanced_updates,
+            full_batch_kl_stop=self.full_batch_kl_stop,
             device=self.device,
         )
 
@@ -893,6 +897,7 @@ class FastSchedulingPPOAgent:
                     self.ppo.buffer.actions.append(action)
                     self.ppo.buffer.logprobs.append(logprob)
                     self.ppo.buffer.values.append(value)
+                    self.ppo.buffer.sample_groups.append(float(env.config.demand_load_multiplier))
         return schedules
 
     def schedule_with_diagnostics(
@@ -1281,6 +1286,8 @@ class HierarchicalPPOAgent:
         fast_minibatch_size: int = 512,
         fast_policy_kind: str = "gat_node_scorer",
         fast_reservation_microbatch_size: int = 16,
+        fast_load_balanced_updates: bool = True,
+        fast_full_batch_kl_stop: bool = True,
         slow_reward_scale: float = 1.0,
         slow_tail_latency_coef: float = 0.35,
         slow_colocation_coef: float = 0.05,
@@ -1333,6 +1340,8 @@ class HierarchicalPPOAgent:
                 target_kl=fast_target_kl,
                 minibatch_size=fast_minibatch_size,
                 reservation_microbatch_size=fast_reservation_microbatch_size,
+                load_balanced_updates=fast_load_balanced_updates,
+                full_batch_kl_stop=fast_full_batch_kl_stop,
                 device=device,
             ),
             slow_reward_scale=slow_reward_scale,

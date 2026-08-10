@@ -23,6 +23,8 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     args = parse_args()
 
     assert args.fast_lr == 2e-4
+    assert args.fast_load_balanced_updates is True
+    assert args.fast_full_batch_kl_stop is True
     assert args.fast_entropy_coef == 0.001
     assert args.slow_count_lr == 2e-4
     assert args.slow_placement_entropy_coef == 0.005
@@ -253,6 +255,11 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "avg_service_memory_util" in rows[0]
     assert "active_node_rate" in rows[0]
     assert "hot_link_rate" in rows[0]
+    assert "fast_optimizer_steps" in rows[0]
+    assert "fast_samples_seen_fraction" in rows[0]
+    assert "fast_min_group_seen_fraction" in rows[0]
+    assert "fast_max_group_approx_kl" in rows[0]
+    assert "fast_load_approx_kl" in rows[0]
 
     with (log_dir / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
         episode_rows = list(csv.DictReader(handle))

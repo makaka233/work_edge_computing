@@ -94,6 +94,8 @@ agent:
     fast_lr: 0.0002
     fast_entropy_coef: 0.001
     fast_target_kl: 0.015
+    fast_load_balanced_updates: true
+    fast_full_batch_kl_stop: true
     slow_tail_latency_coef: 0.35
     slow_value_coef: 0.5
     slow_count_value_coef: 0.0

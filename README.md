@@ -151,6 +151,15 @@ Migration changes remain logged, but `--slow-migration-coef` defaults to zero fo
 the current convergence experiments.
 Fast and Slow PPO use alternating frozen-controller phases by default. Four Fast
 warm-up updates first learn under the conservative expected-count Slow deployment.
+Fast collection tags every transition with its demand load multiplier. By default,
+`--fast-load-balanced-updates` spreads every load level across each minibatch,
+equalizes the total optimizer weight of the load levels, and normalizes advantages
+within each load. `--fast-full-batch-kl-stop` guarantees one complete pass over all
+loads before checking the full-buffer and worst-load KL; later epochs stop only at
+epoch boundaries. This prevents one noisy or high-volume load minibatch from
+discarding the remaining load signals. The training log records optimizer steps,
+sample and minimum-load coverage, full-buffer/worst-load KL, and serialized per-load
+KL/clip fractions. Both options have `--no-...` forms for ablation runs.
 Four Slow warm-up updates then collect the configured episode batch with the now-trained Fast
 policy frozen but still sampled stochastically. This exposes the utility of
 alternative replicas instead of labelling everything outside deterministic Fast's

@@ -3,7 +3,13 @@ import torch
 
 from edge_drl.agents.drl import HierarchicalPPOAgent, fast_obs_dim, slow_obs_dim
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
-from edge_drl.models.ppo import PPOAgent, _center_advantages_by_group
+from edge_drl.models.ppo import (
+    PPOAgent,
+    _balance_group_weights,
+    _center_advantages_by_group,
+    _normalize_advantages_by_group,
+    _stratified_minibatches,
+)
 from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_costs, rollout
 
 
@@ -22,6 +28,67 @@ def test_count_advantages_are_centered_within_service_stage():
     assert np.allclose(centered, [-3.0, 1.0, -4.0, 4.0])
     assert np.isclose(np.average(centered[:2], weights=weights[:2]), 0.0)
     assert np.isclose(np.average(centered[2:], weights=weights[2:]), 0.0)
+
+
+def test_fast_load_groups_are_balanced_normalized_and_stratified():
+    group_ids = np.asarray([0] * 4 + [1] * 8 + [2] * 12 + [3] * 16, dtype=np.float32)
+    weights = np.ones(len(group_ids), dtype=np.float32)
+    balanced = _balance_group_weights(weights, group_ids)
+    group_weight_sums = [balanced[group_ids == group_id].sum() for group_id in range(4)]
+    assert np.allclose(group_weight_sums, group_weight_sums[0])
+
+    advantages = np.arange(len(group_ids), dtype=np.float32)
+    normalized = _normalize_advantages_by_group(advantages, balanced, group_ids)
+    for group_id in range(4):
+        mask = group_ids == group_id
+        assert np.isclose(np.average(normalized[mask], weights=balanced[mask]), 0.0, atol=1e-6)
+        assert np.isclose(np.average(np.square(normalized[mask]), weights=balanced[mask]), 1.0, atol=1e-5)
+
+    batches = _stratified_minibatches(len(group_ids), 10, group_ids)
+    assert len(batches) == 4
+    assert sorted(np.concatenate(batches).tolist()) == list(range(len(group_ids)))
+    assert all(set(group_ids[batch].tolist()) == {0.0, 1.0, 2.0, 3.0} for batch in batches)
+
+
+def test_fast_full_batch_kl_stop_covers_every_load_before_stopping():
+    torch.manual_seed(71)
+    np.random.seed(71)
+    ppo = PPOAgent(
+        obs_dim=2,
+        action_dim=2,
+        hidden_dim=8,
+        lr=0.05,
+        k_epochs=4,
+        minibatch_size=4,
+        target_kl=1e-8,
+        group_balanced_updates=True,
+        full_batch_kl_stop=True,
+    )
+    mask = np.asarray([True, True])
+    for index in range(16):
+        state = np.asarray([float(index % 2), float(index // 2) / 8.0], dtype=np.float32)
+        probabilities, value = ppo.action_probabilities(state, mask)
+        action = index % 2
+        ppo.buffer.states.append(state)
+        ppo.buffer.masks.append(mask.copy())
+        ppo.buffer.actions.append(action)
+        ppo.buffer.logprobs.append(float(np.log(probabilities[action])))
+        ppo.buffer.values.append(value)
+        ppo.buffer.rewards.append(1.0 if action == int(state[0]) else -1.0)
+        ppo.buffer.dones.append(True)
+        ppo.buffer.weights.append(1.0)
+        ppo.buffer.sample_groups.append(float(index // 4))
+
+    metrics = ppo.update()
+
+    assert metrics["kl_early_stop"] == 1.0
+    assert metrics["epochs_completed"] >= 1.0
+    assert metrics["optimizer_steps"] >= 4.0
+    assert metrics["samples_seen_fraction"] == 1.0
+    assert metrics["min_group_seen_fraction"] == 1.0
+    assert metrics["full_batch_kl_checks"] >= 1.0
+    assert metrics["group_count"] == 4.0
+    assert set(ppo.last_group_diagnostics) == {0.0, 1.0, 2.0, 3.0}
 
 
 def test_count_actor_can_bypass_failed_value_baseline():
@@ -204,6 +271,9 @@ def test_fast_batch_inference_keeps_request_major_buffer_order():
 
     expected_transitions = sum(len(request.stage_compute_gcycles) for request in requests)
     assert len(agent.fast_agent.ppo.buffer) == expected_transitions
+    assert agent.fast_agent.ppo.buffer.sample_groups == [
+        env.config.demand_load_multiplier
+    ] * expected_transitions
     offset = 0
     for request_idx, request in enumerate(requests):
         for stage_id in range(len(request.stage_compute_gcycles)):
