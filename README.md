@@ -105,7 +105,8 @@ stochastic training policy. Its initial scale is one sixth of the action range,
 which preserves local exploration without keeping a 32-count policy nearly uniform.
 A one-twelfth-range scale floor prevents Count entropy from collapsing while it
 is still adapting to a changing Fast policy. Count also uses an independent
-`1.5e-4` learning rate and `0.015` KL limit by default.
+`2e-4` learning rate and `0.015` KL limit by default. The learning rate uses
+more of Count's observed KL margin while remaining below the shared Slow rate.
 
 Slow deployment is trained from one 10-minute window at a time, but Count and
 Placement no longer receive one undifferentiated return for every component
@@ -118,9 +119,12 @@ detached from the actor graph encoder so value fitting cannot flatten node score
 Placement actor returns are centered within the same service stage before
 normalization, making the policy compare alternative nodes rather than unrelated
 absolute latency scales across stages. Placement uses an independent `1.5e-4`
-learning rate, `0.015` KL limit, and `0.005` entropy coefficient by default. The
-slightly stronger entropy term is intended to keep node exploration from
-collapsing while the shuffled demand pool changes the active traffic mix.
+learning rate and `0.015` KL limit. Its entropy coefficient starts at `0.005`
+and decays linearly to `0.003` over 16 completed Slow PPO updates. This preserves
+early node exploration without holding the deployment policy at the higher
+exploration pressure after it has collected several full Slow batches. The
+active coefficient and completed Placement-update count are written to each
+training row.
 Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
 and deadline violations penalize under-provisioning, while a continuous effective-
 replica measure based on request shares penalizes replicas that add little usable

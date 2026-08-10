@@ -175,6 +175,9 @@ def test_dual_ppo_rollout_and_update():
     assert np.isfinite(losses["slow"]["count_post_explained_variance"])
     assert np.isfinite(losses["slow"]["placement_post_explained_variance"])
     assert losses["slow"]["window_count"] == 1
+    assert np.isclose(losses["slow"]["placement_entropy_coef"], 0.005)
+    assert losses["slow"]["placement_updates_completed"] == 1
+    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.004875)
     assert np.isfinite(losses["slow"]["critic_explained_variance"])
     assert np.isfinite(losses["fast"]["loss"])
     assert len(agent.slow_agent.count_ppo.buffer) == 0
@@ -479,13 +482,19 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     assert agent.slow_agent.count_ppo.policy.actor[-1].out_features == 2
     assert agent.slow_agent.count_ppo.policy.action_dim == 4
     assert agent.slow_agent.count_ppo.value_coef == 0.0
-    assert np.isclose(agent.slow_agent.count_ppo.optimizer.param_groups[0]["lr"], 1.5e-4)
+    assert np.isclose(agent.slow_agent.count_ppo.optimizer.param_groups[0]["lr"], 2e-4)
     assert np.isclose(agent.slow_agent.count_ppo.target_kl, 0.015)
     assert agent.slow_agent.placement_ppo.policy.actor[-1].out_features == 1
     assert agent.slow_agent.placement_ppo.policy.detach_critic_backbone
     assert np.isclose(agent.slow_agent.placement_ppo.optimizer.param_groups[0]["lr"], 1.5e-4)
     assert np.isclose(agent.slow_agent.placement_ppo.target_kl, 0.015)
     assert np.isclose(agent.slow_agent.placement_ppo.entropy_coef, 0.005)
+    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.005)
+    agent.slow_agent.placement_updates_completed = 8
+    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.004)
+    agent.slow_agent.placement_updates_completed = 16
+    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.003)
+    agent.slow_agent.placement_updates_completed = 0
     assert np.isclose(agent.fast_agent.ppo.optimizer.param_groups[0]["lr"], 2e-4)
     assert np.isclose(agent.fast_agent.ppo.entropy_coef, 0.001)
 

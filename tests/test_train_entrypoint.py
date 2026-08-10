@@ -23,7 +23,10 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
 
     assert args.fast_lr == 2e-4
     assert args.fast_entropy_coef == 0.001
+    assert args.slow_count_lr == 2e-4
     assert args.slow_placement_entropy_coef == 0.005
+    assert args.slow_placement_entropy_final_coef == 0.003
+    assert args.slow_placement_entropy_decay_updates == 16
 
 
 def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
@@ -240,6 +243,8 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "slow_window_return" in rows[0]
     assert "slow_window_count" in rows[0]
     assert "slow_critic_explained_variance" in rows[0]
+    assert "slow_placement_entropy_coef" in rows[0]
+    assert "slow_placement_updates_completed" in rows[0]
     assert "avg_service_memory_util" in rows[0]
     assert "active_node_rate" in rows[0]
     assert "hot_link_rate" in rows[0]

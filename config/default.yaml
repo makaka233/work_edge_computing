@@ -85,7 +85,9 @@ agent:
     feasibility_repair: true
     slow_count_entropy_coef: null
     slow_placement_entropy_coef: 0.005
-    slow_count_lr: 0.00015
+    slow_placement_entropy_final_coef: 0.003
+    slow_placement_entropy_decay_updates: 16
+    slow_count_lr: 0.0002
     slow_placement_lr: 0.00015
     slow_count_target_kl: 0.015
     slow_placement_target_kl: 0.015

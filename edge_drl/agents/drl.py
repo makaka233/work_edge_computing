@@ -63,12 +63,14 @@ class SlowDeploymentPPOAgent:
     replicas_per_stage: int = 5
     coverage_repair: bool = True
     lr: float = 3e-4
-    count_lr: float = 1.5e-4
+    count_lr: float = 2e-4
     placement_lr: float | None = None
     k_epochs: int = 3
     entropy_coef: float = 0.001
     count_entropy_coef: float | None = None
     placement_entropy_coef: float | None = 0.005
+    placement_entropy_final_coef: float | None = 0.003
+    placement_entropy_decay_updates: int = 16
     value_coef: float = 0.5
     count_value_coef: float = 0.0
     critic_lr: float | None = None
@@ -100,12 +102,21 @@ class SlowDeploymentPPOAgent:
     window_returns: list[float] = field(default_factory=list)
     pending_window_id: int | None = None
     last_window_feedback: dict[str, float] = field(default_factory=dict)
+    placement_updates_completed: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.tail_latency_coef <= 1.0:
             raise ValueError("tail_latency_coef must be in [0, 1]")
         if self.deterministic_count_mode not in {"expected", "mode"}:
             raise ValueError("deterministic_count_mode must be 'expected' or 'mode'")
+        placement_entropy_start = self._placement_entropy_start()
+        placement_entropy_final = self._placement_entropy_final()
+        if placement_entropy_start < 0.0 or placement_entropy_final < 0.0:
+            raise ValueError("placement entropy coefficients must be non-negative")
+        if placement_entropy_final > placement_entropy_start:
+            raise ValueError("placement_entropy_final_coef must not exceed the initial coefficient")
+        if self.placement_entropy_decay_updates < 1:
+            raise ValueError("placement_entropy_decay_updates must be >= 1")
         self.count_ppo = PPOAgent(
             obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
             action_dim=self.replicas_per_stage,
@@ -135,7 +146,7 @@ class SlowDeploymentPPOAgent:
             lr=self.lr if self.placement_lr is None else self.placement_lr,
             gamma=0.99,
             k_epochs=self.k_epochs,
-            entropy_coef=self.entropy_coef if self.placement_entropy_coef is None else self.placement_entropy_coef,
+            entropy_coef=self.placement_entropy_coefficient(),
             value_coef=self.value_coef,
             target_kl=self.target_kl if self.placement_target_kl is None else self.placement_target_kl,
             minibatch_size=self.minibatch_size,
@@ -157,6 +168,21 @@ class SlowDeploymentPPOAgent:
             self.window_critic.parameters(),
             lr=self.lr if self.critic_lr is None else self.critic_lr,
         )
+
+    def _placement_entropy_start(self) -> float:
+        return float(self.entropy_coef if self.placement_entropy_coef is None else self.placement_entropy_coef)
+
+    def _placement_entropy_final(self) -> float:
+        start = self._placement_entropy_start()
+        return float(start if self.placement_entropy_final_coef is None else self.placement_entropy_final_coef)
+
+    def placement_entropy_coefficient(self) -> float:
+        progress = min(
+            float(self.placement_updates_completed) / float(self.placement_entropy_decay_updates),
+            1.0,
+        )
+        start = self._placement_entropy_start()
+        return start + progress * (self._placement_entropy_final() - start)
 
     def plan_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> np.ndarray:
         env._require_ready()
@@ -384,6 +410,8 @@ class SlowDeploymentPPOAgent:
             progress_label=f"{progress_label} count",
             progress_interval_seconds=progress_interval_seconds,
         )
+        placement_entropy_coef = self.placement_entropy_coefficient()
+        self.placement_ppo.entropy_coef = placement_entropy_coef
         placement_metrics = self.placement_ppo.update_from_returns(
             placement_returns,
             sample_weights=self._equal_window_action_weights(placement_ids),
@@ -399,6 +427,7 @@ class SlowDeploymentPPOAgent:
             progress_interval_seconds=progress_interval_seconds,
         )
         critic_metrics = self._update_window_critic(returns)
+        self.placement_updates_completed += 1
         window_count = len(self.window_returns)
         self.count_window_ids.clear()
         self.placement_window_ids.clear()
@@ -449,6 +478,8 @@ class SlowDeploymentPPOAgent:
             "placement_policy_loss": placement_metrics["policy_loss"],
             "placement_value_loss": placement_metrics["value_loss"],
             "placement_entropy": placement_metrics["entropy"],
+            "placement_entropy_coef": placement_entropy_coef,
+            "placement_updates_completed": float(self.placement_updates_completed),
             "placement_approx_kl": placement_metrics.get("approx_kl", 0.0),
             "placement_explained_variance": placement_metrics.get("explained_variance", 0.0),
             "placement_post_explained_variance": placement_metrics.get("post_explained_variance", 0.0),
@@ -489,6 +520,8 @@ class SlowDeploymentPPOAgent:
             "placement_policy_loss": 0.0,
             "placement_value_loss": 0.0,
             "placement_entropy": 0.0,
+            "placement_entropy_coef": self.placement_entropy_coefficient(),
+            "placement_updates_completed": float(self.placement_updates_completed),
             "placement_approx_kl": 0.0,
             "placement_explained_variance": 0.0,
             "placement_post_explained_variance": 0.0,
@@ -1224,7 +1257,7 @@ class HierarchicalPPOAgent:
         device: str = "cpu",
         replicas_per_stage: int = 5,
         slow_lr: float = 3e-4,
-        slow_count_lr: float = 1.5e-4,
+        slow_count_lr: float = 2e-4,
         slow_placement_lr: float = 1.5e-4,
         fast_lr: float = 2e-4,
         slow_k_epochs: int = 3,
@@ -1232,6 +1265,8 @@ class HierarchicalPPOAgent:
         slow_entropy_coef: float = 0.001,
         slow_count_entropy_coef: float | None = None,
         slow_placement_entropy_coef: float | None = 0.005,
+        slow_placement_entropy_final_coef: float | None = 0.003,
+        slow_placement_entropy_decay_updates: int = 16,
         fast_entropy_coef: float = 0.001,
         slow_value_coef: float = 0.5,
         slow_count_value_coef: float = 0.0,
@@ -1273,6 +1308,8 @@ class HierarchicalPPOAgent:
                 entropy_coef=slow_entropy_coef,
                 count_entropy_coef=slow_count_entropy_coef,
                 placement_entropy_coef=slow_placement_entropy_coef,
+                placement_entropy_final_coef=slow_placement_entropy_final_coef,
+                placement_entropy_decay_updates=slow_placement_entropy_decay_updates,
                 value_coef=slow_value_coef,
                 count_value_coef=slow_count_value_coef,
                 critic_lr=slow_critic_lr,

@@ -255,8 +255,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--slow-count-lr",
         type=float,
-        default=1.5e-4,
-        help="Independent Count actor learning rate; lower than Placement to avoid replica-count overshoot.",
+        default=2e-4,
+        help="Independent Count actor learning rate; raised to use the large observed Count KL margin.",
     )
     parser.add_argument(
         "--slow-placement-lr",
@@ -270,6 +270,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-entropy-coef", type=float, default=0.001)
     parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
     parser.add_argument("--slow-placement-entropy-coef", type=float, default=0.005)
+    parser.add_argument(
+        "--slow-placement-entropy-final-coef",
+        type=float,
+        default=0.003,
+        help="Final Placement entropy coefficient after the Slow-update decay schedule.",
+    )
+    parser.add_argument(
+        "--slow-placement-entropy-decay-updates",
+        type=int,
+        default=16,
+        help="Completed Slow PPO updates over which Placement entropy decays linearly.",
+    )
     parser.add_argument(
         "--slow-tail-latency-coef",
         type=float,
@@ -488,6 +500,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-count-lr and --slow-count-target-kl must be positive")
     if args.slow_placement_lr <= 0.0 or args.slow_placement_target_kl <= 0.0:
         parser.error("--slow-placement-lr and --slow-placement-target-kl must be positive")
+    if args.slow_placement_entropy_coef < 0.0 or args.slow_placement_entropy_final_coef < 0.0:
+        parser.error("Placement entropy coefficients must be non-negative")
+    if args.slow_placement_entropy_final_coef > args.slow_placement_entropy_coef:
+        parser.error("--slow-placement-entropy-final-coef must not exceed the initial coefficient")
+    if args.slow_placement_entropy_decay_updates < 1:
+        parser.error("--slow-placement-entropy-decay-updates must be >= 1")
     if args.synchronized_window_block < 0:
         parser.error("--synchronized-window-block must be >= 0")
     if args.episode_hours < 1:
@@ -2167,6 +2185,7 @@ def save_checkpoint(agent: HierarchicalPPOAgent, path: Path, metadata: dict[str,
         {
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
             "slow_placement_agent": agent.slow_agent.placement_ppo.policy.state_dict(),
+            "slow_placement_updates_completed": agent.slow_agent.placement_updates_completed,
             "slow_window_critic": agent.slow_agent.window_critic.state_dict(),
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
             "metadata": metadata,
@@ -2187,6 +2206,9 @@ def load_checkpoint(agent: HierarchicalPPOAgent, path: Path) -> dict[str, object
         agent.slow_agent.window_critic.load_state_dict(checkpoint["slow_window_critic"])
     if "fast_agent" in checkpoint:
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
+    if "slow_placement_updates_completed" in checkpoint:
+        agent.slow_agent.placement_updates_completed = int(checkpoint["slow_placement_updates_completed"])
+        agent.slow_agent.placement_ppo.entropy_coef = agent.slow_agent.placement_entropy_coefficient()
     return checkpoint.get("metadata", {})
 
 
@@ -2261,6 +2283,8 @@ def main() -> None:
         slow_entropy_coef=args.slow_entropy_coef,
         slow_count_entropy_coef=args.slow_count_entropy_coef,
         slow_placement_entropy_coef=args.slow_placement_entropy_coef,
+        slow_placement_entropy_final_coef=args.slow_placement_entropy_final_coef,
+        slow_placement_entropy_decay_updates=args.slow_placement_entropy_decay_updates,
         fast_entropy_coef=args.fast_entropy_coef,
         slow_value_coef=args.slow_value_coef,
         slow_count_value_coef=args.slow_count_value_coef,
@@ -2408,7 +2432,7 @@ def main() -> None:
     )
     print(f"  slow_deterministic_count_mode={args.slow_deterministic_count_mode}")
     print(
-        "  ppo slow_lr={} count_lr={} placement_lr={} fast_lr={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={} fast_entropy={} slow_value_coef={}".format(
+        "  ppo slow_lr={} count_lr={} placement_lr={} fast_lr={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={}->{} over {} slow updates fast_entropy={} slow_value_coef={}".format(
             args.slow_lr,
             args.slow_count_lr,
             args.slow_placement_lr,
@@ -2416,6 +2440,8 @@ def main() -> None:
             args.slow_entropy_coef,
             args.slow_count_entropy_coef if args.slow_count_entropy_coef is not None else args.slow_entropy_coef,
             args.slow_placement_entropy_coef if args.slow_placement_entropy_coef is not None else args.slow_entropy_coef,
+            args.slow_placement_entropy_final_coef,
+            args.slow_placement_entropy_decay_updates,
             args.fast_entropy_coef,
             args.slow_value_coef,
         )
@@ -2617,6 +2643,8 @@ def main() -> None:
             "slow_placement_explained_variance": np.nan,
             "slow_placement_post_explained_variance": np.nan,
             "slow_placement_entropy": 0.0,
+            "slow_placement_entropy_coef": args.slow_placement_entropy_coef,
+            "slow_placement_updates_completed": 0,
             "slow_placement_approx_kl": 0.0,
             "fast_loss": 0.0,
             "fast_policy_loss": 0.0,
@@ -3045,6 +3073,10 @@ def main() -> None:
                 "placement_post_explained_variance", np.nan
             ),
             "slow_placement_entropy": losses["slow"].get("placement_entropy", np.nan),
+            "slow_placement_entropy_coef": losses["slow"].get("placement_entropy_coef", np.nan),
+            "slow_placement_updates_completed": int(
+                losses["slow"].get("placement_updates_completed", 0.0)
+            ),
             "slow_placement_approx_kl": losses["slow"].get("placement_approx_kl", np.nan),
             "fast_loss": losses["fast"]["loss"],
             "fast_policy_loss": losses["fast"]["policy_loss"],
