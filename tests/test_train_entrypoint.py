@@ -26,29 +26,20 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_dual_ppo.py"])
     args = parse_args()
 
-    assert args.fast_lr == 1e-4
-    assert args.fast_min_lr == 5e-5
-    assert args.fast_max_lr == 2e-4
-    assert args.fast_kl_lr_adaptation is True
+    assert args.fast_lr == 2e-4
     assert args.fast_load_balanced_updates is True
     assert args.fast_full_batch_kl_stop is True
-    assert args.fast_entropy_coef == 0.002
-    assert args.fast_entropy_target == 0.5
-    assert args.fast_entropy_max_coef == 0.02
+    assert args.fast_entropy_coef == 0.001
+    assert args.fast_entropy_target == 0.7
+    assert args.fast_entropy_max_coef == 0.01
     assert args.slow_count_lr == 2e-4
-    assert args.slow_count_entropy_coef == 0.002
-    assert args.slow_count_entropy_target == 0.5
     assert args.slow_placement_entropy_coef == 0.005
     assert args.slow_placement_entropy_final_coef == 0.0035
     assert args.slow_placement_entropy_hold_updates == 64
     assert args.slow_placement_entropy_decay_updates == 64
     assert args.slow_count_global_advantage_coef == 0.25
     assert args.slow_placement_global_advantage_coef == 0.35
-    assert args.slow_idle_replica_coef == 0.15
-    assert args.slow_count_capacity_coef == 0.05
-    assert args.slow_critic_lr == 5e-4
-    assert args.slow_critic_k_epochs == 8
-    assert args.slow_critic_replay_windows == 96
+    assert args.slow_idle_replica_coef == 0.05
     assert args.slow_placement_idle_coef == 0.02
     assert args.episode_minutes == 10
     assert args.episode_hours is None
@@ -412,10 +403,6 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "slow_critic_explained_variance" in rows[0]
     assert "slow_placement_entropy_coef" in rows[0]
     assert "slow_placement_entropy_next_coef" in rows[0]
-    assert "slow_placement_normalized_entropy" in rows[0]
-    assert "slow_count_normalized_entropy" in rows[0]
-    assert "slow_window_critic_holdout_explained_variance" in rows[0]
-    assert "slow_global_advantage_reliability" in rows[0]
     assert "slow_count_global_advantage_coef" in rows[0]
     assert "slow_placement_global_advantage_coef" in rows[0]
     assert "slow_placement_updates_completed" in rows[0]
@@ -425,9 +412,6 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "fast_optimizer_steps" in rows[0]
     assert "fast_entropy_coef" in rows[0]
     assert "fast_entropy_next_coef" in rows[0]
-    assert "fast_normalized_entropy" in rows[0]
-    assert "fast_learning_rate" in rows[0]
-    assert "fast_next_learning_rate" in rows[0]
     assert "fast_samples_seen_fraction" in rows[0]
     assert "fast_min_group_seen_fraction" in rows[0]
     assert "fast_max_group_approx_kl" in rows[0]

@@ -112,23 +112,6 @@ def _balance_group_weights(
     return balanced
 
 
-def _normalized_masked_entropy(
-    entropy: torch.Tensor,
-    masks: torch.Tensor,
-) -> torch.Tensor:
-    """Scale categorical entropy by the maximum entropy of each action mask.
-
-    A state with one feasible action is already maximally exploratory, so it is
-    assigned one instead of spuriously pulling an adaptive entropy controller
-    upward.
-    """
-
-    feasible = masks.bool().sum(dim=-1).to(dtype=entropy.dtype)
-    denominator = torch.log(feasible.clamp_min(2.0))
-    normalized = entropy / denominator
-    return torch.where(feasible > 1.0, normalized.clamp(0.0, 1.0), torch.ones_like(normalized))
-
-
 def _stratified_minibatches(
     sample_count: int,
     minibatch_size: int,
@@ -646,15 +629,6 @@ class PPOAgent:
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
         self.buffer = RolloutBuffer()
 
-    def learning_rate(self) -> float:
-        return float(self.optimizer.param_groups[0]["lr"])
-
-    def set_learning_rate(self, learning_rate: float) -> None:
-        if not np.isfinite(learning_rate) or learning_rate <= 0.0:
-            raise ValueError("learning_rate must be finite and positive")
-        for parameter_group in self.optimizer.param_groups:
-            parameter_group["lr"] = float(learning_rate)
-
     def _clip_policy_gradients(self, max_norm: float = 0.5) -> None:
         """Clip detached actor/backbone and critic gradients independently."""
 
@@ -743,7 +717,6 @@ class PPOAgent:
         """Measure the final policy against the complete behavior-policy batch."""
 
         weighted_entropy = 0.0
-        weighted_normalized_entropy = 0.0
         weighted_kl = 0.0
         weighted_clip = 0.0
         total_weight = 0.0
@@ -767,16 +740,11 @@ class PPOAgent:
                 )
                 dist, _ = self.policy(states, masks)
                 logprobs = dist.log_prob(actions)
-                entropy_values = dist.entropy()
-                normalized_entropy_values = _normalized_masked_entropy(entropy_values, masks)
                 log_ratios = logprobs - old_logprobs
                 ratios = torch.exp(log_ratios)
                 kl_values = (ratios - 1.0) - log_ratios
                 clip_values = (torch.abs(ratios - 1.0) > self.eps_clip).float()
-                weighted_entropy += float((entropy_values * batch_weights).sum().item())
-                weighted_normalized_entropy += float(
-                    (normalized_entropy_values * batch_weights).sum().item()
-                )
+                weighted_entropy += float((dist.entropy() * batch_weights).sum().item())
                 weighted_kl += float((kl_values * batch_weights).sum().item())
                 weighted_clip += float((clip_values * batch_weights).sum().item())
                 total_weight += float(batch_weights.sum().item())
@@ -791,13 +759,7 @@ class PPOAgent:
                         group_weight = float(batch_weights[group_mask].sum().item())
                         sums = group_sums.setdefault(
                             float(group_id),
-                            {
-                                "weight": 0.0,
-                                "kl": 0.0,
-                                "clip": 0.0,
-                                "entropy": 0.0,
-                                "normalized_entropy": 0.0,
-                            },
+                            {"weight": 0.0, "kl": 0.0, "clip": 0.0, "entropy": 0.0},
                         )
                         sums["weight"] += group_weight
                         sums["kl"] += float(
@@ -807,13 +769,7 @@ class PPOAgent:
                             (clip_values[group_mask] * batch_weights[group_mask]).sum().item()
                         )
                         sums["entropy"] += float(
-                            (entropy_values[group_mask] * batch_weights[group_mask]).sum().item()
-                        )
-                        sums["normalized_entropy"] += float(
-                            (
-                                normalized_entropy_values[group_mask]
-                                * batch_weights[group_mask]
-                            ).sum().item()
+                            (dist.entropy()[group_mask] * batch_weights[group_mask]).sum().item()
                         )
         denominator = max(total_weight, 1e-8)
         self.last_group_diagnostics = {
@@ -821,14 +777,12 @@ class PPOAgent:
                 "approx_kl": sums["kl"] / max(sums["weight"], 1e-8),
                 "clip_fraction": sums["clip"] / max(sums["weight"], 1e-8),
                 "entropy": sums["entropy"] / max(sums["weight"], 1e-8),
-                "normalized_entropy": sums["normalized_entropy"] / max(sums["weight"], 1e-8),
             }
             for group_id, sums in sorted(group_sums.items())
         }
         group_kls = [metrics["approx_kl"] for metrics in self.last_group_diagnostics.values()]
         return {
             "entropy": weighted_entropy / denominator,
-            "normalized_entropy": weighted_normalized_entropy / denominator,
             "approx_kl": weighted_kl / denominator,
             "clip_fraction": weighted_clip / denominator,
             "group_count": float(len(group_kls)),
@@ -845,7 +799,6 @@ class PPOAgent:
                 "policy_loss": 0.0,
                 "value_loss": 0.0,
                 "entropy": 0.0,
-                "normalized_entropy": 0.0,
                 "approx_kl": 0.0,
                 "clip_fraction": 0.0,
                 "advantage_mean": 0.0,
@@ -917,7 +870,6 @@ class PPOAgent:
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "entropy": 0.0,
-            "normalized_entropy": 0.0,
             "approx_kl": 0.0,
             "clip_fraction": 0.0,
             "advantage_mean": advantage_mean,
@@ -951,9 +903,7 @@ class PPOAgent:
                 dist, values = self.policy(states, masks)
                 logprobs = dist.log_prob(actions)
                 entropy_values = dist.entropy()
-                normalized_entropy_values = _normalized_masked_entropy(entropy_values, masks)
                 entropy = (entropy_values * sample_weights).mean()
-                normalized_entropy = (normalized_entropy_values * sample_weights).mean()
                 log_ratios = logprobs - old_logprobs
                 ratios = torch.exp(log_ratios)
                 approx_kl = (((ratios - 1.0) - log_ratios) * sample_weights).mean()
@@ -975,11 +925,7 @@ class PPOAgent:
                 surr2 = torch.clamp(ratios, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
                 policy_loss = -(torch.min(surr1, surr2) * sample_weights).mean()
                 value_loss = (((values - returns) ** 2) * sample_weights).mean()
-                loss = (
-                    policy_loss
-                    + self.value_coef * value_loss
-                    - self.entropy_coef * normalized_entropy
-                )
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -994,7 +940,6 @@ class PPOAgent:
                     "policy_loss": float(policy_loss.item()),
                     "value_loss": float(value_loss.item()),
                     "entropy": float(entropy.item()),
-                    "normalized_entropy": float(normalized_entropy.item()),
                     "approx_kl": float(approx_kl.item()),
                     "clip_fraction": float(clip_fraction.item()),
                     "advantage_mean": advantage_mean,
@@ -1136,7 +1081,6 @@ class PPOAgent:
                 dist, _ = self.policy(states, masks)
                 logprobs = dist.log_prob(actions)
                 entropies = dist.entropy()
-                normalized_entropies = _normalized_masked_entropy(entropies, masks)
                 ratios = torch.exp(logprobs - old_logprobs)
                 approx_kl = (old_logprobs - logprobs).mean()
                 surr1 = ratios * batch_advantages
@@ -1144,10 +1088,7 @@ class PPOAgent:
                 denominator = batch_weights.sum().clamp_min(1e-8)
                 policy_loss = -(torch.min(surr1, surr2) * batch_weights).sum() / denominator
                 entropy = (entropies * batch_weights).sum() / denominator
-                normalized_entropy = (
-                    normalized_entropies * batch_weights
-                ).sum() / denominator
-                loss = policy_loss - self.entropy_coef * normalized_entropy
+                loss = policy_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -1159,7 +1100,6 @@ class PPOAgent:
                     "policy_loss": float(policy_loss.item()),
                     "value_loss": 0.0,
                     "entropy": float(entropy.item()),
-                    "normalized_entropy": float(normalized_entropy.item()),
                     "approx_kl": float(approx_kl.item()),
                 }
                 if progress is not None:
@@ -1208,7 +1148,6 @@ class PPOAgent:
                 "policy_loss": 0.0,
                 "value_loss": 0.0,
                 "entropy": 0.0,
-                "normalized_entropy": 0.0,
                 "approx_kl": 0.0,
                 "advantage_mean": 0.0,
                 "advantage_std": 0.0,
@@ -1332,7 +1271,6 @@ class PPOAgent:
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "entropy": 0.0,
-            "normalized_entropy": 0.0,
             "approx_kl": 0.0,
             "clip_fraction": 0.0,
             "advantage_mean": advantage_mean,
@@ -1370,7 +1308,6 @@ class PPOAgent:
                 dist, values = self.policy(states, masks)
                 logprobs = dist.log_prob(actions)
                 entropies = dist.entropy()
-                normalized_entropies = _normalized_masked_entropy(entropies, masks)
                 log_ratios = logprobs - old_logprobs
                 ratios = torch.exp(log_ratios)
                 approx_kl = (((ratios - 1.0) - log_ratios) * batch_weights).sum() / denominator
@@ -1385,14 +1322,7 @@ class PPOAgent:
                 policy_loss = -(torch.min(surr1, surr2) * batch_weights).sum() / denominator
                 value_loss = (((values - targets) ** 2) * batch_weights).sum() / denominator
                 entropy = (entropies * batch_weights).sum() / denominator
-                normalized_entropy = (
-                    normalized_entropies * batch_weights
-                ).sum() / denominator
-                loss = (
-                    policy_loss
-                    + self.value_coef * value_loss
-                    - self.entropy_coef * normalized_entropy
-                )
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -1405,7 +1335,6 @@ class PPOAgent:
                     "policy_loss": float(policy_loss.item()),
                     "value_loss": float(value_loss.item()),
                     "entropy": float(entropy.item()),
-                    "normalized_entropy": float(normalized_entropy.item()),
                     "approx_kl": float(approx_kl.item()),
                     "clip_fraction": float(clip_fraction.item()),
                     "advantage_mean": advantage_mean,
