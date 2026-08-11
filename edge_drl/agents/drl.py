@@ -16,6 +16,29 @@ SLOW_NODE_BASE_FEATURE_DIM = 6
 SLOW_EDGE_FEATURE_DIM = 4
 
 
+def _discounted_window_returns(
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    gamma: float,
+) -> np.ndarray:
+    """Discount ten-minute Slow rewards without crossing episode boundaries."""
+
+    rewards_np = np.asarray(rewards, dtype=np.float32)
+    dones_np = np.asarray(dones, dtype=bool)
+    if rewards_np.ndim != 1 or dones_np.shape != rewards_np.shape:
+        raise ValueError("Slow rewards and dones must have the same 1D shape")
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError("Slow window gamma must be in [0, 1]")
+    discounted = np.zeros_like(rewards_np)
+    running_return = 0.0
+    for index in range(len(rewards_np) - 1, -1, -1):
+        if dones_np[index]:
+            running_return = 0.0
+        running_return = float(rewards_np[index]) + gamma * running_return
+        discounted[index] = running_return
+    return discounted
+
+
 def slow_node_feature_dim(num_service_types: int) -> int:
     return SLOW_NODE_BASE_FEATURE_DIM + num_service_types
 
@@ -81,6 +104,7 @@ class SlowDeploymentPPOAgent:
     count_value_coef: float = 0.0
     critic_lr: float | None = None
     critic_k_epochs: int = 4
+    window_gamma: float = 0.95
     target_kl: float | None = 0.03
     count_target_kl: float | None = 0.015
     placement_target_kl: float | None = None
@@ -106,6 +130,7 @@ class SlowDeploymentPPOAgent:
     window_states: list[np.ndarray] = field(default_factory=list)
     window_old_values: list[float] = field(default_factory=list)
     window_returns: list[float] = field(default_factory=list)
+    window_dones: list[bool] = field(default_factory=list)
     pending_window_id: int | None = None
     last_window_feedback: dict[str, float] = field(default_factory=dict)
     placement_updates_completed: int = field(default=0, init=False)
@@ -134,6 +159,8 @@ class SlowDeploymentPPOAgent:
             raise ValueError("placement_entropy_adaptation_rate must be non-negative")
         if self.count_global_advantage_coef < 0.0 or self.placement_global_advantage_coef < 0.0:
             raise ValueError("Slow global advantage coefficients must be non-negative")
+        if not 0.0 <= self.window_gamma <= 1.0:
+            raise ValueError("window_gamma must be in [0, 1]")
         self.placement_entropy_current_coef = placement_entropy_start
         self.count_ppo = PPOAgent(
             obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
@@ -373,12 +400,12 @@ class SlowDeploymentPPOAgent:
         count_stage_returns: dict[tuple[int, int], float] | None = None,
         placement_stage_returns: dict[tuple[int, ...], float] | None = None,
     ) -> None:
-        del done
         if self.pending_window_id is None:
             return
         if self.pending_window_id != len(self.window_returns):
             raise RuntimeError("slow deployment windows must be completed in collection order")
         self.window_returns.append(float(reward))
+        self.window_dones.append(bool(done))
         stage_returns = {} if stage_returns is None else stage_returns
         count_stage_returns = stage_returns if count_stage_returns is None else count_stage_returns
         placement_stage_returns = stage_returns if placement_stage_returns is None else placement_stage_returns
@@ -416,10 +443,17 @@ class SlowDeploymentPPOAgent:
             return self.empty_update_metrics()
         if len(self.window_states) != len(self.window_returns):
             raise ValueError("slow deployment window states and returns are misaligned")
+        if len(self.window_dones) != len(self.window_returns):
+            raise ValueError("slow deployment window dones and returns are misaligned")
 
-        returns = np.asarray(self.window_returns, dtype=np.float32)
+        immediate_returns = np.asarray(self.window_returns, dtype=np.float32)
+        trajectory_returns = _discounted_window_returns(
+            immediate_returns,
+            np.asarray(self.window_dones, dtype=bool),
+            self.window_gamma,
+        )
         old_values = np.asarray(self.window_old_values, dtype=np.float32)
-        window_advantages = returns - old_values
+        window_advantages = trajectory_returns - old_values
         window_advantage_mean = float(window_advantages.mean())
         window_advantage_std = float(window_advantages.std())
 
@@ -469,7 +503,7 @@ class SlowDeploymentPPOAgent:
             progress_label=f"{progress_label} placement",
             progress_interval_seconds=progress_interval_seconds,
         )
-        critic_metrics = self._update_window_critic(returns)
+        critic_metrics = self._update_window_critic(trajectory_returns)
         placement_entropy_next_coef = self._adapt_placement_entropy_coefficient(
             placement_metrics.get("entropy", 0.0)
         )
@@ -483,6 +517,7 @@ class SlowDeploymentPPOAgent:
         self.window_states.clear()
         self.window_old_values.clear()
         self.window_returns.clear()
+        self.window_dones.clear()
         return {
             "loss": count_metrics["loss"] + placement_metrics["loss"] + self.value_coef * critic_metrics["value_loss"],
             "policy_loss": count_metrics["policy_loss"] + placement_metrics["policy_loss"],
@@ -490,8 +525,10 @@ class SlowDeploymentPPOAgent:
             "entropy": count_metrics["entropy"] + placement_metrics["entropy"],
             "approx_kl": max(count_metrics.get("approx_kl", 0.0), placement_metrics.get("approx_kl", 0.0)),
             "window_count": float(window_count),
-            "window_return_mean": float(returns.mean()),
-            "window_return_std": float(returns.std()),
+            "window_return_mean": float(immediate_returns.mean()),
+            "window_return_std": float(immediate_returns.std()),
+            "trajectory_return_mean": float(trajectory_returns.mean()),
+            "trajectory_return_std": float(trajectory_returns.std()),
             "count_return_mean": float(count_returns.mean()) if count_returns.size else 0.0,
             "count_return_std": float(count_returns.std()) if count_returns.size else 0.0,
             "placement_return_mean": float(placement_returns.mean()) if placement_returns.size else 0.0,
@@ -508,6 +545,7 @@ class SlowDeploymentPPOAgent:
                 + placement_metrics.get("explained_variance", 0.0)
             ),
             "window_critic_explained_variance": critic_metrics["explained_variance"],
+            "window_critic_value_loss": critic_metrics["value_loss"],
             "count_loss": count_metrics["loss"],
             "count_advantage_mean": count_metrics.get("advantage_mean", 0.0),
             "count_advantage_std": count_metrics.get("advantage_std", 0.0),
@@ -553,6 +591,8 @@ class SlowDeploymentPPOAgent:
             "window_count": 0.0,
             "window_return_mean": 0.0,
             "window_return_std": 0.0,
+            "trajectory_return_mean": 0.0,
+            "trajectory_return_std": 0.0,
             "count_return_mean": 0.0,
             "count_return_std": 0.0,
             "placement_return_mean": 0.0,
@@ -563,6 +603,7 @@ class SlowDeploymentPPOAgent:
             "window_advantage_std": 0.0,
             "critic_explained_variance": 0.0,
             "window_critic_explained_variance": 0.0,
+            "window_critic_value_loss": 0.0,
             "count_loss": 0.0,
             "count_advantage_mean": 0.0,
             "count_advantage_std": 0.0,
@@ -845,6 +886,7 @@ class FastSchedulingPPOAgent:
     minibatch_size: int = 512
     reservation_microbatch_size: int = 16
     load_balanced_updates: bool = True
+    load_group_weights: tuple[float, ...] | None = None
     full_batch_kl_stop: bool = True
     device: str = "cpu"
     ppo: PPOAgent = field(init=False)
@@ -885,6 +927,7 @@ class FastSchedulingPPOAgent:
             edge_feature_dim=FAST_EDGE_FEATURE_DIM,
             num_nodes=self.num_nodes,
             group_balanced_updates=self.load_balanced_updates,
+            group_weight_targets=self.load_group_weights,
             full_batch_kl_stop=self.full_batch_kl_stop,
             device=self.device,
         )
@@ -1395,6 +1438,7 @@ class HierarchicalPPOAgent:
         slow_count_value_coef: float = 0.0,
         slow_critic_lr: float | None = None,
         slow_critic_k_epochs: int = 4,
+        slow_window_gamma: float = 0.95,
         fast_value_coef: float = 0.5,
         slow_target_kl: float | None = 0.03,
         slow_count_target_kl: float | None = 0.015,
@@ -1405,6 +1449,7 @@ class HierarchicalPPOAgent:
         fast_policy_kind: str = "gat_node_scorer",
         fast_reservation_microbatch_size: int = 16,
         fast_load_balanced_updates: bool = True,
+        fast_load_group_weights: tuple[float, ...] | None = None,
         fast_full_batch_kl_stop: bool = True,
         slow_reward_scale: float = 1.0,
         slow_tail_latency_coef: float = 0.35,
@@ -1445,6 +1490,7 @@ class HierarchicalPPOAgent:
                 count_value_coef=slow_count_value_coef,
                 critic_lr=slow_critic_lr,
                 critic_k_epochs=slow_critic_k_epochs,
+                window_gamma=slow_window_gamma,
                 target_kl=slow_target_kl,
                 count_target_kl=slow_count_target_kl,
                 placement_target_kl=slow_placement_target_kl,
@@ -1468,6 +1514,7 @@ class HierarchicalPPOAgent:
                 minibatch_size=fast_minibatch_size,
                 reservation_microbatch_size=fast_reservation_microbatch_size,
                 load_balanced_updates=fast_load_balanced_updates,
+                load_group_weights=fast_load_group_weights,
                 full_batch_kl_stop=fast_full_batch_kl_stop,
                 device=device,
             ),

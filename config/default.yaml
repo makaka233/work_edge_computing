@@ -4,16 +4,21 @@
 
 scenario:
   seed: 2026
-  physical_seed: 2026
+  # null derives the fixed infrastructure from the single master seed above.
+  # Set an explicit value only for a topology-controlled ablation.
+  physical_seed: null
   num_users: 12000
   num_edge_nodes: 32
   num_service_types: 10
   max_service_stages: 3
-  episode_minutes: 10
+  # The trajectory-simultaneous MEC design uses 60-minute episodes containing
+  # six ten-minute Slow decisions. Legacy one-window runs may override this to 10.
+  episode_minutes: 60
   scenario_refresh_episodes: 1
   scenario_refresh_scope: demand_only
   demand_sampling_mode: episode
-  demand_scenario_schedule: shuffled-pool
+  demand_scenario_schedule: stream
+  # Compatibility-only setting for demand_scenario_schedule: shuffled-pool.
   demand_scenario_pool_size: 32
 
 time_scales:
@@ -31,10 +36,19 @@ traffic:
   active_user_request_rate_per_minute: 1.5
   traffic_scale: 1.0
   load_multipliers: [1.0]
-  load_sampling_mode: stratified-random
-  # MEC pressure profiles use four continuous strata and shuffle their order
-  # independently inside each update. Empty falls back to fixed anchors above.
+  load_sampling_mode: distribution-random
+  # MEC pressure profiles draw continuous values independently from four strata
+  # according to their target probabilities. Empty falls back to fixed anchors.
   load_strata: []
+  load_stratum_probabilities: []
+
+training:
+  design: trajectory-simultaneous
+  trajectories_per_update: 2
+  windows_per_trajectory: 6
+  fast_windows_per_update: 12
+  slow_windows_per_update: 12
+  slow_window_gamma: 0.95
   pressure_profile: baseline
   # mec-moderate preset: active_ratio=0.20, active_rate=1.75/min,
   # task_compute=1.65, task_data=2.5, node_capacity=0.65,
@@ -72,12 +86,12 @@ agent:
   drl:
     type: dual_agent_ppo
     optimizer_reward_scale: 10.0
-    fast_windows_per_update: 1
-    slow_windows_per_update: 32
-    joint_training_schedule: alternating
-    fast_updates_per_cycle: 3
-    fast_warmup_updates: 4
-    slow_warmup_updates: 4
+    fast_windows_per_update: 12
+    slow_windows_per_update: 12
+    joint_training_schedule: simultaneous
+    fast_updates_per_cycle: 1
+    fast_warmup_updates: 0
+    slow_warmup_updates: 0
     synchronized_window_block: 0
     slow_agent_decision: every_10_minutes
     slow_fast_collection_mode: stochastic_frozen
@@ -114,6 +128,7 @@ agent:
     slow_count_value_coef: 0.0
     slow_critic_lr: 0.0003
     slow_critic_k_epochs: 4
+    slow_window_gamma: 0.95
     slow_composite_action_return: factorized_service_stage_return_per_10min_window
     slow_count_advantage: centered_local_plus_standardized_window_critic_residual
     slow_placement_advantage: centered_node_local_plus_standardized_window_critic_residual

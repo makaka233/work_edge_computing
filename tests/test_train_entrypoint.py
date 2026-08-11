@@ -2,11 +2,13 @@ import subprocess
 import sys
 import csv
 import math
+import numpy as np
 from argparse import Namespace
 from pathlib import Path
 
 from train_dual_ppo import (
     apply_pressure_profile,
+    apply_training_design,
     demand_seed_for_training_rollout,
     demand_profile_summary,
     effective_replicas_per_stage,
@@ -15,6 +17,7 @@ from train_dual_ppo import (
     parse_args,
     rollout_start_minute,
     scenario_seed_for_offset,
+    TrainingRandomStreams,
     use_deterministic_fast_collection,
 )
 
@@ -42,7 +45,9 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.episode_hours is None
     assert args.scenario_refresh_episodes == 1
     assert args.demand_scenario_pool_size == 32
-    assert args.load_sampling_mode == "stratified-random"
+    assert args.load_sampling_mode == "distribution-random"
+    assert args.demand_scenario_schedule == "stream"
+    assert args.training_design == "legacy-alternating"
 
 
 def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
@@ -70,8 +75,47 @@ def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
     assert args.service_resource_fraction == 0.25
     assert args.deadline_scale == 2.75
     assert args.load_multipliers == "0.8,1.1,1.4,1.7"
-    assert args.load_sampling_mode == "stratified-random"
+    assert args.load_sampling_mode == "distribution-random"
     assert args.load_strata == "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85"
+    assert args.load_stratum_probabilities == "0.20,0.50,0.25,0.05"
+    assert args.training_design == "trajectory-simultaneous"
+
+
+def test_trajectory_training_design_builds_complete_multi_window_batches():
+    args = Namespace(
+        training_design="trajectory-simultaneous",
+        episode_minutes=10,
+        joint_training_schedule="alternating",
+        fast_windows_per_update=4,
+        slow_windows_per_update=16,
+        fast_warmup_updates=4,
+        slow_warmup_updates=4,
+    )
+
+    apply_training_design(args, argv=[])
+
+    assert args.episode_minutes == 60
+    assert args.joint_training_schedule == "simultaneous"
+    assert args.fast_windows_per_update == 12
+    assert args.slow_windows_per_update == 12
+    assert args.fast_warmup_updates == 0
+    assert args.slow_warmup_updates == 0
+
+
+def test_explicit_episode_horizon_survives_training_design_expansion():
+    args = Namespace(
+        training_design="trajectory-simultaneous",
+        episode_minutes=90,
+        joint_training_schedule="alternating",
+        fast_windows_per_update=4,
+        slow_windows_per_update=16,
+        fast_warmup_updates=4,
+        slow_warmup_updates=4,
+    )
+
+    apply_training_design(args, argv=["--episode-minutes", "90"])
+
+    assert args.episode_minutes == 90
 
 
 def test_pressure_profile_does_not_override_explicit_scale():
@@ -83,6 +127,7 @@ def test_pressure_profile_does_not_override_explicit_scale():
         load_multipliers="0.8,1.1,1.4,1.7",
         load_sampling_mode="stratified-random",
         load_strata="",
+        load_stratum_probabilities="1.0",
         task_compute_scale=3.0,
         task_data_scale=2.0,
         node_compute_capacity_scale=0.65,
@@ -108,6 +153,7 @@ def test_pressure_profile_does_not_attach_default_strata_to_custom_load_anchors(
         load_multipliers="0.7,1.3",
         load_sampling_mode="stratified-random",
         load_strata="",
+        load_stratum_probabilities="1.0",
         task_compute_scale=1.0,
         task_data_scale=1.0,
         node_compute_capacity_scale=1.0,
@@ -122,6 +168,46 @@ def test_pressure_profile_does_not_attach_default_strata_to_custom_load_anchors(
 
     assert args.load_multipliers == "0.7,1.3"
     assert args.load_strata == ""
+
+
+def test_master_seed_derives_reproducible_advancing_random_streams():
+    first = TrainingRandomStreams(2026)
+    second = TrainingRandomStreams(2026)
+
+    first_scenarios = [first.next_demand_seed() for _ in range(16)]
+    second_scenarios = [second.next_demand_seed() for _ in range(16)]
+    first_environments = [first.next_environment_seed() for _ in range(16)]
+    second_environments = [second.next_environment_seed() for _ in range(16)]
+
+    assert first_scenarios == second_scenarios
+    assert first_environments == second_environments
+    assert len(set(first_scenarios)) == len(first_scenarios)
+    assert len(set(first_environments)) == len(first_environments)
+    assert first_scenarios != first_environments
+
+
+def test_distribution_random_loads_follow_target_probabilities():
+    args = Namespace(
+        seed=2026,
+        load_sampling_mode="distribution-random",
+        load_multipliers="0.8,1.1,1.4,1.7",
+        load_strata="0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85",
+        load_stratum_probabilities="0.20,0.50,0.25,0.05",
+    )
+    streams = TrainingRandomStreams(args.seed)
+
+    assignments = load_assignments_for_update(
+        args,
+        update_idx=0,
+        rollouts=20_000,
+        rng=streams.load_rng,
+    )
+    frequencies = [
+        sum(group == group_id for _, group in assignments) / len(assignments)
+        for group_id in range(4)
+    ]
+
+    np.testing.assert_allclose(frequencies, [0.20, 0.50, 0.25, 0.05], atol=0.012)
 
 
 def test_slow_collection_uses_frozen_stochastic_fast_by_default():
@@ -1035,7 +1121,7 @@ def test_alternating_schedule_runs_fast_then_slow_warmup(tmp_path):
         "--sampled-seconds-per-window",
         "1",
         "--mean-requests-per-minute",
-        "60",
+        "600",
         "--num-users",
         "10000",
         "--num-edge-nodes",

@@ -70,8 +70,17 @@ def _normalize_advantages_by_group(
     return normalized
 
 
-def _balance_group_weights(weights: np.ndarray, group_ids: np.ndarray) -> np.ndarray:
-    """Give every sampled operating regime equal total optimizer weight."""
+def _balance_group_weights(
+    weights: np.ndarray,
+    group_ids: np.ndarray,
+    target_group_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Assign each sampled regime its configured share of optimizer weight.
+
+    Equal shares remain the compatibility default.  Supplying target weights
+    lets stratified PPO retain coverage without changing the intended traffic
+    distribution into a uniform objective.
+    """
 
     balanced = np.asarray(weights, dtype=np.float32).copy()
     groups_np = np.asarray(group_ids)
@@ -81,11 +90,24 @@ def _balance_group_weights(weights: np.ndarray, group_ids: np.ndarray) -> np.nda
     if unique_groups.size <= 1:
         return balanced
     total_weight = float(balanced.sum())
-    target_weight = total_weight / float(unique_groups.size)
+    if target_group_weights is None:
+        present_targets = {group_id: 1.0 for group_id in unique_groups}
+    else:
+        targets = np.asarray(target_group_weights, dtype=np.float32)
+        present_targets = {}
+        for group_id in unique_groups:
+            group_index = int(group_id)
+            if not np.isclose(float(group_id), float(group_index)) or not 0 <= group_index < len(targets):
+                raise ValueError("group IDs must be integer indices into target_group_weights")
+            present_targets[group_id] = float(targets[group_index])
+    present_target_sum = float(sum(present_targets.values()))
+    if present_target_sum <= 1e-8:
+        raise ValueError("present target group weights must have positive total weight")
     for group_id in unique_groups:
         group_mask = groups_np == group_id
         group_weight = float(balanced[group_mask].sum())
         if group_weight > 1e-8:
+            target_weight = total_weight * present_targets[group_id] / present_target_sum
             balanced[group_mask] *= target_weight / group_weight
     return balanced
 
@@ -541,6 +563,7 @@ class PPOAgent:
         num_nodes: int | None = None,
         detach_critic_backbone: bool = False,
         group_balanced_updates: bool = False,
+        group_weight_targets: tuple[float, ...] | None = None,
         full_batch_kl_stop: bool = False,
         device: str = "cpu",
     ):
@@ -553,6 +576,17 @@ class PPOAgent:
         self.target_kl = target_kl
         self.minibatch_size = minibatch_size
         self.group_balanced_updates = bool(group_balanced_updates)
+        self.group_weight_targets = (
+            None
+            if group_weight_targets is None
+            else np.asarray(group_weight_targets, dtype=np.float32)
+        )
+        if self.group_weight_targets is not None:
+            if self.group_weight_targets.ndim != 1 or len(self.group_weight_targets) == 0:
+                raise ValueError("group_weight_targets must be a non-empty 1D sequence")
+            if np.any(self.group_weight_targets < 0.0) or float(self.group_weight_targets.sum()) <= 0.0:
+                raise ValueError("group_weight_targets must be non-negative with positive total weight")
+            self.group_weight_targets /= float(self.group_weight_targets.sum())
         self.full_batch_kl_stop = bool(full_batch_kl_stop)
         self.device = torch.device(device)
         self.last_group_diagnostics: dict[float, dict[str, float]] = {}
@@ -799,7 +833,11 @@ class PPOAgent:
         else:
             group_ids_np = np.zeros(len(self.buffer.actions), dtype=np.float32)
         if self.group_balanced_updates:
-            weights_np = _balance_group_weights(weights_np, group_ids_np)
+            weights_np = _balance_group_weights(
+                weights_np,
+                group_ids_np,
+                self.group_weight_targets,
+            )
         weights_np /= max(float(weights_np.mean()), 1e-8)
         advantage_mean = float(np.average(advantages_np, weights=weights_np))
         advantage_variance = float(np.average((advantages_np - advantage_mean) ** 2, weights=weights_np))

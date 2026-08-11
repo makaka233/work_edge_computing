@@ -1,7 +1,12 @@
 import numpy as np
 import torch
 
-from edge_drl.agents.drl import HierarchicalPPOAgent, fast_obs_dim, slow_obs_dim
+from edge_drl.agents.drl import (
+    HierarchicalPPOAgent,
+    _discounted_window_returns,
+    fast_obs_dim,
+    slow_obs_dim,
+)
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 from edge_drl.models.ppo import (
     PPOAgent,
@@ -16,6 +21,15 @@ from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_c
 def test_observation_dimensions():
     assert slow_obs_dim(16, 3) == 17 + 16 * (6 + 3) + 16 * 16 * 4
     assert fast_obs_dim(16) == 12 + 16 * 9 + 16 * 16 * 3
+
+
+def test_slow_discounted_returns_stop_at_episode_boundaries():
+    rewards = np.asarray([1.0, 2.0, 3.0, 10.0, 20.0], dtype=np.float32)
+    dones = np.asarray([False, False, True, False, True])
+
+    returns = _discounted_window_returns(rewards, dones, gamma=0.5)
+
+    np.testing.assert_allclose(returns, [2.75, 3.5, 3.0, 20.0, 20.0])
 
 
 def test_count_advantages_are_centered_within_service_stage():
@@ -48,6 +62,19 @@ def test_fast_load_groups_are_balanced_normalized_and_stratified():
     assert len(batches) == 4
     assert sorted(np.concatenate(batches).tolist()) == list(range(len(group_ids)))
     assert all(set(group_ids[batch].tolist()) == {0.0, 1.0, 2.0, 3.0} for batch in batches)
+
+
+def test_fast_load_groups_follow_configured_target_distribution():
+    group_ids = np.asarray([0] * 4 + [1] * 8 + [2] * 12 + [3] * 16, dtype=np.float32)
+    weights = np.ones(len(group_ids), dtype=np.float32)
+    targets = np.asarray([0.20, 0.50, 0.25, 0.05], dtype=np.float32)
+
+    balanced = _balance_group_weights(weights, group_ids, targets)
+    group_weight_sums = np.asarray(
+        [balanced[group_ids == group_id].sum() for group_id in range(4)]
+    )
+
+    np.testing.assert_allclose(group_weight_sums / group_weight_sums.sum(), targets, atol=1e-6)
 
 
 def test_fast_full_batch_kl_stop_covers_every_load_before_stopping():
@@ -523,6 +550,41 @@ def test_fast_update_preserves_slow_window_buffer():
     slow_metrics = agent.update_slow()
     assert slow_metrics["window_count"] == 1
     assert agent.completed_slow_windows == 0
+
+
+def test_slow_collection_records_a_multi_window_episode_boundary():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=171,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=6,
+            deployment_interval_minutes=1,
+            mean_requests_per_minute=10.0,
+        )
+    )
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_window_gamma=0.95,
+    )
+
+    for window in range(6):
+        rollout(
+            env,
+            agent,
+            max_requests=1,
+            rollout_unit="window",
+            reset_env=window == 0,
+        )
+
+    assert agent.completed_slow_windows == 6
+    assert agent.slow_agent.window_dones == [False, False, False, False, False, True]
+    immediate_mean = float(np.mean(agent.slow_agent.window_returns))
+    slow_metrics = agent.update_slow()
+    assert slow_metrics["window_count"] == 6
+    assert not np.isclose(slow_metrics["trajectory_return_mean"], immediate_mean)
 
 
 def test_fast_only_rollout_records_only_fast_buffer():

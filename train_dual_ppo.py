@@ -20,17 +20,19 @@ from edge_drl.agents.drl import HierarchicalPPOAgent
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 
 
-PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
+PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str | bool]] = {
     "baseline": {},
     # Keep topology and physical seed fixed while moving the operating point
     # into a moderate MEC stress regime.
     "mec-moderate": {
+        "training_design": "trajectory-simultaneous",
         "active_user_ratio": 0.20,
         "active_user_request_rate_per_minute": 1.75,
         "traffic_scale": 1.0,
         "load_multipliers": "0.8,1.1,1.4,1.7",
-        "load_sampling_mode": "stratified-random",
+        "load_sampling_mode": "distribution-random",
         "load_strata": "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85",
+        "load_stratum_probabilities": "0.20,0.50,0.25,0.05",
         "task_compute_scale": 1.65,
         "task_data_scale": 2.5,
         "node_compute_capacity_scale": 0.65,
@@ -41,12 +43,14 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
     # Validate moderate pressure first; this profile is a bounded stress case
     # rather than a saturation-first experiment.
     "mec-stress": {
+        "training_design": "trajectory-simultaneous",
         "active_user_ratio": 0.30,
         "active_user_request_rate_per_minute": 2.0,
         "traffic_scale": 1.0,
         "load_multipliers": "0.8,1.1,1.4,1.7",
-        "load_sampling_mode": "stratified-random",
+        "load_sampling_mode": "distribution-random",
         "load_strata": "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85",
+        "load_stratum_probabilities": "0.20,0.50,0.25,0.05",
         "task_compute_scale": 2.75,
         "task_data_scale": 4.0,
         "node_compute_capacity_scale": 0.35,
@@ -70,7 +74,11 @@ def apply_pressure_profile(args: argparse.Namespace, argv: list[str] | None = No
     }
     for field, value in profile.items():
         option = "--" + field.replace("_", "-")
-        if field == "load_strata" and "--load-multipliers" in explicit_options and option not in explicit_options:
+        if (
+            field in {"load_strata", "load_stratum_probabilities"}
+            and ({"--load-multipliers", "--load-strata"} & explicit_options)
+            and option not in explicit_options
+        ):
             # Custom anchors should not silently inherit ranges calibrated for
             # the profile's original anchors.
             continue
@@ -87,6 +95,36 @@ def use_deterministic_fast_collection(slow_phase: bool, collection_mode: str) ->
     return bool(slow_phase and collection_mode == "deterministic")
 
 
+def apply_training_design(
+    args: argparse.Namespace,
+    argv: list[str] | None = None,
+) -> argparse.Namespace:
+    """Expand the selected training semantics while preserving explicit overrides."""
+
+    if args.training_design != "trajectory-simultaneous":
+        return args
+    explicit_options = {
+        token.split("=", 1)[0]
+        for token in (sys.argv[1:] if argv is None else argv)
+        if token.startswith("--")
+    }
+    defaults = {
+        "episode_minutes": 60,
+        "joint_training_schedule": "simultaneous",
+        "fast_windows_per_update": 12,
+        "slow_windows_per_update": 12,
+        "fast_warmup_updates": 0,
+        "slow_warmup_updates": 0,
+    }
+    for field, value in defaults.items():
+        option = "--" + field.replace("_", "-")
+        if field == "episode_minutes" and "--episode-hours" in explicit_options:
+            continue
+        if option not in explicit_options:
+            setattr(args, field, value)
+    return args
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train hierarchical dual-agent PPO for edge services.")
     parser.add_argument("--seed", type=int, default=2026)
@@ -97,6 +135,15 @@ def parse_args() -> argparse.Namespace:
         help="Seed for fixed physical edge infrastructure: nodes, capacities, service catalogue, and wired links.",
     )
     parser.add_argument("--fixed-scenario", action="store_true")
+    parser.add_argument(
+        "--training-design",
+        choices=["legacy-alternating", "trajectory-simultaneous"],
+        default="legacy-alternating",
+        help=(
+            "trajectory-simultaneous collects complete multi-window on-policy trajectories for both "
+            "controllers; legacy-alternating preserves the earlier one-window episode schedule."
+        ),
+    )
     parser.add_argument(
         "--scenario-refresh-episodes",
         type=int,
@@ -126,11 +173,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--demand-scenario-schedule",
-        choices=["sequential", "shuffled-pool"],
-        default="shuffled-pool",
+        choices=["stream", "sequential", "shuffled-pool"],
+        default="stream",
         help=(
-            "Choose demand seeds sequentially, or reuse a deterministic shuffled seed pool. "
-            "The pool removes the accidental correlation between training time and demand difficulty."
+            "stream draws fresh procedural demand seeds from one advancing RNG derived from --seed. "
+            "sequential and shuffled-pool are compatibility ablations."
         ),
     )
     parser.add_argument(
@@ -178,11 +225,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--load-sampling-mode",
-        choices=["cyclic", "stratified-random"],
-        default="stratified-random",
+        choices=["cyclic", "stratified-random", "distribution-random"],
+        default="distribution-random",
         help=(
-            "Use the legacy fixed cyclic order, or draw one continuous value from each load stratum "
-            "and shuffle the strata independently within every training update."
+            "Use the legacy fixed cycle, force balanced strata per update, or independently sample "
+            "traffic strata from --load-stratum-probabilities using one advancing RNG."
         ),
     )
     parser.add_argument(
@@ -193,6 +240,16 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated low:high training ranges, e.g. "
             "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85. "
             "Empty uses the fixed --load-multipliers as zero-width strata."
+        ),
+    )
+    parser.add_argument(
+        "--load-stratum-probabilities",
+        type=str,
+        default="",
+        help=(
+            "Target probability of each load stratum. MEC profiles use 0.20,0.50,0.25,0.05; "
+            "the same probabilities weight Fast PPO groups without forcing uniform traffic. "
+            "Empty selects a uniform distribution over the configured strata."
         ),
     )
     parser.add_argument(
@@ -376,6 +433,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
     parser.add_argument("--slow-critic-k-epochs", type=int, default=4)
+    parser.add_argument(
+        "--slow-window-gamma",
+        type=float,
+        default=0.95,
+        help="Discount factor between consecutive ten-minute Slow decisions in a multi-window episode.",
+    )
     parser.add_argument("--slow-deployment-memory-coef", type=float, default=0.03)
     parser.add_argument("--slow-deployment-storage-coef", type=float, default=0.01)
     parser.add_argument(
@@ -422,7 +485,7 @@ def parse_args() -> argparse.Namespace:
         "--fast-load-balanced-updates",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Stratify Fast minibatches by load and equalize total optimizer weight across load levels.",
+        help="Stratify Fast minibatches by load and apply configured target group weights.",
     )
     parser.add_argument(
         "--fast-full-batch-kl-stop",
@@ -437,7 +500,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Collect this many ten-minute episodes before each Fast PPO update. "
+            "Collect this many ten-minute windows before each Fast PPO update. "
             "--rollouts-per-update is retained as a compatibility alias."
         ),
     )
@@ -445,7 +508,7 @@ def parse_args() -> argparse.Namespace:
         "--slow-windows-per-update",
         type=int,
         default=32,
-        help="Accumulate this many completed ten-minute episodes before each Slow PPO update.",
+        help="Accumulate this many completed ten-minute Slow windows before each update.",
     )
     parser.add_argument(
         "--joint-training-schedule",
@@ -524,6 +587,7 @@ def parse_args() -> argparse.Namespace:
     if args.episode_hours is not None:
         args.episode_minutes = int(round(float(args.episode_hours) * 60.0))
     args = apply_pressure_profile(args)
+    args = apply_training_design(args)
     if args.synchronized_window_block > 0:
         args.fast_windows_per_update = args.synchronized_window_block
         args.slow_windows_per_update = args.synchronized_window_block
@@ -565,6 +629,8 @@ def parse_args() -> argparse.Namespace:
         args.joint_training_schedule = "simultaneous"
     if args.slow_critic_k_epochs < 1:
         parser.error("--slow-critic-k-epochs must be >= 1")
+    if not 0.0 <= args.slow_window_gamma <= 1.0:
+        parser.error("--slow-window-gamma must be in [0, 1]")
     if not 0.0 <= args.slow_tail_latency_coef <= 1.0:
         parser.error("--slow-tail-latency-coef must be in [0, 1]")
     if args.slow_colocation_coef < 0.0:
@@ -609,14 +675,29 @@ def parse_args() -> argparse.Namespace:
         parser.error("--sampled-seconds-per-window must be >= 0")
     if args.train_mode == "joint" and args.rollout_unit == "requests":
         parser.error("joint training requires --rollout-unit window or episode so each slow action receives a complete return")
+    if args.training_design == "trajectory-simultaneous":
+        if args.rollout_unit != "window":
+            parser.error("trajectory-simultaneous training requires --rollout-unit window")
+        if args.joint_training_schedule != "simultaneous":
+            parser.error("trajectory-simultaneous training requires --joint-training-schedule simultaneous")
+        if args.episode_minutes % args.deployment_interval_minutes != 0:
+            parser.error("trajectory episode length must be divisible by the deployment interval")
+        trajectory_windows = args.episode_minutes // args.deployment_interval_minutes
+        if args.fast_windows_per_update != args.slow_windows_per_update:
+            parser.error("trajectory-simultaneous training requires equal Fast and Slow window counts")
+        if args.fast_windows_per_update % trajectory_windows != 0:
+            parser.error("windows per update must contain a whole number of complete trajectories")
     try:
         load_anchors = _parse_float_list(args.load_multipliers, "--load-multipliers")
         load_strata = _load_strata_for_args(args)
+        load_probabilities = _load_probabilities_for_args(args, len(load_strata))
         if args.load_strata:
             if len(load_anchors) != len(load_strata):
                 raise ValueError("--load-multipliers must provide one deterministic anchor per --load-strata range")
             if any(not low <= anchor <= high for anchor, (low, high) in zip(load_anchors, load_strata)):
                 raise ValueError("each --load-multipliers anchor must lie inside its corresponding --load-strata range")
+        if len(load_probabilities) != len(load_strata):
+            raise ValueError("--load-stratum-probabilities must provide one value per load stratum")
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -672,8 +753,72 @@ def _load_strata_for_args(args: argparse.Namespace) -> tuple[tuple[float, float]
     )
 
 
+def _load_probabilities_for_args(args: argparse.Namespace, stratum_count: int) -> tuple[float, ...]:
+    raw = str(getattr(args, "load_stratum_probabilities", "")).strip()
+    if not raw:
+        return tuple(1.0 / stratum_count for _ in range(stratum_count))
+    values = _parse_float_list(raw, "--load-stratum-probabilities")
+    if len(values) != stratum_count:
+        raise ValueError("--load-stratum-probabilities must provide one value per load stratum")
+    total = float(sum(values))
+    return tuple(value / total for value in values)
+
+
+class TrainingRandomStreams:
+    """Independent, advancing RNG streams derived once from the run seed."""
+
+    def __init__(self, master_seed: int):
+        scenario_seed, environment_seed, load_seed = np.random.SeedSequence(int(master_seed)).spawn(3)
+        self.scenario_rng = np.random.default_rng(scenario_seed)
+        self.environment_rng = np.random.default_rng(environment_seed)
+        self.load_rng = np.random.default_rng(load_seed)
+        self._episode_scenario_group: int | None = None
+        self._episode_demand_seed: int | None = None
+
+    @staticmethod
+    def _draw_seed(rng: np.random.Generator) -> int:
+        return int(rng.integers(0, np.iinfo(np.int32).max, endpoint=False))
+
+    def next_demand_seed(self) -> int:
+        return self._draw_seed(self.scenario_rng)
+
+    def demand_seed_for_episode(self, episode_idx: int, refresh_episodes: int = 1) -> int:
+        scenario_group = int(episode_idx) // max(int(refresh_episodes), 1)
+        if scenario_group != self._episode_scenario_group:
+            self._episode_scenario_group = scenario_group
+            self._episode_demand_seed = self.next_demand_seed()
+        assert self._episode_demand_seed is not None
+        return self._episode_demand_seed
+
+    def next_environment_seed(self) -> int:
+        return self._draw_seed(self.environment_rng)
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "scenario_rng_json": json.dumps(self.scenario_rng.bit_generator.state),
+            "environment_rng_json": json.dumps(self.environment_rng.bit_generator.state),
+            "load_rng_json": json.dumps(self.load_rng.bit_generator.state),
+            "episode_scenario_group": self._episode_scenario_group,
+            "episode_demand_seed": self._episode_demand_seed,
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        self.scenario_rng.bit_generator.state = json.loads(str(state["scenario_rng_json"]))
+        self.environment_rng.bit_generator.state = json.loads(str(state["environment_rng_json"]))
+        self.load_rng.bit_generator.state = json.loads(str(state["load_rng_json"]))
+        scenario_group = state.get("episode_scenario_group")
+        demand_seed = state.get("episode_demand_seed")
+        self._episode_scenario_group = None if scenario_group is None else int(scenario_group)
+        self._episode_demand_seed = None if demand_seed is None else int(demand_seed)
+
+
 def load_group_for_rollout(args: argparse.Namespace, rollout_idx: int) -> int:
     return int(rollout_idx) % len(_load_strata_for_args(args))
+
+
+def load_probability_for_group(args: argparse.Namespace, group_id: int) -> float:
+    probabilities = _load_probabilities_for_args(args, len(_load_strata_for_args(args)))
+    return float(probabilities[int(group_id)])
 
 
 def load_assignments_for_update(
@@ -682,6 +827,7 @@ def load_assignments_for_update(
     rollouts: int,
     *,
     rollout_start_idx: int = 0,
+    rng: np.random.Generator | None = None,
 ) -> list[tuple[float, int]]:
     """Return reproducible load values and stable PPO credit groups for one update."""
 
@@ -696,18 +842,29 @@ def load_assignments_for_update(
             )
             for offset in range(rollouts)
         ]
-    if mode != "stratified-random":
-        raise ValueError("load_sampling_mode must be 'cyclic' or 'stratified-random'")
+    if mode not in {"stratified-random", "distribution-random"}:
+        raise ValueError(
+            "load_sampling_mode must be 'cyclic', 'stratified-random', or 'distribution-random'"
+        )
 
     strata = _load_strata_for_args(args)
-    group_ids = np.arange(rollouts, dtype=np.int64) % len(strata)
-    rng = np.random.default_rng(int(args.seed) + 910_001 + int(update_idx))
-    rng.shuffle(group_ids)
+    sample_rng = rng or np.random.default_rng(int(args.seed) + 910_001 + int(update_idx))
+    if mode == "stratified-random":
+        group_ids = np.arange(rollouts, dtype=np.int64) % len(strata)
+        sample_rng.shuffle(group_ids)
+    else:
+        probabilities = _load_probabilities_for_args(args, len(strata))
+        group_ids = sample_rng.choice(
+            len(strata),
+            size=rollouts,
+            replace=True,
+            p=np.asarray(probabilities, dtype=np.float64),
+        )
     assignments: list[tuple[float, int]] = []
     for group_id_raw in group_ids:
         group_id = int(group_id_raw)
         low, high = strata[group_id]
-        multiplier = low if np.isclose(low, high) else float(rng.uniform(low, high))
+        multiplier = low if np.isclose(low, high) else float(sample_rng.uniform(low, high))
         assignments.append((float(multiplier), group_id))
     return assignments
 
@@ -768,14 +925,27 @@ def demand_seed_for_training_rollout(args: argparse.Namespace, rollout_idx: int,
     else:
         refresh = max(int(getattr(args, "scenario_refresh_episodes", 1)), 1)
         scenario_group = int(episode_idx) // refresh
-    if getattr(args, "demand_scenario_schedule", "sequential") == "sequential":
+    schedule = getattr(args, "demand_scenario_schedule", "sequential")
+    if schedule == "sequential":
         scenario_offset = scenario_group
-    else:
+        return int(args.seed) + scenario_offset
+    if schedule == "stream":
+        scenario_seed = np.random.SeedSequence(int(args.seed)).spawn(3)[0]
+        scenario_rng = np.random.default_rng(scenario_seed)
+        draws = scenario_rng.integers(
+            0,
+            np.iinfo(np.int32).max,
+            size=scenario_group + 1,
+            endpoint=False,
+        )
+        return int(draws[-1])
+    if schedule == "shuffled-pool":
         pool_size = max(int(getattr(args, "demand_scenario_pool_size", 32)), 1)
         pool_cycle, pool_position = divmod(scenario_group, pool_size)
         pool_rng = np.random.default_rng(int(args.seed) + 730_001 + pool_cycle)
         scenario_offset = int(pool_rng.permutation(pool_size)[pool_position])
-    return int(args.seed) + scenario_offset
+        return int(args.seed) + scenario_offset
+    raise ValueError("unknown demand_scenario_schedule")
 
 
 def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_by_refresh: bool = False) -> EdgeComputingEnv:
@@ -818,8 +988,14 @@ def build_training_env(
     episode_idx: int,
     load_multiplier: float | None = None,
     load_group: int | None = None,
+    demand_seed: int | None = None,
+    environment_seed: int | None = None,
 ) -> EdgeComputingEnv:
-    demand_seed = demand_seed_for_training_rollout(args, rollout_idx, episode_idx)
+    selected_demand_seed = (
+        demand_seed_for_training_rollout(args, rollout_idx, episode_idx)
+        if demand_seed is None
+        else int(demand_seed)
+    )
     selected_multiplier = (
         load_multiplier_for_rollout(args, rollout_idx)
         if load_multiplier is None
@@ -832,9 +1008,9 @@ def build_training_env(
     )
     return EdgeComputingEnv(
         EdgeEnvConfig(
-            seed=args.seed + rollout_idx,
+            seed=args.seed + rollout_idx if environment_seed is None else int(environment_seed),
             physical_seed=args.seed if args.physical_seed is None else args.physical_seed,
-            scenario_seed=demand_seed,
+            scenario_seed=selected_demand_seed,
             num_users=args.num_users,
             num_edge_nodes=args.num_edge_nodes,
             num_service_types=args.num_service_types,
@@ -1841,10 +2017,14 @@ def build_episode_metrics_row(
         "training_phase_end": str(last["training_phase"]),
         "demand_seed": int(first["demand_seed"]),
         "demand_seed_end": int(last["demand_seed"]),
+        "environment_seed": int(first["environment_seed"]),
+        "environment_seed_end": int(last["environment_seed"]),
         "load_multiplier": float(first["load_multiplier"]),
         "load_multiplier_end": float(last["load_multiplier"]),
         "load_group": int(first["load_group"]),
         "load_group_end": int(last["load_group"]),
+        "load_target_probability": float(first["load_target_probability"]),
+        "load_target_probability_end": float(last["load_target_probability"]),
         "start_minute": float(first["start_minute"]),
         "start_minute_end": float(last["start_minute"]),
         "rollout_start": int(first["rollout"]),
@@ -2415,35 +2595,68 @@ def pretrain_fast_agent(
     return metrics
 
 
-def save_checkpoint(agent: HierarchicalPPOAgent, path: Path, metadata: dict[str, float | int | str]) -> None:
+def save_checkpoint(
+    agent: HierarchicalPPOAgent,
+    path: Path,
+    metadata: dict[str, float | int | str],
+    random_streams: TrainingRandomStreams | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    numpy_state = np.random.get_state()
+    safe_numpy_state = {
+        "bit_generator": str(numpy_state[0]),
+        "keys": [int(value) for value in numpy_state[1]],
+        "position": int(numpy_state[2]),
+        "has_gauss": int(numpy_state[3]),
+        "cached_gaussian": float(numpy_state[4]),
+    }
     torch.save(
         {
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
+            "slow_count_optimizer": agent.slow_agent.count_ppo.optimizer.state_dict(),
             "slow_placement_agent": agent.slow_agent.placement_ppo.policy.state_dict(),
+            "slow_placement_optimizer": agent.slow_agent.placement_ppo.optimizer.state_dict(),
             "slow_placement_updates_completed": agent.slow_agent.placement_updates_completed,
             "slow_placement_entropy_current_coef": agent.slow_agent.placement_entropy_current_coef,
             "slow_window_critic": agent.slow_agent.window_critic.state_dict(),
+            "slow_window_critic_optimizer": agent.slow_agent.critic_optimizer.state_dict(),
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
+            "fast_optimizer": agent.fast_agent.ppo.optimizer.state_dict(),
             "fast_entropy_current_coef": agent.fast_agent.entropy_current_coef,
+            "training_random_streams": None if random_streams is None else random_streams.state_dict(),
+            "numpy_random_state": safe_numpy_state,
+            "torch_random_state": torch.get_rng_state(),
+            "torch_cuda_random_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "metadata": metadata,
         },
         path,
     )
 
 
-def load_checkpoint(agent: HierarchicalPPOAgent, path: Path) -> dict[str, object]:
+def load_checkpoint(
+    agent: HierarchicalPPOAgent,
+    path: Path,
+    random_streams: TrainingRandomStreams | None = None,
+) -> dict[str, object]:
     checkpoint = torch.load(path, map_location=agent.fast_agent.ppo.device)
     if "slow_count_agent" in checkpoint:
         agent.slow_agent.count_ppo.policy.load_state_dict(checkpoint["slow_count_agent"])
+    if "slow_count_optimizer" in checkpoint:
+        agent.slow_agent.count_ppo.optimizer.load_state_dict(checkpoint["slow_count_optimizer"])
     if "slow_placement_agent" in checkpoint:
         agent.slow_agent.placement_ppo.policy.load_state_dict(checkpoint["slow_placement_agent"])
+        if "slow_placement_optimizer" in checkpoint:
+            agent.slow_agent.placement_ppo.optimizer.load_state_dict(checkpoint["slow_placement_optimizer"])
     elif "slow_agent" in checkpoint:
         agent.slow_agent.placement_ppo.policy.load_state_dict(checkpoint["slow_agent"])
     if "slow_window_critic" in checkpoint:
         agent.slow_agent.window_critic.load_state_dict(checkpoint["slow_window_critic"])
+    if "slow_window_critic_optimizer" in checkpoint:
+        agent.slow_agent.critic_optimizer.load_state_dict(checkpoint["slow_window_critic_optimizer"])
     if "fast_agent" in checkpoint:
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
+    if "fast_optimizer" in checkpoint:
+        agent.fast_agent.ppo.optimizer.load_state_dict(checkpoint["fast_optimizer"])
     if "slow_placement_updates_completed" in checkpoint:
         agent.slow_agent.placement_updates_completed = int(checkpoint["slow_placement_updates_completed"])
     if "slow_placement_entropy_current_coef" in checkpoint:
@@ -2454,6 +2667,23 @@ def load_checkpoint(agent: HierarchicalPPOAgent, path: Path) -> dict[str, object
     if "fast_entropy_current_coef" in checkpoint:
         agent.fast_agent.entropy_current_coef = float(checkpoint["fast_entropy_current_coef"])
         agent.fast_agent.ppo.entropy_coef = agent.fast_agent.entropy_current_coef
+    if random_streams is not None and checkpoint.get("training_random_streams") is not None:
+        random_streams.load_state_dict(checkpoint["training_random_streams"])
+    if "numpy_random_state" in checkpoint:
+        numpy_state = checkpoint["numpy_random_state"]
+        np.random.set_state(
+            (
+                str(numpy_state["bit_generator"]),
+                np.asarray(numpy_state["keys"], dtype=np.uint32),
+                int(numpy_state["position"]),
+                int(numpy_state["has_gauss"]),
+                float(numpy_state["cached_gaussian"]),
+            )
+        )
+    if "torch_random_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_random_state"])
+    if torch.cuda.is_available() and checkpoint.get("torch_cuda_random_state") is not None:
+        torch.cuda.set_rng_state_all(checkpoint["torch_cuda_random_state"])
     return checkpoint.get("metadata", {})
 
 
@@ -2520,6 +2750,7 @@ def main() -> None:
     eval_rollout_unit = resolve_eval_rollout_unit(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    training_random_streams = TrainingRandomStreams(args.seed)
 
     env = build_env(args)
     env.reset()
@@ -2554,6 +2785,7 @@ def main() -> None:
         slow_count_value_coef=args.slow_count_value_coef,
         slow_critic_lr=args.slow_critic_lr,
         slow_critic_k_epochs=args.slow_critic_k_epochs,
+        slow_window_gamma=args.slow_window_gamma,
         fast_value_coef=args.fast_value_coef,
         slow_target_kl=args.slow_target_kl,
         slow_count_target_kl=args.slow_count_target_kl,
@@ -2564,6 +2796,10 @@ def main() -> None:
         fast_policy_kind=args.fast_policy_kind,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
         fast_load_balanced_updates=args.fast_load_balanced_updates,
+        fast_load_group_weights=_load_probabilities_for_args(
+            args,
+            len(_load_strata_for_args(args)),
+        ),
         fast_full_batch_kl_stop=args.fast_full_batch_kl_stop,
         slow_reward_scale=args.reward_scale,
         slow_tail_latency_coef=args.slow_tail_latency_coef,
@@ -2581,7 +2817,11 @@ def main() -> None:
     )
     loaded_metadata: dict[str, object] = {}
     if args.load_checkpoint:
-        loaded_metadata = load_checkpoint(agent, Path(args.load_checkpoint))
+        loaded_metadata = load_checkpoint(
+            agent,
+            Path(args.load_checkpoint),
+            training_random_streams,
+        )
     bc_metrics = pretrain_fast_agent(
         args,
         agent,
@@ -2602,16 +2842,20 @@ def main() -> None:
         )
     )
     print(f"  train_mode={args.train_mode}")
+    print(f"  training_design={args.training_design}")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
     print(f"  rollout_unit={args.rollout_unit}")
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  pressure_profile={args.pressure_profile}")
     print(f"  demand_sampling_mode={args.demand_sampling_mode}")
-    print(
-        f"  demand_scenario_schedule={args.demand_scenario_schedule} "
-        f"pool_size={args.demand_scenario_pool_size}"
-    )
+    if args.demand_scenario_schedule == "shuffled-pool":
+        print(
+            f"  demand_scenario_schedule=shuffled-pool "
+            f"pool_size={args.demand_scenario_pool_size}"
+        )
+    else:
+        print(f"  demand_scenario_schedule={args.demand_scenario_schedule}")
     print(f"  fast_windows_per_update={args.fast_windows_per_update}")
     print(f"  slow_windows_per_update={args.slow_windows_per_update}")
     print(
@@ -2658,7 +2902,8 @@ def main() -> None:
         print(f"  rollout_start_mode={args.rollout_start_mode} eval_rollout_start_mode={args.eval_rollout_start_mode}")
     print(
         f"  load_multipliers={args.load_multipliers} sampling={args.load_sampling_mode} "
-        f"strata={args.load_strata or 'fixed-anchors'}"
+        f"strata={args.load_strata or 'fixed-anchors'} "
+        f"probabilities={args.load_stratum_probabilities}"
     )
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
@@ -2729,7 +2974,8 @@ def main() -> None:
     )
     print(
         f"  slow_global_advantage count_coef={args.slow_count_global_advantage_coef} "
-        f"placement_coef={args.slow_placement_global_advantage_coef}"
+        f"placement_coef={args.slow_placement_global_advantage_coef} "
+        f"window_gamma={args.slow_window_gamma}"
     )
     print(
         f"  ppo_target_kl count={args.slow_count_target_kl} "
@@ -2790,10 +3036,24 @@ def main() -> None:
             "episodes_collected": 0,
             "demand_seed": scenario_seed_for_offset(args, 0),
             "demand_seed_end": scenario_seed_for_offset(args, 0),
+            "environment_seed": int(args.seed),
+            "environment_seed_end": int(args.seed),
             "load_multiplier": load_multiplier_for_rollout(args, 0),
             "load_multiplier_end": load_multiplier_for_rollout(args, 0),
             "load_group": load_group_for_rollout(args, 0),
             "load_group_end": load_group_for_rollout(args, 0),
+            "load_target_probability": load_probability_for_group(
+                args,
+                load_group_for_rollout(args, 0),
+            ),
+            "load_target_probability_end": load_probability_for_group(
+                args,
+                load_group_for_rollout(args, 0),
+            ),
+            "load_multiplier_mean": np.nan,
+            "load_multiplier_std": np.nan,
+            "load_group_counts": "",
+            "load_group_frequencies": "",
             "start_minute": rollout_start_minute(args, 0),
             "start_minute_end": rollout_start_minute(args, 0),
             "rollouts_collected": 0,
@@ -2910,6 +3170,8 @@ def main() -> None:
             "slow_window_count": 0.0,
             "slow_window_return_mean": np.nan,
             "slow_window_return_std": np.nan,
+            "slow_trajectory_return_mean": np.nan,
+            "slow_trajectory_return_std": np.nan,
             "slow_count_return_mean": np.nan,
             "slow_count_return_std": np.nan,
             "slow_placement_return_mean": np.nan,
@@ -2920,6 +3182,7 @@ def main() -> None:
             "slow_window_advantage_std": np.nan,
             "slow_critic_explained_variance": np.nan,
             "slow_window_critic_explained_variance": np.nan,
+            "slow_window_critic_value_loss": np.nan,
             "slow_count_loss": 0.0,
             "slow_count_advantage_mean": np.nan,
             "slow_count_advantage_std": np.nan,
@@ -3052,6 +3315,7 @@ def main() -> None:
                     "run_name": run_name,
                     "train_mode": args.train_mode,
                 },
+                training_random_streams,
             )
 
     train_env: EdgeComputingEnv | None = None
@@ -3097,8 +3361,10 @@ def main() -> None:
         deterministic_slow_phase = bool(alternating_joint and not slow_phase)
         rollout_stats: list[dict[str, float]] = []
         demand_seeds: list[int] = []
+        environment_seeds: list[int] = []
         load_multipliers: list[float] = []
         load_groups: list[int] = []
+        load_target_probabilities: list[float] = []
         start_minutes: list[float] = []
         episode_numbers: list[int] = []
         window_numbers: list[int] = []
@@ -3107,12 +3373,14 @@ def main() -> None:
             update,
             windows_this_update,
             rollout_start_idx=training_rollout_idx,
+            rng=training_random_streams.load_rng,
         )
         for rollout_in_update in range(windows_this_update):
             rollout_idx = training_rollout_idx
             training_rollout_idx += 1
             start_minute = rollout_start_minute(args, rollout_idx)
             load_multiplier, load_group = update_load_assignments[rollout_in_update]
+            load_target_probability = load_probability_for_group(args, load_group)
             batch_suffix = (
                 ""
                 if windows_this_update <= 1
@@ -3120,24 +3388,51 @@ def main() -> None:
             )
             if args.rollout_unit == "window":
                 if args.demand_sampling_mode == "rollout":
+                    stream_demand_seed = (
+                        training_random_streams.next_demand_seed()
+                        if args.demand_scenario_schedule == "stream"
+                        else None
+                    )
+                    stream_environment_seed = (
+                        training_random_streams.next_environment_seed()
+                        if args.demand_scenario_schedule == "stream"
+                        else None
+                    )
                     train_env = build_training_env(
                         args,
                         rollout_idx=rollout_idx,
                         episode_idx=rollout_idx,
                         load_multiplier=load_multiplier,
                         load_group=load_group,
+                        demand_seed=stream_demand_seed,
+                        environment_seed=stream_environment_seed,
                     )
                     train_env.reset()
                     start_env_at_minute(train_env, start_minute)
                     episode_number = rollout_idx + 1
                 else:
                     if train_env is None or train_env.done:
+                        stream_demand_seed = (
+                            training_random_streams.demand_seed_for_episode(
+                                train_episode_idx,
+                                args.scenario_refresh_episodes,
+                            )
+                            if args.demand_scenario_schedule == "stream"
+                            else None
+                        )
+                        stream_environment_seed = (
+                            training_random_streams.next_environment_seed()
+                            if args.demand_scenario_schedule == "stream"
+                            else None
+                        )
                         train_env = build_training_env(
                             args,
                             rollout_idx=rollout_idx,
                             episode_idx=train_episode_idx,
                             load_multiplier=load_multiplier,
                             load_group=load_group,
+                            demand_seed=stream_demand_seed,
+                            environment_seed=stream_environment_seed,
                         )
                         train_env.reset()
                     episode_number = train_episode_idx + 1
@@ -3153,11 +3448,7 @@ def main() -> None:
                         env.current_requests = env._generate_current_second_requests()
                         env.current_request = env.current_requests[0] if env.current_requests else None
                 window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
-                demand_seed = demand_seed_for_training_rollout(
-                    args,
-                    rollout_idx,
-                    train_episode_idx if args.demand_sampling_mode == "episode" else rollout_idx,
-                )
+                demand_seed = int(env.config.scenario_seed)
                 progress_label = (
                     f"update={update + 1:03d}/{args.updates:03d}{batch_suffix} "
                     f"ep={episode_number:03d} win={window_in_episode:02d}/{total_windows:02d}"
@@ -3181,15 +3472,27 @@ def main() -> None:
                 if args.rollout_unit == "window" and one_stats["episode_complete"]:
                     train_episode_idx += 1
             else:
+                stream_demand_seed = (
+                    training_random_streams.next_demand_seed()
+                    if args.demand_scenario_schedule == "stream"
+                    else None
+                )
+                stream_environment_seed = (
+                    training_random_streams.next_environment_seed()
+                    if args.demand_scenario_schedule == "stream"
+                    else None
+                )
                 env = build_training_env(
                     args,
                     rollout_idx=rollout_idx,
                     episode_idx=rollout_idx,
                     load_multiplier=load_multiplier,
                     load_group=load_group,
+                    demand_seed=stream_demand_seed,
+                    environment_seed=stream_environment_seed,
                 )
                 episode_number = rollout_idx + 1
-                demand_seed = demand_seed_for_training_rollout(args, rollout_idx, rollout_idx)
+                demand_seed = int(env.config.scenario_seed)
                 one_stats = rollout(
                     env,
                     agent,
@@ -3208,8 +3511,10 @@ def main() -> None:
                 window_in_episode = int(one_stats["deployment_updates"])
             rollout_stats.append(one_stats)
             demand_seeds.append(demand_seed)
+            environment_seeds.append(int(env.config.seed))
             load_multipliers.append(load_multiplier)
             load_groups.append(load_group)
+            load_target_probabilities.append(load_target_probability)
             start_minutes.append(start_minute)
             episode_numbers.append(episode_number)
             window_numbers.append(window_in_episode)
@@ -3218,8 +3523,10 @@ def main() -> None:
                 "update": update + 1,
                 "training_phase": training_phase,
                 "demand_seed": demand_seed,
+                "environment_seed": int(env.config.seed),
                 "load_multiplier": load_multiplier,
                 "load_group": load_group,
+                "load_target_probability": load_target_probability,
                 "start_minute": start_minute,
                 "rollout": rollout_idx + 1,
                 "window": window_in_episode,
@@ -3254,10 +3561,28 @@ def main() -> None:
         window_in_episode = window_numbers[-1]
         demand_seed = demand_seeds[0]
         demand_seed_end = demand_seeds[-1]
+        environment_seed = environment_seeds[0]
+        environment_seed_end = environment_seeds[-1]
         load_multiplier = load_multipliers[0]
         load_multiplier_end = load_multipliers[-1]
         load_group = load_groups[0]
         load_group_end = load_groups[-1]
+        load_target_probability = load_target_probabilities[0]
+        load_target_probability_end = load_target_probabilities[-1]
+        load_multiplier_mean = float(np.mean(load_multipliers))
+        load_multiplier_std = float(np.std(load_multipliers))
+        load_group_counts = {
+            group_id: load_groups.count(group_id)
+            for group_id in sorted(set(load_groups))
+        }
+        load_group_count_text = ";".join(
+            f"{group_id}={count}"
+            for group_id, count in load_group_counts.items()
+        )
+        load_group_frequency_text = ";".join(
+            f"{group_id}={count / len(load_groups):.8g}"
+            for group_id, count in load_group_counts.items()
+        )
         start_minute = start_minutes[0]
         start_minute_end = start_minutes[-1]
         fast_metrics = agent.update_fast(
@@ -3305,10 +3630,18 @@ def main() -> None:
             "episodes_collected": episodes_collected,
             "demand_seed": demand_seed,
             "demand_seed_end": demand_seed_end,
+            "environment_seed": environment_seed,
+            "environment_seed_end": environment_seed_end,
             "load_multiplier": load_multiplier,
             "load_multiplier_end": load_multiplier_end,
             "load_group": load_group,
             "load_group_end": load_group_end,
+            "load_target_probability": load_target_probability,
+            "load_target_probability_end": load_target_probability_end,
+            "load_multiplier_mean": load_multiplier_mean,
+            "load_multiplier_std": load_multiplier_std,
+            "load_group_counts": load_group_count_text,
+            "load_group_frequencies": load_group_frequency_text,
             "start_minute": start_minute,
             "start_minute_end": start_minute_end,
             "rollouts_collected": len(rollout_stats),
@@ -3425,6 +3758,8 @@ def main() -> None:
             "slow_window_count": losses["slow"].get("window_count", 0.0),
             "slow_window_return_mean": losses["slow"].get("window_return_mean", np.nan),
             "slow_window_return_std": losses["slow"].get("window_return_std", np.nan),
+            "slow_trajectory_return_mean": losses["slow"].get("trajectory_return_mean", np.nan),
+            "slow_trajectory_return_std": losses["slow"].get("trajectory_return_std", np.nan),
             "slow_count_return_mean": losses["slow"].get("count_return_mean", np.nan),
             "slow_count_return_std": losses["slow"].get("count_return_std", np.nan),
             "slow_placement_return_mean": losses["slow"].get("placement_return_mean", np.nan),
@@ -3436,6 +3771,9 @@ def main() -> None:
             "slow_critic_explained_variance": losses["slow"].get("critic_explained_variance", np.nan),
             "slow_window_critic_explained_variance": losses["slow"].get(
                 "window_critic_explained_variance", np.nan
+            ),
+            "slow_window_critic_value_loss": losses["slow"].get(
+                "window_critic_value_loss", np.nan
             ),
             "slow_count_loss": losses["slow"].get("count_loss", np.nan),
             "slow_count_advantage_mean": losses["slow"].get("count_advantage_mean", np.nan),
@@ -3714,6 +4052,7 @@ def main() -> None:
                     "run_name": run_name,
                     "train_mode": args.train_mode,
                 },
+                training_random_streams,
             )
         save_checkpoint(
             agent,
@@ -3726,6 +4065,7 @@ def main() -> None:
                 "run_name": run_name,
                 "train_mode": args.train_mode,
             },
+            training_random_streams,
         )
 
     if episode_rollout_stats:
@@ -3768,6 +4108,7 @@ def main() -> None:
                 "run_name": run_name,
                 "train_mode": args.train_mode,
             },
+            training_random_streams,
         )
         print(f"log={log_path}")
         print(f"episode_log={episode_log_path}")
