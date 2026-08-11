@@ -107,8 +107,12 @@ A one-twelfth-range scale floor prevents Count entropy from collapsing while it
 is still adapting to a changing Fast policy. Count also uses an independent
 `2e-4` learning rate and `0.015` KL limit by default. The learning rate uses
 more of Count's observed KL margin while remaining below the shared Slow rate.
+Count, Placement, and Fast exploration are controlled by entropy normalized by
+the logarithm of the number of feasible actions. A state with one feasible
+action is treated as maximally exploratory rather than forcing its entropy
+coefficient upward.
 
-Slow deployment is trained from one 10-minute window at a time, but Count and
+Slow deployment is trained from complete six-window trajectories, but Count and
 Placement no longer receive one undifferentiated return for every component
 action. Each Placement node action receives its own mean/P95 latency, actual
 traffic usage, adjacent-stage cross-node result, and node-local compute-load
@@ -122,24 +126,25 @@ absolute latency scales across stages. Placement uses an independent `1.5e-4`
 learning rate and `0.015` KL limit. Its entropy coefficient starts at `0.005`,
 is held for 64 completed Slow updates, then its scheduled floor decays to
 `0.0035` over another 64 updates. An adaptive controller raises the coefficient,
-up to `0.015`, whenever observed Placement entropy falls below the default target
-of `1.8`. The active, next, and scheduled coefficients are written to every
+up to `0.02`, whenever normalized Placement entropy falls below the default target
+of `0.55`. The active, next, normalized entropy, and scheduled coefficients are written to every
 training row.
 Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
 and deadline violations penalize under-provisioning, while a continuous effective-
 replica measure based on request shares penalizes replicas that add little usable
-capacity. Because low-entropy Fast routing can make useful fallback replicas look
-idle, the Count redundancy coefficient is conservatively reduced from `0.25` to
-`0.05`, and the Placement idle coefficient from `0.10` to `0.02`. Placement still
-trains its value head.
+capacity. Its marginal cost uses redundant replicas relative to effective replicas
+with coefficient `0.15`, plus deployed count relative to feasible capacity with
+coefficient `0.05`. This makes each additional unused replica progressively more
+expensive instead of saturating at a weak fractional penalty. Placement still trains its value head.
 Count instead uses direct stage-centered returns with
 `--slow-count-value-coef 0` by default, so its failed critic cannot dominate the
 shared graph encoder; value loss and explained variance remain logged for ablation
-diagnostics but are not optimized. The separate window critic now supplies a
-standardized 10-minute residual to both actors. Count mixes it with coefficient
-`0.25`, Placement with `0.35`, after their local returns have been centered within
-comparable service stages. This keeps local credit while making both actors answer
-to the system-level window outcome. Fast PPO receives an additive stage-local latency reward
+diagnostics but are not optimized. The separate window critic trains with running
+return normalization, Huber loss, and a recency-weighted 96-window buffer; the newest
+six windows are held out for an online explained-variance check. Its trajectory
+residual is gated by critic reliability: Count and Placement receive no global
+credit while holdout explained variance is non-positive, and reach their configured
+`0.25`/`0.35` coefficients at EV `0.20`. Fast PPO receives an additive stage-local latency reward
 plus the exact KKT difference reward for compute/link congestion imposed on other
 requests. Requests are inferred in microbatches (default 16); after each
 microbatch a virtual workload ledger reserves the selected-node work so later
@@ -166,8 +171,8 @@ epoch boundaries. This prevents one noisy or high-volume load minibatch from
 discarding the remaining load signals. The training log records optimizer steps,
 sample and minimum-load coverage, full-buffer/worst-load KL, and serialized per-load
 KL/clip fractions. Both options have `--no-...` forms for ablation runs.
-Fast entropy also has a default floor target of `0.7`: its coefficient starts at
-`0.001` and adapts only when Fast actually updates, up to `0.01`. This prevents
+Fast normalized entropy has a default target of `0.50`: its coefficient starts at
+`0.002` and adapts only when Fast actually updates, up to `0.02`. This prevents
 Slow-only phases from changing Fast exploration state and counters the observed
 late concentration onto a small replica subset.
 Slow window rewards are discounted across the six decisions with
@@ -243,14 +248,13 @@ the deployed service replicas: `used_replica_rate`, `idle_replica_rate`,
 `used_replicas_per_stage`, normalized replica-use entropy,
 top-1 replica-use share, and cross-node stage transition rate.
 
-Fast optimizer diagnostics additionally report full-batch policy entropy,
+Fast optimizer diagnostics additionally report raw and normalized full-batch policy entropy,
 non-negative sampled KL, clip fraction, raw advantage mean/standard deviation,
-completed epochs, and KL early stops. Fast uses a `2e-4` learning rate, `0.001`
-entropy coefficient, and `0.015` KL limit by default. The smaller optimizer step
-reduces repeated KL-bound overshoot, while the entropy term slows premature
-loss of per-state scheduling exploration. The optimizer stops within an epoch
-when a later minibatch has already crossed that limit instead of averaging
-positive and negative signed estimates.
+completed epochs, and KL early stops. Fast starts at a `1e-4` learning rate with
+range `5e-5` to `2e-4`, a `0.002` normalized-entropy coefficient, and a `0.015`
+KL limit. Complete-buffer KL halves the next learning rate above `1.2x` target;
+three updates below `0.4x` target increase it by `1.2x`. KL stopping remains the
+final safety bound instead of acting as the primary step-size controller.
 
 Demand-side load can be raised without changing physical infrastructure. Use
 `--traffic-scale`, `--active-user-ratio`, and
@@ -301,4 +305,5 @@ a whole number of episodes. `--rollouts-per-update` remains a compatibility alia
 for the Fast count in legacy experiments.
 Slow deployment exploration can also be controlled separately with
 `--slow-count-entropy-coef` and `--slow-placement-entropy-coef`; the count policy
-is especially sensitive because its action space is only the replica count.
+is especially sensitive because its action space is only the replica count. Their
+targets are normalized fractions in `[0, 1]`, not raw categorical entropy values.

@@ -357,11 +357,25 @@ def parse_args() -> argparse.Namespace:
         default=1.5e-4,
         help="Independent Placement actor learning rate; conservative by default to avoid node-policy collapse.",
     )
-    parser.add_argument("--fast-lr", type=float, default=2e-4)
+    parser.add_argument("--fast-lr", type=float, default=1e-4)
+    parser.add_argument("--fast-min-lr", type=float, default=5e-5)
+    parser.add_argument("--fast-max-lr", type=float, default=2e-4)
+    parser.add_argument(
+        "--fast-kl-lr-adaptation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt Fast learning rate from complete-buffer KL after each update.",
+    )
+    parser.add_argument("--fast-kl-high-ratio", type=float, default=1.2)
+    parser.add_argument("--fast-kl-low-ratio", type=float, default=0.4)
+    parser.add_argument("--fast-kl-low-patience", type=int, default=3)
     parser.add_argument("--slow-k-epochs", type=int, default=3)
     parser.add_argument("--fast-k-epochs", type=int, default=4)
     parser.add_argument("--slow-entropy-coef", type=float, default=0.001)
-    parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
+    parser.add_argument("--slow-count-entropy-coef", type=float, default=0.002)
+    parser.add_argument("--slow-count-entropy-target", type=float, default=0.50)
+    parser.add_argument("--slow-count-entropy-max-coef", type=float, default=0.015)
+    parser.add_argument("--slow-count-entropy-adaptation-rate", type=float, default=0.001)
     parser.add_argument("--slow-placement-entropy-coef", type=float, default=0.005)
     parser.add_argument(
         "--slow-placement-entropy-final-coef",
@@ -381,9 +395,9 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help="Completed Slow PPO updates over which Placement entropy decays after the hold period.",
     )
-    parser.add_argument("--slow-placement-entropy-target", type=float, default=1.8)
-    parser.add_argument("--slow-placement-entropy-max-coef", type=float, default=0.015)
-    parser.add_argument("--slow-placement-entropy-adaptation-rate", type=float, default=5e-4)
+    parser.add_argument("--slow-placement-entropy-target", type=float, default=0.55)
+    parser.add_argument("--slow-placement-entropy-max-coef", type=float, default=0.02)
+    parser.add_argument("--slow-placement-entropy-adaptation-rate", type=float, default=0.001)
     parser.add_argument(
         "--slow-count-global-advantage-coef",
         type=float,
@@ -397,6 +411,12 @@ def parse_args() -> argparse.Namespace:
         help="Window-critic residual mixed into each stage-centered Placement advantage.",
     )
     parser.add_argument(
+        "--slow-global-advantage-ev-full",
+        type=float,
+        default=0.20,
+        help="Hold global Slow credit at zero until critic EV rises, reaching full weight at this EV.",
+    )
+    parser.add_argument(
         "--slow-tail-latency-coef",
         type=float,
         default=0.35,
@@ -408,10 +428,10 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Penalty in seconds-equivalent for cross-node transitions between adjacent stages in the Slow return.",
     )
-    parser.add_argument("--fast-entropy-coef", type=float, default=0.001)
-    parser.add_argument("--fast-entropy-target", type=float, default=0.7)
-    parser.add_argument("--fast-entropy-max-coef", type=float, default=0.01)
-    parser.add_argument("--fast-entropy-adaptation-rate", type=float, default=5e-4)
+    parser.add_argument("--fast-entropy-coef", type=float, default=0.002)
+    parser.add_argument("--fast-entropy-target", type=float, default=0.50)
+    parser.add_argument("--fast-entropy-max-coef", type=float, default=0.02)
+    parser.add_argument("--fast-entropy-adaptation-rate", type=float, default=0.002)
     parser.add_argument(
         "--fast-congestion-credit-coef",
         type=float,
@@ -431,8 +451,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Count critic loss coefficient. Keep at 0 when the actor uses direct stage-centered returns.",
     )
-    parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
-    parser.add_argument("--slow-critic-k-epochs", type=int, default=4)
+    parser.add_argument("--slow-critic-lr", type=float, default=5e-4)
+    parser.add_argument("--slow-critic-k-epochs", type=int, default=8)
+    parser.add_argument("--slow-critic-replay-windows", type=int, default=96)
+    parser.add_argument("--slow-critic-replay-decay", type=float, default=0.90)
+    parser.add_argument("--slow-critic-holdout-windows", type=int, default=6)
+    parser.add_argument("--slow-critic-gradient-clip", type=float, default=5.0)
     parser.add_argument(
         "--slow-window-gamma",
         type=float,
@@ -447,7 +471,8 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Slow-return migration penalty. Disabled by default; deployment changes remain logged.",
     )
-    parser.add_argument("--slow-idle-replica-coef", type=float, default=0.05)
+    parser.add_argument("--slow-idle-replica-coef", type=float, default=0.15)
+    parser.add_argument("--slow-count-capacity-coef", type=float, default=0.05)
     parser.add_argument(
         "--slow-placement-idle-coef",
         type=float,
@@ -614,6 +639,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fast-reservation-microbatch-size must be >= 1")
     if (
         args.slow_idle_replica_coef < 0.0
+        or args.slow_count_capacity_coef < 0.0
         or args.slow_placement_idle_coef < 0.0
         or args.slow_placement_compute_coef < 0.0
         or args.slow_count_shortage_coef < 0.0
@@ -629,6 +655,12 @@ def parse_args() -> argparse.Namespace:
         args.joint_training_schedule = "simultaneous"
     if args.slow_critic_k_epochs < 1:
         parser.error("--slow-critic-k-epochs must be >= 1")
+    if args.slow_critic_replay_windows < 1 or args.slow_critic_holdout_windows < 0:
+        parser.error("Slow critic replay windows must be positive and holdout windows non-negative")
+    if not 0.0 < args.slow_critic_replay_decay <= 1.0:
+        parser.error("--slow-critic-replay-decay must be in (0, 1]")
+    if args.slow_critic_gradient_clip <= 0.0:
+        parser.error("--slow-critic-gradient-clip must be positive")
     if not 0.0 <= args.slow_window_gamma <= 1.0:
         parser.error("--slow-window-gamma must be in [0, 1]")
     if not 0.0 <= args.slow_tail_latency_coef <= 1.0:
@@ -649,20 +681,36 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-placement-entropy-hold-updates must be >= 0")
     if args.slow_placement_entropy_decay_updates < 1:
         parser.error("--slow-placement-entropy-decay-updates must be >= 1")
-    if args.slow_placement_entropy_target < 0.0:
-        parser.error("--slow-placement-entropy-target must be >= 0")
+    if not 0.0 <= args.slow_placement_entropy_target <= 1.0:
+        parser.error("--slow-placement-entropy-target must be normalized to [0, 1]")
     if args.slow_placement_entropy_max_coef < args.slow_placement_entropy_coef:
         parser.error("--slow-placement-entropy-max-coef must be at least the initial coefficient")
     if args.slow_placement_entropy_adaptation_rate < 0.0:
         parser.error("--slow-placement-entropy-adaptation-rate must be >= 0")
+    if not 0.0 <= args.slow_count_entropy_target <= 1.0:
+        parser.error("--slow-count-entropy-target must be normalized to [0, 1]")
+    if args.slow_count_entropy_coef < 0.0:
+        parser.error("--slow-count-entropy-coef must be non-negative")
+    if args.slow_count_entropy_max_coef < args.slow_count_entropy_coef:
+        parser.error("--slow-count-entropy-max-coef must be at least the initial coefficient")
+    if args.slow_count_entropy_adaptation_rate < 0.0:
+        parser.error("--slow-count-entropy-adaptation-rate must be >= 0")
     if args.slow_count_global_advantage_coef < 0.0 or args.slow_placement_global_advantage_coef < 0.0:
         parser.error("Slow global advantage coefficients must be >= 0")
-    if args.fast_entropy_coef < 0.0 or args.fast_entropy_target < 0.0:
-        parser.error("Fast entropy coefficient and target must be >= 0")
+    if args.slow_global_advantage_ev_full <= 0.0:
+        parser.error("--slow-global-advantage-ev-full must be positive")
+    if args.fast_entropy_coef < 0.0 or not 0.0 <= args.fast_entropy_target <= 1.0:
+        parser.error("Fast entropy coefficient must be non-negative and target normalized to [0, 1]")
     if args.fast_entropy_max_coef < args.fast_entropy_coef:
         parser.error("--fast-entropy-max-coef must be at least --fast-entropy-coef")
     if args.fast_entropy_adaptation_rate < 0.0:
         parser.error("--fast-entropy-adaptation-rate must be >= 0")
+    if not 0.0 < args.fast_min_lr <= args.fast_lr <= args.fast_max_lr:
+        parser.error("Fast learning rates must satisfy 0 < min <= initial <= max")
+    if args.fast_kl_high_ratio <= 1.0 or not 0.0 < args.fast_kl_low_ratio < 1.0:
+        parser.error("Fast KL adaptation ratios must straddle one")
+    if args.fast_kl_low_patience < 1:
+        parser.error("--fast-kl-low-patience must be positive")
     if args.synchronized_window_block < 0:
         parser.error("--synchronized-window-block must be >= 0")
     if args.episode_minutes < 1:
@@ -1564,6 +1612,8 @@ def rollout(
         "slow_factorized_count_return_std": float("nan"),
         "slow_count_effective_replicas_per_stage": float("nan"),
         "slow_count_redundant_replica_fraction": float("nan"),
+        "slow_count_redundant_replica_ratio": float("nan"),
+        "slow_count_replica_capacity_fraction": float("nan"),
         "slow_placement_node_compute_load": float("nan"),
         "slow_placement_node_compute_cost": float("nan"),
         "slow_deployment_memory_fraction": float("nan"),
@@ -1963,6 +2013,8 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_factorized_count_return_std",
         "slow_count_effective_replicas_per_stage",
         "slow_count_redundant_replica_fraction",
+        "slow_count_redundant_replica_ratio",
+        "slow_count_replica_capacity_fraction",
         "slow_placement_node_compute_load",
         "slow_placement_node_compute_cost",
         "slow_deployment_memory_fraction",
@@ -2618,11 +2670,30 @@ def save_checkpoint(
             "slow_placement_optimizer": agent.slow_agent.placement_ppo.optimizer.state_dict(),
             "slow_placement_updates_completed": agent.slow_agent.placement_updates_completed,
             "slow_placement_entropy_current_coef": agent.slow_agent.placement_entropy_current_coef,
+            "slow_count_entropy_current_coef": agent.slow_agent.count_entropy_current_coef,
             "slow_window_critic": agent.slow_agent.window_critic.state_dict(),
             "slow_window_critic_optimizer": agent.slow_agent.critic_optimizer.state_dict(),
+            "slow_window_critic_return_mean": agent.slow_agent.critic_return_mean,
+            "slow_window_critic_return_std": agent.slow_agent.critic_return_std,
+            "slow_window_critic_update_index": agent.slow_agent.critic_update_index,
+            "slow_window_critic_last_ev": agent.slow_agent.last_window_critic_explained_variance,
+            "slow_window_critic_replay_states": (
+                torch.as_tensor(np.stack(agent.slow_agent.critic_replay_states), dtype=torch.float32)
+                if agent.slow_agent.critic_replay_states
+                else torch.empty((0, 0), dtype=torch.float32)
+            ),
+            "slow_window_critic_replay_returns": torch.as_tensor(
+                agent.slow_agent.critic_replay_returns,
+                dtype=torch.float32,
+            ),
+            "slow_window_critic_replay_update_ids": torch.as_tensor(
+                agent.slow_agent.critic_replay_update_ids,
+                dtype=torch.int64,
+            ),
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
             "fast_optimizer": agent.fast_agent.ppo.optimizer.state_dict(),
             "fast_entropy_current_coef": agent.fast_agent.entropy_current_coef,
+            "fast_low_kl_updates": agent.fast_agent.low_kl_updates,
             "training_random_streams": None if random_streams is None else random_streams.state_dict(),
             "numpy_random_state": safe_numpy_state,
             "torch_random_state": torch.get_rng_state(),
@@ -2653,6 +2724,28 @@ def load_checkpoint(
         agent.slow_agent.window_critic.load_state_dict(checkpoint["slow_window_critic"])
     if "slow_window_critic_optimizer" in checkpoint:
         agent.slow_agent.critic_optimizer.load_state_dict(checkpoint["slow_window_critic_optimizer"])
+    if "slow_window_critic_return_mean" in checkpoint:
+        agent.slow_agent.critic_return_mean = float(checkpoint["slow_window_critic_return_mean"])
+        agent.slow_agent.critic_return_std = float(checkpoint["slow_window_critic_return_std"])
+        agent.slow_agent.critic_update_index = int(checkpoint["slow_window_critic_update_index"])
+        agent.slow_agent.last_window_critic_explained_variance = float(
+            checkpoint.get("slow_window_critic_last_ev", 0.0)
+        )
+        replay_states = checkpoint.get("slow_window_critic_replay_states")
+        replay_returns = checkpoint.get("slow_window_critic_replay_returns")
+        replay_update_ids = checkpoint.get("slow_window_critic_replay_update_ids")
+        if replay_states is not None and replay_states.numel() > 0:
+            agent.slow_agent.critic_replay_states = [
+                state.copy() for state in replay_states.cpu().numpy()
+            ]
+        if replay_returns is not None:
+            agent.slow_agent.critic_replay_returns = [
+                float(value) for value in replay_returns.cpu().tolist()
+            ]
+        if replay_update_ids is not None:
+            agent.slow_agent.critic_replay_update_ids = [
+                int(value) for value in replay_update_ids.cpu().tolist()
+            ]
     if "fast_agent" in checkpoint:
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
     if "fast_optimizer" in checkpoint:
@@ -2664,9 +2757,16 @@ def load_checkpoint(
     else:
         agent.slow_agent.placement_entropy_current_coef = agent.slow_agent.placement_entropy_schedule_coefficient()
     agent.slow_agent.placement_ppo.entropy_coef = agent.slow_agent.placement_entropy_coefficient()
+    if "slow_count_entropy_current_coef" in checkpoint:
+        agent.slow_agent.count_entropy_current_coef = float(
+            checkpoint["slow_count_entropy_current_coef"]
+        )
+    agent.slow_agent.count_ppo.entropy_coef = agent.slow_agent.count_entropy_current_coef
     if "fast_entropy_current_coef" in checkpoint:
         agent.fast_agent.entropy_current_coef = float(checkpoint["fast_entropy_current_coef"])
         agent.fast_agent.ppo.entropy_coef = agent.fast_agent.entropy_current_coef
+    if "fast_low_kl_updates" in checkpoint:
+        agent.fast_agent.low_kl_updates = int(checkpoint["fast_low_kl_updates"])
     if random_streams is not None and checkpoint.get("training_random_streams") is not None:
         random_streams.load_state_dict(checkpoint["training_random_streams"])
     if "numpy_random_state" in checkpoint:
@@ -2764,10 +2864,19 @@ def main() -> None:
         slow_count_lr=args.slow_count_lr,
         slow_placement_lr=args.slow_placement_lr,
         fast_lr=args.fast_lr,
+        fast_min_lr=args.fast_min_lr,
+        fast_max_lr=args.fast_max_lr,
+        fast_kl_lr_adaptation=args.fast_kl_lr_adaptation,
+        fast_kl_high_ratio=args.fast_kl_high_ratio,
+        fast_kl_low_ratio=args.fast_kl_low_ratio,
+        fast_kl_low_patience=args.fast_kl_low_patience,
         slow_k_epochs=args.slow_k_epochs,
         fast_k_epochs=args.fast_k_epochs,
         slow_entropy_coef=args.slow_entropy_coef,
         slow_count_entropy_coef=args.slow_count_entropy_coef,
+        slow_count_entropy_target=args.slow_count_entropy_target,
+        slow_count_entropy_max_coef=args.slow_count_entropy_max_coef,
+        slow_count_entropy_adaptation_rate=args.slow_count_entropy_adaptation_rate,
         slow_placement_entropy_coef=args.slow_placement_entropy_coef,
         slow_placement_entropy_final_coef=args.slow_placement_entropy_final_coef,
         slow_placement_entropy_hold_updates=args.slow_placement_entropy_hold_updates,
@@ -2777,6 +2886,7 @@ def main() -> None:
         slow_placement_entropy_adaptation_rate=args.slow_placement_entropy_adaptation_rate,
         slow_count_global_advantage_coef=args.slow_count_global_advantage_coef,
         slow_placement_global_advantage_coef=args.slow_placement_global_advantage_coef,
+        slow_global_advantage_ev_full=args.slow_global_advantage_ev_full,
         fast_entropy_coef=args.fast_entropy_coef,
         fast_entropy_target=args.fast_entropy_target,
         fast_entropy_max_coef=args.fast_entropy_max_coef,
@@ -2785,6 +2895,10 @@ def main() -> None:
         slow_count_value_coef=args.slow_count_value_coef,
         slow_critic_lr=args.slow_critic_lr,
         slow_critic_k_epochs=args.slow_critic_k_epochs,
+        slow_critic_replay_windows=args.slow_critic_replay_windows,
+        slow_critic_replay_decay=args.slow_critic_replay_decay,
+        slow_critic_holdout_windows=args.slow_critic_holdout_windows,
+        slow_critic_gradient_clip=args.slow_critic_gradient_clip,
         slow_window_gamma=args.slow_window_gamma,
         fast_value_coef=args.fast_value_coef,
         slow_target_kl=args.slow_target_kl,
@@ -2808,6 +2922,7 @@ def main() -> None:
         slow_deployment_storage_coef=args.slow_deployment_storage_coef,
         slow_migration_coef=args.slow_migration_coef,
         slow_idle_replica_coef=args.slow_idle_replica_coef,
+        slow_count_capacity_coef=args.slow_count_capacity_coef,
         slow_placement_idle_coef=args.slow_placement_idle_coef,
         slow_placement_compute_coef=args.slow_placement_compute_coef,
         slow_count_shortage_coef=args.slow_count_shortage_coef,
@@ -2931,9 +3046,10 @@ def main() -> None:
         )
     )
     print(
-        "  slow_window_cost count_latency_coef={} redundancy_coef={} placement_idle_coef={} placement_compute_coef={} shortage_coef={} memory_coef={} storage_coef={} migration_coef={} critic_lr={} critic_epochs={}".format(
+        "  slow_window_cost count_latency_coef={} redundancy_ratio_coef={} count_capacity_coef={} placement_idle_coef={} placement_compute_coef={} shortage_coef={} memory_coef={} storage_coef={} migration_coef={} critic_lr={} critic_epochs={}".format(
             args.slow_count_latency_coef,
             args.slow_idle_replica_coef,
+            args.slow_count_capacity_coef,
             args.slow_placement_idle_coef,
             args.slow_placement_compute_coef,
             args.slow_count_shortage_coef,
@@ -2968,14 +3084,27 @@ def main() -> None:
     )
     print(
         f"  adaptive_entropy fast_target={args.fast_entropy_target} fast_max={args.fast_entropy_max_coef} "
-        f"fast_rate={args.fast_entropy_adaptation_rate} placement_target={args.slow_placement_entropy_target} "
+        f"fast_rate={args.fast_entropy_adaptation_rate} count_target={args.slow_count_entropy_target} "
+        f"count_max={args.slow_count_entropy_max_coef} count_rate={args.slow_count_entropy_adaptation_rate} "
+        f"placement_target={args.slow_placement_entropy_target} "
         f"placement_max={args.slow_placement_entropy_max_coef} "
-        f"placement_rate={args.slow_placement_entropy_adaptation_rate}"
+        f"placement_rate={args.slow_placement_entropy_adaptation_rate} targets=normalized"
+    )
+    print(
+        f"  fast_kl_lr_adaptation={args.fast_kl_lr_adaptation} "
+        f"lr_range={args.fast_min_lr:g}-{args.fast_max_lr:g} "
+        f"high_ratio={args.fast_kl_high_ratio} low_ratio={args.fast_kl_low_ratio} "
+        f"low_patience={args.fast_kl_low_patience}"
     )
     print(
         f"  slow_global_advantage count_coef={args.slow_count_global_advantage_coef} "
         f"placement_coef={args.slow_placement_global_advantage_coef} "
-        f"window_gamma={args.slow_window_gamma}"
+        f"ev_full={args.slow_global_advantage_ev_full} window_gamma={args.slow_window_gamma}"
+    )
+    print(
+        f"  slow_critic replay={args.slow_critic_replay_windows} "
+        f"decay={args.slow_critic_replay_decay} holdout={args.slow_critic_holdout_windows} "
+        f"gradient_clip={args.slow_critic_gradient_clip} target=running_normalized_huber"
     )
     print(
         f"  ppo_target_kl count={args.slow_count_target_kl} "
@@ -3155,6 +3284,8 @@ def main() -> None:
             "slow_factorized_count_return_std": np.nan,
             "slow_count_effective_replicas_per_stage": np.nan,
             "slow_count_redundant_replica_fraction": np.nan,
+            "slow_count_redundant_replica_ratio": np.nan,
+            "slow_count_replica_capacity_fraction": np.nan,
             "slow_placement_node_compute_load": np.nan,
             "slow_placement_node_compute_cost": np.nan,
             "slow_deployment_memory_fraction": np.nan,
@@ -3183,29 +3314,43 @@ def main() -> None:
             "slow_critic_explained_variance": np.nan,
             "slow_window_critic_explained_variance": np.nan,
             "slow_window_critic_value_loss": np.nan,
+            "slow_window_critic_raw_value_mse": np.nan,
+            "slow_window_critic_train_explained_variance": np.nan,
+            "slow_window_critic_holdout_explained_variance": np.nan,
+            "slow_window_critic_replay_size": 0,
+            "slow_window_critic_return_mean": 0.0,
+            "slow_window_critic_return_std": 1.0,
+            "slow_global_advantage_reliability": 0.0,
             "slow_count_loss": 0.0,
             "slow_count_advantage_mean": np.nan,
             "slow_count_advantage_std": np.nan,
             "slow_count_global_advantage_mean": np.nan,
             "slow_count_global_advantage_std": np.nan,
-            "slow_count_global_advantage_coef": args.slow_count_global_advantage_coef,
+            "slow_count_global_advantage_coef": 0.0,
+            "slow_count_global_advantage_configured_coef": args.slow_count_global_advantage_coef,
             "slow_count_combined_advantage_std": np.nan,
             "slow_count_value_loss": 0.0,
             "slow_count_explained_variance": np.nan,
             "slow_count_post_explained_variance": np.nan,
             "slow_count_entropy": 0.0,
+            "slow_count_normalized_entropy": 0.0,
+            "slow_count_entropy_coef": args.slow_count_entropy_coef,
+            "slow_count_entropy_next_coef": args.slow_count_entropy_coef,
+            "slow_count_entropy_target": args.slow_count_entropy_target,
             "slow_count_approx_kl": 0.0,
             "slow_placement_loss": 0.0,
             "slow_placement_advantage_mean": np.nan,
             "slow_placement_advantage_std": np.nan,
             "slow_placement_global_advantage_mean": np.nan,
             "slow_placement_global_advantage_std": np.nan,
-            "slow_placement_global_advantage_coef": args.slow_placement_global_advantage_coef,
+            "slow_placement_global_advantage_coef": 0.0,
+            "slow_placement_global_advantage_configured_coef": args.slow_placement_global_advantage_coef,
             "slow_placement_combined_advantage_std": np.nan,
             "slow_placement_value_loss": 0.0,
             "slow_placement_explained_variance": np.nan,
             "slow_placement_post_explained_variance": np.nan,
             "slow_placement_entropy": 0.0,
+            "slow_placement_normalized_entropy": 0.0,
             "slow_placement_entropy_coef": args.slow_placement_entropy_coef,
             "slow_placement_entropy_next_coef": args.slow_placement_entropy_coef,
             "slow_placement_entropy_schedule_coef": args.slow_placement_entropy_coef,
@@ -3216,10 +3361,14 @@ def main() -> None:
             "fast_policy_loss": 0.0,
             "fast_value_loss": 0.0,
             "fast_entropy": 0.0,
+            "fast_normalized_entropy": 0.0,
             "fast_entropy_coef": args.fast_entropy_coef,
             "fast_entropy_next_coef": args.fast_entropy_coef,
             "fast_entropy_target": args.fast_entropy_target,
             "fast_approx_kl": 0.0,
+            "fast_learning_rate": args.fast_lr,
+            "fast_next_learning_rate": args.fast_lr,
+            "fast_low_kl_updates": 0,
             "fast_clip_fraction": 0.0,
             "fast_advantage_mean": np.nan,
             "fast_advantage_std": np.nan,
@@ -3237,6 +3386,7 @@ def main() -> None:
             "fast_group_approx_kl_std": 0.0,
             "fast_load_approx_kl": "",
             "fast_load_clip_fraction": "",
+            "fast_load_normalized_entropy": "",
             "eval_avg_latency_s": eval_stats["eval_avg_latency_s"],
             "eval_avg_latency_std": eval_stats["eval_avg_latency_std"],
             "eval_p95_latency_s": eval_stats["eval_p95_latency_s"],
@@ -3743,6 +3893,8 @@ def main() -> None:
             "slow_factorized_count_return_std": stats["slow_factorized_count_return_std"],
             "slow_count_effective_replicas_per_stage": stats["slow_count_effective_replicas_per_stage"],
             "slow_count_redundant_replica_fraction": stats["slow_count_redundant_replica_fraction"],
+            "slow_count_redundant_replica_ratio": stats["slow_count_redundant_replica_ratio"],
+            "slow_count_replica_capacity_fraction": stats["slow_count_replica_capacity_fraction"],
             "slow_placement_node_compute_load": stats["slow_placement_node_compute_load"],
             "slow_placement_node_compute_cost": stats["slow_placement_node_compute_cost"],
             "slow_deployment_memory_fraction": stats["slow_deployment_memory_fraction"],
@@ -3775,6 +3927,27 @@ def main() -> None:
             "slow_window_critic_value_loss": losses["slow"].get(
                 "window_critic_value_loss", np.nan
             ),
+            "slow_window_critic_raw_value_mse": losses["slow"].get(
+                "window_critic_raw_value_mse", np.nan
+            ),
+            "slow_window_critic_train_explained_variance": losses["slow"].get(
+                "window_critic_train_explained_variance", np.nan
+            ),
+            "slow_window_critic_holdout_explained_variance": losses["slow"].get(
+                "window_critic_holdout_explained_variance", np.nan
+            ),
+            "slow_window_critic_replay_size": losses["slow"].get(
+                "window_critic_replay_size", 0.0
+            ),
+            "slow_window_critic_return_mean": losses["slow"].get(
+                "window_critic_return_mean", np.nan
+            ),
+            "slow_window_critic_return_std": losses["slow"].get(
+                "window_critic_return_std", np.nan
+            ),
+            "slow_global_advantage_reliability": losses["slow"].get(
+                "global_advantage_reliability", 0.0
+            ),
             "slow_count_loss": losses["slow"].get("count_loss", np.nan),
             "slow_count_advantage_mean": losses["slow"].get("count_advantage_mean", np.nan),
             "slow_count_advantage_std": losses["slow"].get("count_advantage_std", np.nan),
@@ -3785,7 +3958,10 @@ def main() -> None:
                 "count_global_advantage_std", np.nan
             ),
             "slow_count_global_advantage_coef": losses["slow"].get(
-                "count_global_advantage_coef", args.slow_count_global_advantage_coef
+                "count_global_advantage_coef", 0.0
+            ),
+            "slow_count_global_advantage_configured_coef": losses["slow"].get(
+                "count_global_advantage_configured_coef", args.slow_count_global_advantage_coef
             ),
             "slow_count_combined_advantage_std": losses["slow"].get(
                 "count_combined_advantage_std", np.nan
@@ -3796,6 +3972,16 @@ def main() -> None:
                 "count_post_explained_variance", np.nan
             ),
             "slow_count_entropy": losses["slow"].get("count_entropy", np.nan),
+            "slow_count_normalized_entropy": losses["slow"].get(
+                "count_normalized_entropy", np.nan
+            ),
+            "slow_count_entropy_coef": losses["slow"].get("count_entropy_coef", np.nan),
+            "slow_count_entropy_next_coef": losses["slow"].get(
+                "count_entropy_next_coef", np.nan
+            ),
+            "slow_count_entropy_target": losses["slow"].get(
+                "count_entropy_target", args.slow_count_entropy_target
+            ),
             "slow_count_approx_kl": losses["slow"].get("count_approx_kl", np.nan),
             "slow_placement_loss": losses["slow"].get("placement_loss", np.nan),
             "slow_placement_advantage_mean": losses["slow"].get(
@@ -3811,7 +3997,11 @@ def main() -> None:
                 "placement_global_advantage_std", np.nan
             ),
             "slow_placement_global_advantage_coef": losses["slow"].get(
-                "placement_global_advantage_coef", args.slow_placement_global_advantage_coef
+                "placement_global_advantage_coef", 0.0
+            ),
+            "slow_placement_global_advantage_configured_coef": losses["slow"].get(
+                "placement_global_advantage_configured_coef",
+                args.slow_placement_global_advantage_coef,
             ),
             "slow_placement_combined_advantage_std": losses["slow"].get(
                 "placement_combined_advantage_std", np.nan
@@ -3824,6 +4014,9 @@ def main() -> None:
                 "placement_post_explained_variance", np.nan
             ),
             "slow_placement_entropy": losses["slow"].get("placement_entropy", np.nan),
+            "slow_placement_normalized_entropy": losses["slow"].get(
+                "placement_normalized_entropy", np.nan
+            ),
             "slow_placement_entropy_coef": losses["slow"].get("placement_entropy_coef", np.nan),
             "slow_placement_entropy_next_coef": losses["slow"].get(
                 "placement_entropy_next_coef", np.nan
@@ -3842,10 +4035,14 @@ def main() -> None:
             "fast_policy_loss": losses["fast"]["policy_loss"],
             "fast_value_loss": losses["fast"]["value_loss"],
             "fast_entropy": losses["fast"].get("entropy", np.nan),
+            "fast_normalized_entropy": losses["fast"].get("normalized_entropy", np.nan),
             "fast_entropy_coef": losses["fast"].get("entropy_coef", np.nan),
             "fast_entropy_next_coef": losses["fast"].get("entropy_next_coef", np.nan),
             "fast_entropy_target": losses["fast"].get("entropy_target", args.fast_entropy_target),
             "fast_approx_kl": losses["fast"].get("approx_kl", 0.0),
+            "fast_learning_rate": losses["fast"].get("learning_rate", np.nan),
+            "fast_next_learning_rate": losses["fast"].get("next_learning_rate", np.nan),
+            "fast_low_kl_updates": losses["fast"].get("low_kl_updates", 0.0),
             "fast_clip_fraction": losses["fast"].get("clip_fraction", 0.0),
             "fast_advantage_mean": losses["fast"].get("advantage_mean", np.nan),
             "fast_advantage_std": losses["fast"].get("advantage_std", np.nan),
@@ -3868,6 +4065,10 @@ def main() -> None:
             "fast_load_clip_fraction": format_group_diagnostics(
                 fast_group_diagnostics,
                 "clip_fraction",
+            ),
+            "fast_load_normalized_entropy": format_group_diagnostics(
+                fast_group_diagnostics,
+                "normalized_entropy",
             ),
             "eval_avg_latency_s": eval_stats.get("eval_avg_latency_s", np.nan),
             "eval_avg_latency_std": eval_stats.get("eval_avg_latency_std", np.nan),

@@ -13,6 +13,7 @@ from edge_drl.models.ppo import (
     _balance_group_weights,
     _center_advantages_by_group,
     _normalize_advantages_by_group,
+    _normalized_masked_entropy,
     _stratified_minibatches,
 )
 from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_costs, rollout
@@ -21,6 +22,24 @@ from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_c
 def test_observation_dimensions():
     assert slow_obs_dim(16, 3) == 17 + 16 * (6 + 3) + 16 * 16 * 4
     assert fast_obs_dim(16) == 12 + 16 * 9 + 16 * 16 * 3
+
+
+def test_masked_entropy_is_normalized_by_feasible_action_count():
+    entropies = torch.tensor([np.log(4.0), 0.5 * np.log(2.0), 0.0])
+    masks = torch.tensor(
+        [
+            [True, True, True, True],
+            [True, True, False, False],
+            [True, False, False, False],
+        ]
+    )
+
+    normalized = _normalized_masked_entropy(entropies, masks)
+
+    torch.testing.assert_close(
+        normalized,
+        torch.tensor([1.0, 0.5, 1.0], dtype=normalized.dtype),
+    )
 
 
 def test_slow_discounted_returns_stop_at_episode_boundaries():
@@ -296,8 +315,10 @@ def test_dual_ppo_rollout_and_update():
     assert losses["slow"]["window_count"] == 1
     assert np.isclose(losses["slow"]["placement_entropy_coef"], 0.005)
     assert losses["slow"]["placement_updates_completed"] == 1
-    assert losses["slow"]["count_global_advantage_coef"] == 0.25
-    assert losses["slow"]["placement_global_advantage_coef"] == 0.35
+    assert losses["slow"]["count_global_advantage_coef"] == 0.0
+    assert losses["slow"]["placement_global_advantage_coef"] == 0.0
+    assert losses["slow"]["count_global_advantage_configured_coef"] == 0.25
+    assert losses["slow"]["placement_global_advantage_configured_coef"] == 0.35
     assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.005)
     assert np.isfinite(losses["slow"]["critic_explained_variance"])
     assert np.isfinite(losses["fast"]["loss"])
@@ -585,6 +606,9 @@ def test_slow_collection_records_a_multi_window_episode_boundary():
     slow_metrics = agent.update_slow()
     assert slow_metrics["window_count"] == 6
     assert not np.isclose(slow_metrics["trajectory_return_mean"], immediate_mean)
+    assert slow_metrics["window_critic_replay_size"] == 6
+    assert np.isfinite(slow_metrics["window_critic_value_loss"])
+    assert np.isfinite(slow_metrics["window_critic_holdout_explained_variance"])
 
 
 def test_fast_only_rollout_records_only_fast_buffer():
@@ -656,21 +680,21 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     agent.slow_agent.placement_updates_completed = 128
     assert np.isclose(agent.slow_agent.placement_entropy_schedule_coefficient(), 0.0035)
     agent.slow_agent.placement_updates_completed = 0
-    assert np.isclose(agent.fast_agent.ppo.optimizer.param_groups[0]["lr"], 2e-4)
-    assert np.isclose(agent.fast_agent.ppo.entropy_coef, 0.001)
+    assert np.isclose(agent.fast_agent.ppo.optimizer.param_groups[0]["lr"], 1e-4)
+    assert np.isclose(agent.fast_agent.ppo.entropy_coef, 0.002)
     assert agent.slow_agent.count_global_advantage_coef == 0.25
     assert agent.slow_agent.placement_global_advantage_coef == 0.35
-    assert agent.slow_idle_replica_coef == 0.05
+    assert agent.slow_idle_replica_coef == 0.15
     assert agent.slow_placement_idle_coef == 0.02
 
     empty_fast_metrics = agent.fast_agent.update()
-    assert np.isclose(empty_fast_metrics["entropy_coef"], 0.001)
-    assert np.isclose(empty_fast_metrics["entropy_next_coef"], 0.001)
-    assert np.isclose(agent.fast_agent.entropy_current_coef, 0.001)
+    assert np.isclose(empty_fast_metrics["entropy_coef"], 0.002)
+    assert np.isclose(empty_fast_metrics["entropy_next_coef"], 0.002)
+    assert np.isclose(agent.fast_agent.entropy_current_coef, 0.002)
 
     agent.slow_agent.placement_entropy_current_coef = 0.005
-    adapted_coef = agent.slow_agent._adapt_placement_entropy_coefficient(observed_entropy=1.0)
-    assert np.isclose(adapted_coef, 0.0054)
+    adapted_coef = agent.slow_agent._adapt_placement_entropy_coefficient(observed_entropy=0.1)
+    assert np.isclose(adapted_coef, 0.00545)
 
     def count_two(state, mask, deterministic=False):
         assert mask[1]
@@ -803,6 +827,7 @@ def test_slow_count_return_uses_dense_latency_and_continuous_replica_credit():
         slow_reward_scale=1.0,
         slow_count_latency_coef=1.0,
         slow_idle_replica_coef=1.0,
+        slow_count_capacity_coef=0.0,
         slow_count_shortage_coef=0.0,
         slow_deployment_memory_coef=0.0,
         slow_deployment_storage_coef=0.0,
@@ -826,7 +851,8 @@ def test_slow_count_return_uses_dense_latency_and_continuous_replica_credit():
     concentrated_returns, _, concentrated_metrics = agent._factorized_stage_returns(env)
     assert np.isclose(concentrated_metrics["slow_count_effective_replicas_per_stage"], 1.0)
     assert np.isclose(concentrated_metrics["slow_count_redundant_replica_fraction"], 0.75)
-    assert np.isclose(concentrated_returns[stage_key], -0.95)
+    assert np.isclose(concentrated_metrics["slow_count_redundant_replica_ratio"], 3.0)
+    assert np.isclose(concentrated_returns[stage_key], -3.2)
 
 
 def test_slow_window_return_includes_tail_latency_feedback():
