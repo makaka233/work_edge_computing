@@ -1088,6 +1088,8 @@ class PPOAgent:
         sample_weights: np.ndarray | None = None,
         advantage_group_ids: np.ndarray | None = None,
         actor_use_value_baseline: bool = True,
+        auxiliary_advantages: np.ndarray | None = None,
+        auxiliary_advantage_coef: float = 0.0,
         progress_label: str = "",
         progress_interval_seconds: float = 0.0,
     ) -> dict[str, float]:
@@ -1111,9 +1113,15 @@ class PPOAgent:
                 "approx_kl": 0.0,
                 "advantage_mean": 0.0,
                 "advantage_std": 0.0,
+                "auxiliary_advantage_mean": 0.0,
+                "auxiliary_advantage_std": 0.0,
+                "auxiliary_advantage_coef": float(auxiliary_advantage_coef),
+                "combined_advantage_std": 0.0,
                 "explained_variance": 0.0,
                 "post_explained_variance": 0.0,
             }
+        if not np.isfinite(auxiliary_advantage_coef) or auxiliary_advantage_coef < 0.0:
+            raise ValueError("auxiliary_advantage_coef must be finite and non-negative")
         returns_np = np.asarray(returns, dtype=np.float32)
         if returns_np.shape != (n,):
             raise ValueError(f"returns must have shape ({n},), got {returns_np.shape}")
@@ -1152,6 +1160,48 @@ class PPOAgent:
         else:
             advantages_np = advantages_np - advantage_mean
 
+        auxiliary_advantage_mean = 0.0
+        auxiliary_advantage_std = 0.0
+        if auxiliary_advantages is not None:
+            auxiliary_np = np.asarray(auxiliary_advantages, dtype=np.float32)
+            if auxiliary_np.shape != (n,):
+                raise ValueError(f"auxiliary_advantages must have shape ({n},), got {auxiliary_np.shape}")
+            if not np.isfinite(auxiliary_np).all():
+                raise ValueError("auxiliary_advantages must be finite")
+            auxiliary_advantage_mean = float(np.average(auxiliary_np, weights=weights_np))
+            auxiliary_variance = float(
+                np.average(
+                    (auxiliary_np - auxiliary_advantage_mean) ** 2,
+                    weights=weights_np,
+                )
+            )
+            auxiliary_advantage_std = float(np.sqrt(auxiliary_variance))
+            if auxiliary_advantage_std > 1e-8:
+                auxiliary_np = (
+                    auxiliary_np - auxiliary_advantage_mean
+                ) / (auxiliary_advantage_std + 1e-8)
+            else:
+                auxiliary_np = auxiliary_np - auxiliary_advantage_mean
+            advantages_np = advantages_np + float(auxiliary_advantage_coef) * auxiliary_np
+
+        # Keep the overall PPO gradient scale stable after mixing local credit
+        # with the Slow window-level residual. The coefficient still controls
+        # their relative contribution before this final normalization.
+        combined_advantage_mean = float(np.average(advantages_np, weights=weights_np))
+        combined_advantage_variance = float(
+            np.average(
+                (advantages_np - combined_advantage_mean) ** 2,
+                weights=weights_np,
+            )
+        )
+        combined_advantage_std = float(np.sqrt(combined_advantage_variance))
+        if combined_advantage_std > 1e-8:
+            advantages_np = (
+                advantages_np - combined_advantage_mean
+            ) / (combined_advantage_std + 1e-8)
+        else:
+            advantages_np = advantages_np - combined_advantage_mean
+
         return_variance = float(np.average((returns_np - np.average(returns_np, weights=weights_np)) ** 2, weights=weights_np))
         residual_variance = float(
             np.average(
@@ -1187,6 +1237,10 @@ class PPOAgent:
             "clip_fraction": 0.0,
             "advantage_mean": advantage_mean,
             "advantage_std": advantage_std,
+            "auxiliary_advantage_mean": auxiliary_advantage_mean,
+            "auxiliary_advantage_std": auxiliary_advantage_std,
+            "auxiliary_advantage_coef": float(auxiliary_advantage_coef),
+            "combined_advantage_std": combined_advantage_std,
         }
         optimizer_steps = 0
         epochs_completed = 0
@@ -1247,6 +1301,10 @@ class PPOAgent:
                     "clip_fraction": float(clip_fraction.item()),
                     "advantage_mean": advantage_mean,
                     "advantage_std": advantage_std,
+                    "auxiliary_advantage_mean": auxiliary_advantage_mean,
+                    "auxiliary_advantage_std": auxiliary_advantage_std,
+                    "auxiliary_advantage_coef": float(auxiliary_advantage_coef),
+                    "combined_advantage_std": combined_advantage_std,
                     "explained_variance": explained_variance,
                 }
                 if progress is not None:

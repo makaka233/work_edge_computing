@@ -120,22 +120,27 @@ detached from the actor graph encoder so value fitting cannot flatten node score
 Placement actor returns are centered within the same service stage before
 normalization, making the policy compare alternative nodes rather than unrelated
 absolute latency scales across stages. Placement uses an independent `1.5e-4`
-learning rate and `0.015` KL limit. Its entropy coefficient starts at `0.005`
-and decays linearly to `0.003` over 16 completed Slow PPO updates. This preserves
-early node exploration without holding the deployment policy at the higher
-exploration pressure after it has collected several full Slow batches. The
-active coefficient and completed Placement-update count are written to each
+learning rate and `0.015` KL limit. Its entropy coefficient starts at `0.005`,
+is held for 64 completed Slow updates, then its scheduled floor decays to
+`0.0035` over another 64 updates. An adaptive controller raises the coefficient,
+up to `0.015`, whenever observed Placement entropy falls below the default target
+of `1.8`. The active, next, and scheduled coefficients are written to every
 training row.
 Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
 and deadline violations penalize under-provisioning, while a continuous effective-
 replica measure based on request shares penalizes replicas that add little usable
-capacity. This avoids treating a replica as fully useful merely because it handled
-one request during a high-traffic window. Placement still trains its value head.
+capacity. Because low-entropy Fast routing can make useful fallback replicas look
+idle, the Count redundancy coefficient is conservatively reduced from `0.25` to
+`0.05`, and the Placement idle coefficient from `0.10` to `0.02`. Placement still
+trains its value head.
 Count instead uses direct stage-centered returns with
 `--slow-count-value-coef 0` by default, so its failed critic cannot dominate the
 shared graph encoder; value loss and explained variance remain logged for ablation
-diagnostics but are not optimized. The
-separate window critic remains as a high-level diagnostic. Fast PPO receives an additive stage-local latency reward
+diagnostics but are not optimized. The separate window critic now supplies a
+standardized 10-minute residual to both actors. Count mixes it with coefficient
+`0.25`, Placement with `0.35`, after their local returns have been centered within
+comparable service stages. This keeps local credit while making both actors answer
+to the system-level window outcome. Fast PPO receives an additive stage-local latency reward
 plus the exact KKT difference reward for compute/link congestion imposed on other
 requests. Requests are inferred in microbatches (default 16); after each
 microbatch a virtual workload ledger reserves the selected-node work so later
@@ -160,6 +165,10 @@ epoch boundaries. This prevents one noisy or high-volume load minibatch from
 discarding the remaining load signals. The training log records optimizer steps,
 sample and minimum-load coverage, full-buffer/worst-load KL, and serialized per-load
 KL/clip fractions. Both options have `--no-...` forms for ablation runs.
+Fast entropy also has a default floor target of `0.7`: its coefficient starts at
+`0.001` and adapts only when Fast actually updates, up to `0.01`. This prevents
+Slow-only phases from changing Fast exploration state and counters the observed
+late concentration onto a small replica subset.
 Four Slow warm-up updates then collect the configured episode batch with the now-trained Fast
 policy frozen but still sampled stochastically. This exposes the utility of
 alternative replicas instead of labelling everything outside deterministic Fast's

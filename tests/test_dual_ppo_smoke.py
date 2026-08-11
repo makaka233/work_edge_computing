@@ -113,6 +113,31 @@ def test_count_actor_can_bypass_failed_value_baseline():
     assert np.isclose(metrics["advantage_std"], np.sqrt(10.0))
 
 
+def test_component_actor_mixes_normalized_window_advantage():
+    ppo = PPOAgent(obs_dim=2, action_dim=2, hidden_dim=8, k_epochs=1, minibatch_size=4)
+    mask = np.asarray([True, True])
+    for index in range(4):
+        state = np.asarray([float(index), 1.0], dtype=np.float32)
+        action, logprob, value = ppo.act(state, mask, deterministic=False)
+        ppo.buffer.states.append(state)
+        ppo.buffer.masks.append(mask.copy())
+        ppo.buffer.actions.append(action)
+        ppo.buffer.logprobs.append(logprob)
+        ppo.buffer.values.append(value)
+
+    metrics = ppo.update_from_returns(
+        np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.float32),
+        actor_use_value_baseline=False,
+        auxiliary_advantages=np.asarray([2.0, 2.0, -2.0, -2.0], dtype=np.float32),
+        auxiliary_advantage_coef=0.5,
+    )
+
+    assert np.isclose(metrics["auxiliary_advantage_mean"], 0.0)
+    assert np.isclose(metrics["auxiliary_advantage_std"], 2.0)
+    assert np.isclose(metrics["auxiliary_advantage_coef"], 0.5)
+    assert metrics["combined_advantage_std"] > 1.0
+
+
 def test_fast_ppo_reports_full_batch_diagnostics_and_strict_kl_stop():
     torch.manual_seed(7)
     np.random.seed(7)
@@ -244,7 +269,9 @@ def test_dual_ppo_rollout_and_update():
     assert losses["slow"]["window_count"] == 1
     assert np.isclose(losses["slow"]["placement_entropy_coef"], 0.005)
     assert losses["slow"]["placement_updates_completed"] == 1
-    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.004875)
+    assert losses["slow"]["count_global_advantage_coef"] == 0.25
+    assert losses["slow"]["placement_global_advantage_coef"] == 0.35
+    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.005)
     assert np.isfinite(losses["slow"]["critic_explained_variance"])
     assert np.isfinite(losses["fast"]["loss"])
     assert len(agent.slow_agent.count_ppo.buffer) == 0
@@ -560,13 +587,28 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     assert np.isclose(agent.slow_agent.placement_ppo.target_kl, 0.015)
     assert np.isclose(agent.slow_agent.placement_ppo.entropy_coef, 0.005)
     assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.005)
-    agent.slow_agent.placement_updates_completed = 8
-    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.004)
-    agent.slow_agent.placement_updates_completed = 16
-    assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.003)
+    agent.slow_agent.placement_updates_completed = 64
+    assert np.isclose(agent.slow_agent.placement_entropy_schedule_coefficient(), 0.005)
+    agent.slow_agent.placement_updates_completed = 96
+    assert np.isclose(agent.slow_agent.placement_entropy_schedule_coefficient(), 0.00425)
+    agent.slow_agent.placement_updates_completed = 128
+    assert np.isclose(agent.slow_agent.placement_entropy_schedule_coefficient(), 0.0035)
     agent.slow_agent.placement_updates_completed = 0
     assert np.isclose(agent.fast_agent.ppo.optimizer.param_groups[0]["lr"], 2e-4)
     assert np.isclose(agent.fast_agent.ppo.entropy_coef, 0.001)
+    assert agent.slow_agent.count_global_advantage_coef == 0.25
+    assert agent.slow_agent.placement_global_advantage_coef == 0.35
+    assert agent.slow_idle_replica_coef == 0.05
+    assert agent.slow_placement_idle_coef == 0.02
+
+    empty_fast_metrics = agent.fast_agent.update()
+    assert np.isclose(empty_fast_metrics["entropy_coef"], 0.001)
+    assert np.isclose(empty_fast_metrics["entropy_next_coef"], 0.001)
+    assert np.isclose(agent.fast_agent.entropy_current_coef, 0.001)
+
+    agent.slow_agent.placement_entropy_current_coef = 0.005
+    adapted_coef = agent.slow_agent._adapt_placement_entropy_coefficient(observed_entropy=1.0)
+    assert np.isclose(adapted_coef, 0.0054)
 
     def count_two(state, mask, deterministic=False):
         assert mask[1]

@@ -26,10 +26,17 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.fast_load_balanced_updates is True
     assert args.fast_full_batch_kl_stop is True
     assert args.fast_entropy_coef == 0.001
+    assert args.fast_entropy_target == 0.7
+    assert args.fast_entropy_max_coef == 0.01
     assert args.slow_count_lr == 2e-4
     assert args.slow_placement_entropy_coef == 0.005
-    assert args.slow_placement_entropy_final_coef == 0.003
-    assert args.slow_placement_entropy_decay_updates == 16
+    assert args.slow_placement_entropy_final_coef == 0.0035
+    assert args.slow_placement_entropy_hold_updates == 64
+    assert args.slow_placement_entropy_decay_updates == 64
+    assert args.slow_count_global_advantage_coef == 0.25
+    assert args.slow_placement_global_advantage_coef == 0.35
+    assert args.slow_idle_replica_coef == 0.05
+    assert args.slow_placement_idle_coef == 0.02
     assert args.episode_minutes == 10
     assert args.episode_hours is None
     assert args.scenario_refresh_episodes == 1
@@ -251,11 +258,16 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "slow_window_count" in rows[0]
     assert "slow_critic_explained_variance" in rows[0]
     assert "slow_placement_entropy_coef" in rows[0]
+    assert "slow_placement_entropy_next_coef" in rows[0]
+    assert "slow_count_global_advantage_coef" in rows[0]
+    assert "slow_placement_global_advantage_coef" in rows[0]
     assert "slow_placement_updates_completed" in rows[0]
     assert "avg_service_memory_util" in rows[0]
     assert "active_node_rate" in rows[0]
     assert "hot_link_rate" in rows[0]
     assert "fast_optimizer_steps" in rows[0]
+    assert "fast_entropy_coef" in rows[0]
+    assert "fast_entropy_next_coef" in rows[0]
     assert "fast_samples_seen_fraction" in rows[0]
     assert "fast_min_group_seen_fraction" in rows[0]
     assert "fast_max_group_approx_kl" in rows[0]
