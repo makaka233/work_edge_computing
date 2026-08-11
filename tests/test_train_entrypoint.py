@@ -10,6 +10,7 @@ from train_dual_ppo import (
     demand_seed_for_training_rollout,
     demand_profile_summary,
     effective_replicas_per_stage,
+    load_assignments_for_update,
     load_multiplier_for_rollout,
     parse_args,
     rollout_start_minute,
@@ -40,6 +41,8 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.episode_minutes == 10
     assert args.episode_hours is None
     assert args.scenario_refresh_episodes == 1
+    assert args.demand_scenario_pool_size == 32
+    assert args.load_sampling_mode == "stratified-random"
 
 
 def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
@@ -67,6 +70,8 @@ def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
     assert args.service_resource_fraction == 0.25
     assert args.deadline_scale == 2.75
     assert args.load_multipliers == "0.8,1.1,1.4,1.7"
+    assert args.load_sampling_mode == "stratified-random"
+    assert args.load_strata == "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85"
 
 
 def test_pressure_profile_does_not_override_explicit_scale():
@@ -76,6 +81,8 @@ def test_pressure_profile_does_not_override_explicit_scale():
         active_user_request_rate_per_minute=1.75,
         traffic_scale=1.0,
         load_multipliers="0.8,1.1,1.4,1.7",
+        load_sampling_mode="stratified-random",
+        load_strata="",
         task_compute_scale=3.0,
         task_data_scale=2.0,
         node_compute_capacity_scale=0.65,
@@ -90,6 +97,31 @@ def test_pressure_profile_does_not_override_explicit_scale():
 
     assert args.task_compute_scale == 3.0
     assert args.task_data_scale == 2.5
+
+
+def test_pressure_profile_does_not_attach_default_strata_to_custom_load_anchors():
+    args = Namespace(
+        pressure_profile="mec-moderate",
+        active_user_ratio=0.15,
+        active_user_request_rate_per_minute=1.5,
+        traffic_scale=1.0,
+        load_multipliers="0.7,1.3",
+        load_sampling_mode="stratified-random",
+        load_strata="",
+        task_compute_scale=1.0,
+        task_data_scale=1.0,
+        node_compute_capacity_scale=1.0,
+        wired_link_bandwidth_scale=1.0,
+        service_resource_fraction=0.5,
+    )
+
+    apply_pressure_profile(
+        args,
+        argv=["--pressure-profile", "mec-moderate", "--load-multipliers", "0.7,1.3"],
+    )
+
+    assert args.load_multipliers == "0.7,1.3"
+    assert args.load_strata == ""
 
 
 def test_slow_collection_uses_frozen_stochastic_fast_by_default():
@@ -188,6 +220,32 @@ def test_rollout_load_and_start_modes_cycle():
 
     assert [load_multiplier_for_rollout(args, idx) for idx in range(5)] == [1.0, 1.5, 2.0, 1.0, 1.5]
     assert [rollout_start_minute(args, idx) for idx in range(7)] == [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+
+
+def test_stratified_random_loads_are_balanced_shuffled_and_reproducible():
+    args = Namespace(
+        seed=2026,
+        load_sampling_mode="stratified-random",
+        load_multipliers="0.8,1.1,1.4,1.7",
+        load_strata="0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85",
+    )
+
+    first = load_assignments_for_update(args, update_idx=0, rollouts=4)
+    repeated = load_assignments_for_update(args, update_idx=0, rollouts=4)
+    second = load_assignments_for_update(args, update_idx=1, rollouts=4)
+
+    assert first == repeated
+    assert first != second
+    assert sorted(group for _, group in first) == [0, 1, 2, 3]
+    assert [group for _, group in first] != [0, 1, 2, 3]
+    bounds = ((0.75, 0.95), (0.95, 1.20), (1.20, 1.50), (1.50, 1.85))
+    assert all(bounds[group][0] <= value <= bounds[group][1] for value, group in first)
+
+    slow_batch = load_assignments_for_update(args, update_idx=2, rollouts=16)
+    assert [group for _, group in slow_batch].count(0) == 4
+    assert [group for _, group in slow_batch].count(1) == 4
+    assert [group for _, group in slow_batch].count(2) == 4
+    assert [group for _, group in slow_batch].count(3) == 4
 
     stationary_args = Namespace(
         seed=2026,
@@ -368,6 +426,8 @@ def test_episode_rollout_unit_aligns_update_and_episode(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "1",
+        "--demand-scenario-schedule",
+        "sequential",
         "--rollout-unit",
         "episode",
         "--mean-requests-per-minute",
@@ -413,6 +473,8 @@ def test_window_rollout_unit_allows_multiple_updates_per_episode(tmp_path):
         "train_dual_ppo.py",
         "--updates",
         "2",
+        "--demand-scenario-schedule",
+        "sequential",
         "--slow-warmup-updates",
         "0",
         "--rollout-unit",
@@ -490,6 +552,8 @@ def test_window_rollout_demand_sampling_resets_each_update(tmp_path):
         "window",
         "--demand-sampling-mode",
         "rollout",
+        "--demand-scenario-schedule",
+        "sequential",
         "--mean-requests-per-minute",
         "2",
         "--num-users",
@@ -538,6 +602,8 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
         "window",
         "--demand-sampling-mode",
         "rollout",
+        "--demand-scenario-schedule",
+        "sequential",
         "--rollouts-per-update",
         "2",
         "--mean-requests-per-minute",
@@ -698,6 +764,8 @@ def test_rollouts_per_update_batches_pressure_levels_and_start_windows(tmp_path)
         "2",
         "--load-multipliers",
         "1.0,1.5",
+        "--load-sampling-mode",
+        "cyclic",
         "--rollout-start-mode",
         "cycle-window",
         "--arrival-profile",

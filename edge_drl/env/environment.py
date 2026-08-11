@@ -101,6 +101,9 @@ class EdgeEnvConfig:
     active_user_request_rate_per_minute: float = 1.5
     traffic_scale: float = 1.0
     demand_load_multiplier: float = 1.0
+    # Stable stratum identifier used for PPO credit/KL grouping when the
+    # multiplier itself is sampled continuously.
+    demand_load_group: int | None = None
     task_compute_scale: float = 1.0
     task_data_scale: float = 1.0
     node_compute_capacity_scale: float = 1.0
@@ -141,6 +144,8 @@ class EdgeEnvConfig:
             raise ValueError("traffic_scale must be positive.")
         if self.demand_load_multiplier <= 0:
             raise ValueError("demand_load_multiplier must be positive.")
+        if self.demand_load_group is not None and self.demand_load_group < 0:
+            raise ValueError("demand_load_group must be non-negative when provided.")
         if self.task_compute_scale <= 0:
             raise ValueError("task_compute_scale must be positive.")
         if self.task_data_scale <= 0:

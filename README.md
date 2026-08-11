@@ -64,7 +64,7 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ```powershell
 python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
-python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-minutes 10 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode episode --scenario-refresh-episodes 1 --fast-windows-per-update 4 --slow-windows-per-update 16 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 0.8,1.1,1.4,1.7 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-k-epochs 3 --fast-k-epochs 4 --fast-minibatch-size 512 --device cuda --run-name joint_gat_ten_minute_episodes --save-best --progress-interval-seconds 10
+python train_dual_ppo.py --train-mode joint --rollout-unit window --episode-minutes 10 --deployment-interval-minutes 10 --sampled-seconds-per-window 60 --arrival-profile stationary --demand-sampling-mode episode --scenario-refresh-episodes 1 --demand-scenario-pool-size 32 --fast-windows-per-update 4 --slow-windows-per-update 16 --updates 80 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --physical-seed 2026 --traffic-scale 1.0 --load-multipliers 0.8,1.1,1.4,1.7 --load-sampling-mode stratified-random --load-strata 0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85 --eval-rollout-unit window --eval-interval 10 --eval-seeds 1 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-k-epochs 3 --fast-k-epochs 4 --fast-minibatch-size 512 --device cuda --run-name joint_gat_ten_minute_episodes --save-best --progress-interval-seconds 10
 python scripts/run_full_training.py --episode-minutes 10 --scenario-refresh-episodes 1 --traffic-scale 1.6
 python scripts/summarize_full_training.py runs
 python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
@@ -156,11 +156,14 @@ Migration changes remain logged, but `--slow-migration-coef` defaults to zero fo
 the current convergence experiments.
 Fast and Slow PPO use alternating frozen-controller phases by default. Four Fast
 warm-up updates first learn under the conservative expected-count Slow deployment.
-Fast collection tags every transition with its demand load multiplier. By default,
-`--fast-load-balanced-updates` spreads every load level across each minibatch,
-equalizes the total optimizer weight of the load levels, and normalizes advantages
-within each load. `--fast-full-batch-kl-stop` guarantees one complete pass over all
-loads before checking the full-buffer and worst-load KL; later epochs stop only at
+Fast collection tags every transition with a stable load-stratum ID. MEC pressure
+profiles draw a continuous multiplier from each of four ranges and independently
+shuffle the four strata inside every update, so rollout position no longer predicts
+load while every Fast batch still covers low, medium, high, and overload traffic.
+By default, `--fast-load-balanced-updates` spreads every stratum across each minibatch,
+equalizes the total optimizer weight of the strata, and normalizes advantages
+within each stratum. `--fast-full-batch-kl-stop` guarantees one complete pass over all
+strata before checking the full-buffer and worst-stratum KL; later epochs stop only at
 epoch boundaries. This prevents one noisy or high-volume load minibatch from
 discarding the remaining load signals. The training log records optimizer steps,
 sample and minimum-load coverage, full-buffer/worst-load KL, and serialized per-load
@@ -192,12 +195,12 @@ Configure the cadence with `--fast-warmup-updates`, `--slow-warmup-updates`,
 `training_phase` records which policy was active.
 For a synchronized training block, use `--synchronized-window-block 4`; this
 sets both PPO update periods to four episodes and selects simultaneous mode. Four episodes are useful for a quick
-smoke run, but are usually too few for Slow PPO when four load multipliers are
-cycled because each pressure level contributes only one sample. Prefer independent
+smoke run, but are usually too few for Slow PPO when four load strata are
+sampled because each pressure level contributes only one sample. Prefer independent
 alternating collection with at least 16 Slow episodes for convergence runs. With `--demand-sampling-mode episode`
-and multiple `--load-multipliers`, the fixed user distribution is retained while
-each window in the block receives the next load multiplier, for example
-`0.8,1.1,1.4,1.7`.
+and `--load-sampling-mode stratified-random`, the fixed user distribution is retained
+while the load strata are independently shuffled and sampled. Use cyclic mode only
+to reproduce the old fixed sequence such as `0.8,1.1,1.4,1.7`.
 Training episodes use stratified temporal approximation by default:
 `--sampled-seconds-per-window 60` performs 60 neural-policy/KKT settlements that
 represent all 600 logical seconds in a ten-minute window. Instantaneous KKT
@@ -208,7 +211,7 @@ always executes the full window. Use `--sampled-seconds-per-window 0` to restore
 full training rollouts. Logs distinguish `settlement_steps`, `logical_steps`,
 and `temporal_sampling_fraction`.
 Each run also writes `logs/episode_metrics.csv` with one row per episode. It
-records the exact demand seed and load, collection update/phase, average and P95
+records the exact demand seed, continuous load, and load-group ID, collection update/phase, average and P95
 latency, average and total reward, reward components, request counts, resource
 utilization, replica usage, and completion state. If an episode spans multiple
 deployment windows or PPO updates, its windows are accumulated into one row when
@@ -235,10 +238,12 @@ check demand generalization on the same edge infrastructure, not a different
 physical network.
 
 Training demand seeds come from a deterministic shuffled pool by default
-(`--demand-scenario-schedule shuffled-pool --demand-scenario-pool-size 8`).
+(`--demand-scenario-schedule shuffled-pool --demand-scenario-pool-size 32`).
 Every pool cycle visits each demand scenario once in a new order, preventing
 harder service-popularity draws from being accidentally aligned with later PPO
-updates. Use `--demand-scenario-schedule sequential` only to reproduce the old
+updates. The demand-seed permutation and load-stratum permutation use independent
+random streams, so a seed is not permanently tied to one traffic level. Use
+`--demand-scenario-schedule sequential` only to reproduce the old
 monotonic seed schedule. Logs include expected compute, data, deadline, and
 service-popularity entropy for the active demand mix, so policy changes can be
 separated from scenario difficulty without a separate evaluation rollout.
@@ -274,8 +279,11 @@ of the fixed physical scenario for a run and remain tied to `--physical-seed`.
 For reproducible pressure experiments, `--pressure-profile mec-moderate` applies
 the following fixed-run operating point: 20% active users, 1.75 requests per active
 user per minute, 1.65x task compute, 2.5x task data, 0.65x node compute capacity,
-0.15x wired-link bandwidth, 0.25 service resource fraction, and rollout load
-multipliers `0.8,1.1,1.4,1.7` with 2.75x deadline scale. This keeps the topology, node locations, node
+0.15x wired-link bandwidth, 0.25 service resource fraction, and four continuous
+rollout-load strata `0.75:0.95`, `0.95:1.20`, `1.20:1.50`, and `1.50:1.85`
+with 2.75x deadline scale. Each update samples once per stratum for Fast (four
+times per stratum for a 16-episode Slow batch) and shuffles the order. The fixed
+anchors `0.8,1.1,1.4,1.7` remain available for deterministic comparisons. This keeps the topology, node locations, node
 tiers, service catalogue, and link classes fixed while making both compute and
 network pressure visible. `--pressure-profile mec-stress` is a stronger bounded
 ablation. Explicit scale flags override a profile, and the resolved values are
@@ -285,8 +293,8 @@ The moderate profile is intended as the first pressure test. It targets a
 moderate operating point rather than immediate saturation: if diagnostics show
 persistent infeasible actions or penalty latency, use the moderate profile as a
 calibration point before trying `mec-stress`.
-For demand-randomized convergence experiments, load multipliers can still be
-cycled across consecutive Fast windows. The stationary profile ignores rollout
+For legacy ablations, `--load-sampling-mode cyclic` restores fixed multipliers in
+their listed order. The stationary profile ignores rollout
 start modes. Use
 `--arrival-profile daily --episode-hours 24 --rollout-start-mode cycle-window`
 only for legacy experiments that intentionally model within-day timing.

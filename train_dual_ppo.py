@@ -29,6 +29,8 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
         "active_user_request_rate_per_minute": 1.75,
         "traffic_scale": 1.0,
         "load_multipliers": "0.8,1.1,1.4,1.7",
+        "load_sampling_mode": "stratified-random",
+        "load_strata": "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85",
         "task_compute_scale": 1.65,
         "task_data_scale": 2.5,
         "node_compute_capacity_scale": 0.65,
@@ -43,6 +45,8 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str]] = {
         "active_user_request_rate_per_minute": 2.0,
         "traffic_scale": 1.0,
         "load_multipliers": "0.8,1.1,1.4,1.7",
+        "load_sampling_mode": "stratified-random",
+        "load_strata": "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85",
         "task_compute_scale": 2.75,
         "task_data_scale": 4.0,
         "node_compute_capacity_scale": 0.35,
@@ -66,6 +70,10 @@ def apply_pressure_profile(args: argparse.Namespace, argv: list[str] | None = No
     }
     for field, value in profile.items():
         option = "--" + field.replace("_", "-")
+        if field == "load_strata" and "--load-multipliers" in explicit_options and option not in explicit_options:
+            # Custom anchors should not silently inherit ranges calibrated for
+            # the profile's original anchors.
+            continue
         if option not in explicit_options:
             setattr(args, field, value)
     return args
@@ -128,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--demand-scenario-pool-size",
         type=int,
-        default=8,
+        default=32,
         help="Number of demand-only scenarios in the shuffled training pool.",
     )
     parser.add_argument(
@@ -163,7 +171,29 @@ def parse_args() -> argparse.Namespace:
         "--load-multipliers",
         type=str,
         default="1.0",
-        help="Comma-separated demand load multipliers cycled across rollout seeds, e.g. 1.0,1.4,1.8,2.2.",
+        help=(
+            "Comma-separated fixed load anchors used by cyclic sampling and deterministic evaluation. "
+            "They also define zero-width strata when --load-strata is empty."
+        ),
+    )
+    parser.add_argument(
+        "--load-sampling-mode",
+        choices=["cyclic", "stratified-random"],
+        default="stratified-random",
+        help=(
+            "Use the legacy fixed cyclic order, or draw one continuous value from each load stratum "
+            "and shuffle the strata independently within every training update."
+        ),
+    )
+    parser.add_argument(
+        "--load-strata",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated low:high training ranges, e.g. "
+            "0.75:0.95,0.95:1.20,1.20:1.50,1.50:1.85. "
+            "Empty uses the fixed --load-multipliers as zero-width strata."
+        ),
     )
     parser.add_argument(
         "--rollout-start-mode",
@@ -580,7 +610,13 @@ def parse_args() -> argparse.Namespace:
     if args.train_mode == "joint" and args.rollout_unit == "requests":
         parser.error("joint training requires --rollout-unit window or episode so each slow action receives a complete return")
     try:
-        _parse_float_list(args.load_multipliers, "--load-multipliers")
+        load_anchors = _parse_float_list(args.load_multipliers, "--load-multipliers")
+        load_strata = _load_strata_for_args(args)
+        if args.load_strata:
+            if len(load_anchors) != len(load_strata):
+                raise ValueError("--load-multipliers must provide one deterministic anchor per --load-strata range")
+            if any(not low <= anchor <= high for anchor, (low, high) in zip(load_anchors, load_strata)):
+                raise ValueError("each --load-multipliers anchor must lie inside its corresponding --load-strata range")
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -605,6 +641,75 @@ def _parse_float_list(raw: str, name: str) -> tuple[float, ...]:
 def load_multiplier_for_rollout(args: argparse.Namespace, rollout_idx: int) -> float:
     multipliers = _parse_float_list(getattr(args, "load_multipliers", "1.0"), "--load-multipliers")
     return multipliers[int(rollout_idx) % len(multipliers)]
+
+
+def _parse_load_strata(raw: str, name: str = "--load-strata") -> tuple[tuple[float, float], ...]:
+    strata: list[tuple[float, float]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            low_raw, high_raw = part.split(":", 1)
+            low, high = float(low_raw), float(high_raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must contain comma-separated low:high pairs") from exc
+        if low <= 0.0 or high <= 0.0 or high < low:
+            raise ValueError(f"{name} bounds must be positive and satisfy low <= high")
+        strata.append((low, high))
+    if not strata:
+        raise ValueError(f"{name} must contain at least one low:high pair")
+    return tuple(strata)
+
+
+def _load_strata_for_args(args: argparse.Namespace) -> tuple[tuple[float, float], ...]:
+    raw = str(getattr(args, "load_strata", "")).strip()
+    if raw:
+        return _parse_load_strata(raw)
+    return tuple(
+        (value, value)
+        for value in _parse_float_list(getattr(args, "load_multipliers", "1.0"), "--load-multipliers")
+    )
+
+
+def load_group_for_rollout(args: argparse.Namespace, rollout_idx: int) -> int:
+    return int(rollout_idx) % len(_load_strata_for_args(args))
+
+
+def load_assignments_for_update(
+    args: argparse.Namespace,
+    update_idx: int,
+    rollouts: int,
+    *,
+    rollout_start_idx: int = 0,
+) -> list[tuple[float, int]]:
+    """Return reproducible load values and stable PPO credit groups for one update."""
+
+    if rollouts < 1:
+        raise ValueError("rollouts must be positive")
+    mode = getattr(args, "load_sampling_mode", "cyclic")
+    if mode == "cyclic":
+        return [
+            (
+                load_multiplier_for_rollout(args, rollout_start_idx + offset),
+                load_group_for_rollout(args, rollout_start_idx + offset),
+            )
+            for offset in range(rollouts)
+        ]
+    if mode != "stratified-random":
+        raise ValueError("load_sampling_mode must be 'cyclic' or 'stratified-random'")
+
+    strata = _load_strata_for_args(args)
+    group_ids = np.arange(rollouts, dtype=np.int64) % len(strata)
+    rng = np.random.default_rng(int(args.seed) + 910_001 + int(update_idx))
+    rng.shuffle(group_ids)
+    assignments: list[tuple[float, int]] = []
+    for group_id_raw in group_ids:
+        group_id = int(group_id_raw)
+        low, high = strata[group_id]
+        multiplier = low if np.isclose(low, high) else float(rng.uniform(low, high))
+        assignments.append((float(multiplier), group_id))
+    return assignments
 
 
 def episode_minutes_for_args(args: argparse.Namespace) -> int:
@@ -666,7 +771,7 @@ def demand_seed_for_training_rollout(args: argparse.Namespace, rollout_idx: int,
     if getattr(args, "demand_scenario_schedule", "sequential") == "sequential":
         scenario_offset = scenario_group
     else:
-        pool_size = max(int(getattr(args, "demand_scenario_pool_size", 8)), 1)
+        pool_size = max(int(getattr(args, "demand_scenario_pool_size", 32)), 1)
         pool_cycle, pool_position = divmod(scenario_group, pool_size)
         pool_rng = np.random.default_rng(int(args.seed) + 730_001 + pool_cycle)
         scenario_offset = int(pool_rng.permutation(pool_size)[pool_position])
@@ -690,6 +795,7 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
             traffic_scale=args.traffic_scale,
             demand_load_multiplier=load_multiplier_for_rollout(args, seed_offset),
+            demand_load_group=load_group_for_rollout(args, seed_offset),
             task_compute_scale=args.task_compute_scale,
             task_data_scale=args.task_data_scale,
             node_compute_capacity_scale=args.node_compute_capacity_scale,
@@ -705,8 +811,25 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
     )
 
 
-def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_idx: int) -> EdgeComputingEnv:
+def build_training_env(
+    args: argparse.Namespace,
+    *,
+    rollout_idx: int,
+    episode_idx: int,
+    load_multiplier: float | None = None,
+    load_group: int | None = None,
+) -> EdgeComputingEnv:
     demand_seed = demand_seed_for_training_rollout(args, rollout_idx, episode_idx)
+    selected_multiplier = (
+        load_multiplier_for_rollout(args, rollout_idx)
+        if load_multiplier is None
+        else float(load_multiplier)
+    )
+    selected_group = (
+        load_group_for_rollout(args, rollout_idx)
+        if load_group is None
+        else int(load_group)
+    )
     return EdgeComputingEnv(
         EdgeEnvConfig(
             seed=args.seed + rollout_idx,
@@ -722,7 +845,8 @@ def build_training_env(args: argparse.Namespace, *, rollout_idx: int, episode_id
             active_user_ratio=args.active_user_ratio,
             active_user_request_rate_per_minute=args.active_user_request_rate_per_minute,
             traffic_scale=args.traffic_scale,
-            demand_load_multiplier=load_multiplier_for_rollout(args, rollout_idx),
+            demand_load_multiplier=selected_multiplier,
+            demand_load_group=selected_group,
             task_compute_scale=args.task_compute_scale,
             task_data_scale=args.task_data_scale,
             node_compute_capacity_scale=args.node_compute_capacity_scale,
@@ -1719,6 +1843,8 @@ def build_episode_metrics_row(
         "demand_seed_end": int(last["demand_seed"]),
         "load_multiplier": float(first["load_multiplier"]),
         "load_multiplier_end": float(last["load_multiplier"]),
+        "load_group": int(first["load_group"]),
+        "load_group_end": int(last["load_group"]),
         "start_minute": float(first["start_minute"]),
         "start_minute_end": float(last["start_minute"]),
         "rollout_start": int(first["rollout"]),
@@ -2530,7 +2656,10 @@ def main() -> None:
         print("  rollout_start_mode=beginning (stationary demand; requested start modes have no effect)")
     else:
         print(f"  rollout_start_mode={args.rollout_start_mode} eval_rollout_start_mode={args.eval_rollout_start_mode}")
-    print(f"  load_multipliers={args.load_multipliers}")
+    print(
+        f"  load_multipliers={args.load_multipliers} sampling={args.load_sampling_mode} "
+        f"strata={args.load_strata or 'fixed-anchors'}"
+    )
     print(f"  scenario_refresh_episodes={args.scenario_refresh_episodes} demand_only=true")
     print(f"  reward_mode={args.reward_mode}")
     print(f"  optimizer_reward_scale={args.reward_scale}")
@@ -2663,6 +2792,8 @@ def main() -> None:
             "demand_seed_end": scenario_seed_for_offset(args, 0),
             "load_multiplier": load_multiplier_for_rollout(args, 0),
             "load_multiplier_end": load_multiplier_for_rollout(args, 0),
+            "load_group": load_group_for_rollout(args, 0),
+            "load_group_end": load_group_for_rollout(args, 0),
             "start_minute": rollout_start_minute(args, 0),
             "start_minute_end": rollout_start_minute(args, 0),
             "rollouts_collected": 0,
@@ -2967,14 +3098,21 @@ def main() -> None:
         rollout_stats: list[dict[str, float]] = []
         demand_seeds: list[int] = []
         load_multipliers: list[float] = []
+        load_groups: list[int] = []
         start_minutes: list[float] = []
         episode_numbers: list[int] = []
         window_numbers: list[int] = []
+        update_load_assignments = load_assignments_for_update(
+            args,
+            update,
+            windows_this_update,
+            rollout_start_idx=training_rollout_idx,
+        )
         for rollout_in_update in range(windows_this_update):
             rollout_idx = training_rollout_idx
             training_rollout_idx += 1
             start_minute = rollout_start_minute(args, rollout_idx)
-            load_multiplier = load_multiplier_for_rollout(args, rollout_idx)
+            load_multiplier, load_group = update_load_assignments[rollout_in_update]
             batch_suffix = (
                 ""
                 if windows_this_update <= 1
@@ -2982,13 +3120,25 @@ def main() -> None:
             )
             if args.rollout_unit == "window":
                 if args.demand_sampling_mode == "rollout":
-                    train_env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
+                    train_env = build_training_env(
+                        args,
+                        rollout_idx=rollout_idx,
+                        episode_idx=rollout_idx,
+                        load_multiplier=load_multiplier,
+                        load_group=load_group,
+                    )
                     train_env.reset()
                     start_env_at_minute(train_env, start_minute)
                     episode_number = rollout_idx + 1
                 else:
                     if train_env is None or train_env.done:
-                        train_env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=train_episode_idx)
+                        train_env = build_training_env(
+                            args,
+                            rollout_idx=rollout_idx,
+                            episode_idx=train_episode_idx,
+                            load_multiplier=load_multiplier,
+                            load_group=load_group,
+                        )
                         train_env.reset()
                     episode_number = train_episode_idx + 1
                 env = train_env
@@ -2998,6 +3148,7 @@ def main() -> None:
                     # a synchronized four-window block expose distinct load cases.
                     previous_multiplier = float(env.config.demand_load_multiplier)
                     env.config.demand_load_multiplier = float(load_multiplier)
+                    env.config.demand_load_group = int(load_group)
                     if not np.isclose(previous_multiplier, load_multiplier):
                         env.current_requests = env._generate_current_second_requests()
                         env.current_request = env.current_requests[0] if env.current_requests else None
@@ -3030,7 +3181,13 @@ def main() -> None:
                 if args.rollout_unit == "window" and one_stats["episode_complete"]:
                     train_episode_idx += 1
             else:
-                env = build_training_env(args, rollout_idx=rollout_idx, episode_idx=rollout_idx)
+                env = build_training_env(
+                    args,
+                    rollout_idx=rollout_idx,
+                    episode_idx=rollout_idx,
+                    load_multiplier=load_multiplier,
+                    load_group=load_group,
+                )
                 episode_number = rollout_idx + 1
                 demand_seed = demand_seed_for_training_rollout(args, rollout_idx, rollout_idx)
                 one_stats = rollout(
@@ -3052,6 +3209,7 @@ def main() -> None:
             rollout_stats.append(one_stats)
             demand_seeds.append(demand_seed)
             load_multipliers.append(load_multiplier)
+            load_groups.append(load_group)
             start_minutes.append(start_minute)
             episode_numbers.append(episode_number)
             window_numbers.append(window_in_episode)
@@ -3061,6 +3219,7 @@ def main() -> None:
                 "training_phase": training_phase,
                 "demand_seed": demand_seed,
                 "load_multiplier": load_multiplier,
+                "load_group": load_group,
                 "start_minute": start_minute,
                 "rollout": rollout_idx + 1,
                 "window": window_in_episode,
@@ -3097,6 +3256,8 @@ def main() -> None:
         demand_seed_end = demand_seeds[-1]
         load_multiplier = load_multipliers[0]
         load_multiplier_end = load_multipliers[-1]
+        load_group = load_groups[0]
+        load_group_end = load_groups[-1]
         start_minute = start_minutes[0]
         start_minute_end = start_minutes[-1]
         fast_metrics = agent.update_fast(
@@ -3146,6 +3307,8 @@ def main() -> None:
             "demand_seed_end": demand_seed_end,
             "load_multiplier": load_multiplier,
             "load_multiplier_end": load_multiplier_end,
+            "load_group": load_group,
+            "load_group_end": load_group_end,
             "start_minute": start_minute,
             "start_minute_end": start_minute_end,
             "rollouts_collected": len(rollout_stats),
@@ -3437,7 +3600,7 @@ def main() -> None:
             else f"episodes={episode_start_number:03d}-{episode_number:03d}"
         )
         print(
-            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} requests={} request_events={} sampled_steps={}/{} sim_hours={:.2f} episode_frac={:.1%} "
+            "update={:03d} {} demand_seed={}-{} load={:.2f}-{:.2f} start_min={:.0f}-{:.0f} rollouts={} complete={} window={:02d} group={}-{} requests={} request_events={} sampled_steps={}/{} sim_hours={:.2f} episode_frac={:.1%} "
             "avg_reward={:.4f} avg_latency={:.4f}s valid_latency={:.4f}s penalty_latency={:.4f}s train_reward={:.4f} diag_res={:.4f} slowR={:.4f} invalid={} invalid_rate={:.2%} deployments={} "
             "replicas={:.2f}/{:.0f}-{:.0f} single={:.1%} "
             "used_replica={:.1%} idle_replica={:.1%} use_entropy={:.3f} top1_use={:.1%} cross_stage={:.1%} "
@@ -3455,6 +3618,8 @@ def main() -> None:
                 len(rollout_stats),
                 int(stats["episode_complete"]),
                 window_in_episode,
+                load_group,
+                load_group_end,
                 int(stats["requests"]),
                 int(stats["request_events"]),
                 int(stats["settlement_steps"]),

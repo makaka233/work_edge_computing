@@ -981,7 +981,10 @@ class FastSchedulingPPOAgent:
                     self.ppo.buffer.actions.append(action)
                     self.ppo.buffer.logprobs.append(logprob)
                     self.ppo.buffer.values.append(value)
-                    self.ppo.buffer.sample_groups.append(float(env.config.demand_load_multiplier))
+                    load_group = env.config.demand_load_group
+                    self.ppo.buffer.sample_groups.append(
+                        float(env.config.demand_load_multiplier if load_group is None else load_group)
+                    )
         return schedules
 
     def schedule_with_diagnostics(

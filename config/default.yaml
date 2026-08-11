@@ -14,7 +14,7 @@ scenario:
   scenario_refresh_scope: demand_only
   demand_sampling_mode: episode
   demand_scenario_schedule: shuffled-pool
-  demand_scenario_pool_size: 8
+  demand_scenario_pool_size: 32
 
 time_scales:
   slow_deployment_interval_minutes: 10
@@ -31,6 +31,10 @@ traffic:
   active_user_request_rate_per_minute: 1.5
   traffic_scale: 1.0
   load_multipliers: [1.0]
+  load_sampling_mode: stratified-random
+  # MEC pressure profiles use four continuous strata and shuffle their order
+  # independently inside each update. Empty falls back to fixed anchors above.
+  load_strata: []
   pressure_profile: baseline
   # mec-moderate preset: active_ratio=0.20, active_rate=1.75/min,
   # task_compute=1.65, task_data=2.5, node_capacity=0.65,

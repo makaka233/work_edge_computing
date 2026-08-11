@@ -289,6 +289,8 @@ def test_fast_batch_inference_keeps_request_major_buffer_order():
             num_service_types=3,
             episode_hours=1,
             mean_requests_per_minute=600.0,
+            demand_load_multiplier=1.37,
+            demand_load_group=2,
         )
     )
     env.reset()
@@ -298,9 +300,7 @@ def test_fast_batch_inference_keeps_request_major_buffer_order():
 
     expected_transitions = sum(len(request.stage_compute_gcycles) for request in requests)
     assert len(agent.fast_agent.ppo.buffer) == expected_transitions
-    assert agent.fast_agent.ppo.buffer.sample_groups == [
-        env.config.demand_load_multiplier
-    ] * expected_transitions
+    assert agent.fast_agent.ppo.buffer.sample_groups == [2.0] * expected_transitions
     offset = 0
     for request_idx, request in enumerate(requests):
         for stage_id in range(len(request.stage_compute_gcycles)):
