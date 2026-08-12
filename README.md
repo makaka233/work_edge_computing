@@ -138,8 +138,12 @@ shared graph encoder; value loss and explained variance remain logged for ablati
 diagnostics but are not optimized. The separate window critic now supplies a
 standardized 10-minute residual to both actors. Count mixes it with coefficient
 `0.25`, Placement with `0.35`, after their local returns have been centered within
-comparable service stages. This keeps local credit while making both actors answer
-to the system-level window outcome. Fast PPO receives an additive stage-local latency reward
+comparable service stages. These are maximum coefficients: the effective value is
+multiplied by the critic's non-negative holdout explained variance and reaches its
+full value only at `--slow-global-advantage-ev-full 0.20`. A critic that has not yet
+predicted unseen windows therefore cannot inject noisy global credit. This keeps
+local credit while making both actors answer to the system-level window outcome
+once that residual is demonstrably useful. Fast PPO receives an additive stage-local latency reward
 plus the exact KKT difference reward for compute/link congestion imposed on other
 requests. Requests are inferred in microbatches (default 16); after each
 microbatch a virtual workload ledger reserves the selected-node work so later
@@ -172,8 +176,15 @@ Slow-only phases from changing Fast exploration state and counters the observed
 late concentration onto a small replica subset.
 Slow window rewards are discounted across the six decisions with
 `--slow-window-gamma 0.95` and stop at episode boundaries. The window critic
-learns these trajectory returns; Count and Placement retain local stage credit
-while mixing the trajectory-level residual. Because replica count is ordinal, deterministic Slow deployment
+learns these trajectory returns from a recency-weighted 96-window replay. The
+newest 12 windows are a temporal holdout and are not used for the current critic
+fit. Training uses running return normalization, Huber loss, eight critic epochs,
+and gradient clipping; logs report raw MSE plus current, replay-train, and holdout
+explained variance. Critic replay, normalization, holdout reliability, optimizer,
+and RNG state are persisted in checkpoints. Count and Placement retain local stage
+credit while mixing only the reliability-gated trajectory residual. No additional
+Count capacity or redundancy penalty is introduced by this critic change. Because
+replica count is ordinal, deterministic Slow deployment
 uses the ceiling of the Count distribution's expected replica count instead of an
 unstable categorical argmax; use `--slow-deterministic-count-mode mode` only for an
 explicit mode ablation. Count actor advantages use direct

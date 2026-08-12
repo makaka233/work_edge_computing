@@ -111,6 +111,7 @@ agent:
     slow_placement_entropy_adaptation_rate: 0.0005
     slow_count_global_advantage_coef: 0.25
     slow_placement_global_advantage_coef: 0.35
+    slow_global_advantage_ev_full: 0.20
     slow_count_lr: 0.0002
     slow_placement_lr: 0.00015
     slow_count_target_kl: 0.015
@@ -126,12 +127,17 @@ agent:
     slow_tail_latency_coef: 0.35
     slow_value_coef: 0.5
     slow_count_value_coef: 0.0
-    slow_critic_lr: 0.0003
-    slow_critic_k_epochs: 4
+    slow_critic_lr: 0.0005
+    slow_critic_k_epochs: 8
+    slow_critic_replay_windows: 96
+    slow_critic_replay_decay: 0.90
+    slow_critic_holdout_windows: 12
+    slow_critic_gradient_clip: 5.0
     slow_window_gamma: 0.95
     slow_composite_action_return: factorized_service_stage_return_per_10min_window
-    slow_count_advantage: centered_local_plus_standardized_window_critic_residual
-    slow_placement_advantage: centered_node_local_plus_standardized_window_critic_residual
+    slow_count_advantage: centered_local_plus_holdout_ev_gated_window_critic_residual
+    slow_placement_advantage: centered_node_local_plus_holdout_ev_gated_window_critic_residual
+    slow_window_critic_target: recency_weighted_running_normalized_huber
     slow_count_policy: ordered_discretized_gaussian
     slow_count_initial_scale: action_dimension_divided_by_6
     slow_count_minimum_scale: action_dimension_divided_by_12

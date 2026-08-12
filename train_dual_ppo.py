@@ -397,6 +397,12 @@ def parse_args() -> argparse.Namespace:
         help="Window-critic residual mixed into each stage-centered Placement advantage.",
     )
     parser.add_argument(
+        "--slow-global-advantage-ev-full",
+        type=float,
+        default=0.20,
+        help="Holdout explained variance at which Slow global credit reaches its configured coefficient.",
+    )
+    parser.add_argument(
         "--slow-tail-latency-coef",
         type=float,
         default=0.35,
@@ -431,8 +437,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Count critic loss coefficient. Keep at 0 when the actor uses direct stage-centered returns.",
     )
-    parser.add_argument("--slow-critic-lr", type=float, default=3e-4)
-    parser.add_argument("--slow-critic-k-epochs", type=int, default=4)
+    parser.add_argument("--slow-critic-lr", type=float, default=5e-4)
+    parser.add_argument("--slow-critic-k-epochs", type=int, default=8)
+    parser.add_argument("--slow-critic-replay-windows", type=int, default=96)
+    parser.add_argument("--slow-critic-replay-decay", type=float, default=0.90)
+    parser.add_argument("--slow-critic-holdout-windows", type=int, default=12)
+    parser.add_argument("--slow-critic-gradient-clip", type=float, default=5.0)
     parser.add_argument(
         "--slow-window-gamma",
         type=float,
@@ -629,6 +639,16 @@ def parse_args() -> argparse.Namespace:
         args.joint_training_schedule = "simultaneous"
     if args.slow_critic_k_epochs < 1:
         parser.error("--slow-critic-k-epochs must be >= 1")
+    if args.slow_critic_replay_windows < 1:
+        parser.error("--slow-critic-replay-windows must be >= 1")
+    if args.slow_critic_holdout_windows < 1:
+        parser.error("--slow-critic-holdout-windows must be >= 1")
+    if args.slow_critic_replay_windows <= args.slow_critic_holdout_windows:
+        parser.error("--slow-critic-replay-windows must exceed --slow-critic-holdout-windows")
+    if not 0.0 < args.slow_critic_replay_decay <= 1.0:
+        parser.error("--slow-critic-replay-decay must be in (0, 1]")
+    if args.slow_critic_gradient_clip <= 0.0:
+        parser.error("--slow-critic-gradient-clip must be positive")
     if not 0.0 <= args.slow_window_gamma <= 1.0:
         parser.error("--slow-window-gamma must be in [0, 1]")
     if not 0.0 <= args.slow_tail_latency_coef <= 1.0:
@@ -657,6 +677,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-placement-entropy-adaptation-rate must be >= 0")
     if args.slow_count_global_advantage_coef < 0.0 or args.slow_placement_global_advantage_coef < 0.0:
         parser.error("Slow global advantage coefficients must be >= 0")
+    if args.slow_global_advantage_ev_full <= 0.0:
+        parser.error("--slow-global-advantage-ev-full must be positive")
     if args.fast_entropy_coef < 0.0 or args.fast_entropy_target < 0.0:
         parser.error("Fast entropy coefficient and target must be >= 0")
     if args.fast_entropy_max_coef < args.fast_entropy_coef:
@@ -2620,6 +2642,26 @@ def save_checkpoint(
             "slow_placement_entropy_current_coef": agent.slow_agent.placement_entropy_current_coef,
             "slow_window_critic": agent.slow_agent.window_critic.state_dict(),
             "slow_window_critic_optimizer": agent.slow_agent.critic_optimizer.state_dict(),
+            "slow_window_critic_return_mean": agent.slow_agent.critic_return_mean,
+            "slow_window_critic_return_std": agent.slow_agent.critic_return_std,
+            "slow_window_critic_update_index": agent.slow_agent.critic_update_index,
+            "slow_window_critic_last_holdout_ev": agent.slow_agent.last_window_critic_holdout_ev,
+            "slow_window_critic_replay_states": (
+                torch.as_tensor(
+                    np.stack(agent.slow_agent.critic_replay_states),
+                    dtype=torch.float32,
+                )
+                if agent.slow_agent.critic_replay_states
+                else torch.empty((0,), dtype=torch.float32)
+            ),
+            "slow_window_critic_replay_returns": torch.as_tensor(
+                agent.slow_agent.critic_replay_returns,
+                dtype=torch.float32,
+            ),
+            "slow_window_critic_replay_update_ids": torch.as_tensor(
+                agent.slow_agent.critic_replay_update_ids,
+                dtype=torch.int64,
+            ),
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
             "fast_optimizer": agent.fast_agent.ppo.optimizer.state_dict(),
             "fast_entropy_current_coef": agent.fast_agent.entropy_current_coef,
@@ -2657,6 +2699,34 @@ def load_checkpoint(
         agent.slow_agent.window_critic.load_state_dict(checkpoint["slow_window_critic"])
     if "slow_window_critic_optimizer" in checkpoint:
         agent.slow_agent.critic_optimizer.load_state_dict(checkpoint["slow_window_critic_optimizer"])
+    if "slow_window_critic_return_mean" in checkpoint:
+        agent.slow_agent.critic_return_mean = float(
+            checkpoint["slow_window_critic_return_mean"]
+        )
+        agent.slow_agent.critic_return_std = float(
+            checkpoint["slow_window_critic_return_std"]
+        )
+        agent.slow_agent.critic_update_index = int(
+            checkpoint.get("slow_window_critic_update_index", 0)
+        )
+        agent.slow_agent.last_window_critic_holdout_ev = float(
+            checkpoint.get("slow_window_critic_last_holdout_ev", 0.0)
+        )
+        replay_states = checkpoint.get("slow_window_critic_replay_states")
+        replay_returns = checkpoint.get("slow_window_critic_replay_returns")
+        replay_update_ids = checkpoint.get("slow_window_critic_replay_update_ids")
+        if torch.is_tensor(replay_states) and replay_states.numel() > 0:
+            agent.slow_agent.critic_replay_states = [
+                state.numpy().copy() for state in replay_states.cpu()
+            ]
+        if torch.is_tensor(replay_returns):
+            agent.slow_agent.critic_replay_returns = [
+                float(value) for value in replay_returns.cpu().tolist()
+            ]
+        if torch.is_tensor(replay_update_ids):
+            agent.slow_agent.critic_replay_update_ids = [
+                int(value) for value in replay_update_ids.cpu().tolist()
+            ]
     if "fast_agent" in checkpoint:
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
     if "fast_optimizer" in checkpoint:
@@ -2791,6 +2861,7 @@ def main() -> None:
         slow_placement_entropy_adaptation_rate=args.slow_placement_entropy_adaptation_rate,
         slow_count_global_advantage_coef=args.slow_count_global_advantage_coef,
         slow_placement_global_advantage_coef=args.slow_placement_global_advantage_coef,
+        slow_global_advantage_ev_full=args.slow_global_advantage_ev_full,
         fast_entropy_coef=args.fast_entropy_coef,
         fast_entropy_target=args.fast_entropy_target,
         fast_entropy_max_coef=args.fast_entropy_max_coef,
@@ -2799,6 +2870,10 @@ def main() -> None:
         slow_count_value_coef=args.slow_count_value_coef,
         slow_critic_lr=args.slow_critic_lr,
         slow_critic_k_epochs=args.slow_critic_k_epochs,
+        slow_critic_replay_windows=args.slow_critic_replay_windows,
+        slow_critic_replay_decay=args.slow_critic_replay_decay,
+        slow_critic_holdout_windows=args.slow_critic_holdout_windows,
+        slow_critic_gradient_clip=args.slow_critic_gradient_clip,
         slow_window_gamma=args.slow_window_gamma,
         fast_value_coef=args.fast_value_coef,
         slow_target_kl=args.slow_target_kl,
@@ -2989,7 +3064,14 @@ def main() -> None:
     print(
         f"  slow_global_advantage count_coef={args.slow_count_global_advantage_coef} "
         f"placement_coef={args.slow_placement_global_advantage_coef} "
-        f"window_gamma={args.slow_window_gamma}"
+        f"ev_full={args.slow_global_advantage_ev_full} window_gamma={args.slow_window_gamma}"
+    )
+    print(
+        f"  slow_critic replay={args.slow_critic_replay_windows} "
+        f"decay={args.slow_critic_replay_decay} "
+        f"holdout={args.slow_critic_holdout_windows} "
+        f"gradient_clip={args.slow_critic_gradient_clip} "
+        "target=running_normalized_huber"
     )
     print(
         f"  ppo_target_kl count={args.slow_count_target_kl} "
@@ -3197,12 +3279,22 @@ def main() -> None:
             "slow_critic_explained_variance": np.nan,
             "slow_window_critic_explained_variance": np.nan,
             "slow_window_critic_value_loss": np.nan,
+            "slow_window_critic_raw_value_mse": np.nan,
+            "slow_window_critic_train_explained_variance": np.nan,
+            "slow_window_critic_holdout_explained_variance": np.nan,
+            "slow_window_critic_replay_size": 0,
+            "slow_window_critic_train_size": 0,
+            "slow_window_critic_holdout_size": 0,
+            "slow_window_critic_return_mean": np.nan,
+            "slow_window_critic_return_std": np.nan,
+            "slow_global_advantage_reliability": 0.0,
             "slow_count_loss": 0.0,
             "slow_count_advantage_mean": np.nan,
             "slow_count_advantage_std": np.nan,
             "slow_count_global_advantage_mean": np.nan,
             "slow_count_global_advantage_std": np.nan,
-            "slow_count_global_advantage_coef": args.slow_count_global_advantage_coef,
+            "slow_count_global_advantage_coef": 0.0,
+            "slow_count_global_advantage_configured_coef": args.slow_count_global_advantage_coef,
             "slow_count_combined_advantage_std": np.nan,
             "slow_count_value_loss": 0.0,
             "slow_count_explained_variance": np.nan,
@@ -3214,7 +3306,8 @@ def main() -> None:
             "slow_placement_advantage_std": np.nan,
             "slow_placement_global_advantage_mean": np.nan,
             "slow_placement_global_advantage_std": np.nan,
-            "slow_placement_global_advantage_coef": args.slow_placement_global_advantage_coef,
+            "slow_placement_global_advantage_coef": 0.0,
+            "slow_placement_global_advantage_configured_coef": args.slow_placement_global_advantage_coef,
             "slow_placement_combined_advantage_std": np.nan,
             "slow_placement_value_loss": 0.0,
             "slow_placement_explained_variance": np.nan,
@@ -3789,6 +3882,33 @@ def main() -> None:
             "slow_window_critic_value_loss": losses["slow"].get(
                 "window_critic_value_loss", np.nan
             ),
+            "slow_window_critic_raw_value_mse": losses["slow"].get(
+                "window_critic_raw_value_mse", np.nan
+            ),
+            "slow_window_critic_train_explained_variance": losses["slow"].get(
+                "window_critic_train_explained_variance", np.nan
+            ),
+            "slow_window_critic_holdout_explained_variance": losses["slow"].get(
+                "window_critic_holdout_explained_variance", np.nan
+            ),
+            "slow_window_critic_replay_size": losses["slow"].get(
+                "window_critic_replay_size", 0.0
+            ),
+            "slow_window_critic_train_size": losses["slow"].get(
+                "window_critic_train_size", 0.0
+            ),
+            "slow_window_critic_holdout_size": losses["slow"].get(
+                "window_critic_holdout_size", 0.0
+            ),
+            "slow_window_critic_return_mean": losses["slow"].get(
+                "window_critic_return_mean", np.nan
+            ),
+            "slow_window_critic_return_std": losses["slow"].get(
+                "window_critic_return_std", np.nan
+            ),
+            "slow_global_advantage_reliability": losses["slow"].get(
+                "global_advantage_reliability", 0.0
+            ),
             "slow_count_loss": losses["slow"].get("count_loss", np.nan),
             "slow_count_advantage_mean": losses["slow"].get("count_advantage_mean", np.nan),
             "slow_count_advantage_std": losses["slow"].get("count_advantage_std", np.nan),
@@ -3799,7 +3919,11 @@ def main() -> None:
                 "count_global_advantage_std", np.nan
             ),
             "slow_count_global_advantage_coef": losses["slow"].get(
-                "count_global_advantage_coef", args.slow_count_global_advantage_coef
+                "count_global_advantage_coef", 0.0
+            ),
+            "slow_count_global_advantage_configured_coef": losses["slow"].get(
+                "count_global_advantage_configured_coef",
+                args.slow_count_global_advantage_coef,
             ),
             "slow_count_combined_advantage_std": losses["slow"].get(
                 "count_combined_advantage_std", np.nan
@@ -3825,7 +3949,11 @@ def main() -> None:
                 "placement_global_advantage_std", np.nan
             ),
             "slow_placement_global_advantage_coef": losses["slow"].get(
-                "placement_global_advantage_coef", args.slow_placement_global_advantage_coef
+                "placement_global_advantage_coef", 0.0
+            ),
+            "slow_placement_global_advantage_configured_coef": losses["slow"].get(
+                "placement_global_advantage_configured_coef",
+                args.slow_placement_global_advantage_coef,
             ),
             "slow_placement_combined_advantage_std": losses["slow"].get(
                 "placement_combined_advantage_std", np.nan

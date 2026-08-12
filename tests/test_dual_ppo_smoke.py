@@ -32,6 +32,43 @@ def test_slow_discounted_returns_stop_at_episode_boundaries():
     np.testing.assert_allclose(returns, [2.75, 3.5, 3.0, 20.0, 20.0])
 
 
+def test_slow_window_critic_uses_temporal_holdout_and_replay():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=101,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    slow = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4).slow_agent
+    obs_dim = slow_obs_dim(16, 3)
+
+    slow.window_states = [
+        np.full(obs_dim, index / 12.0, dtype=np.float32) for index in range(12)
+    ]
+    first = slow._update_window_critic(np.linspace(-20.0, -5.0, 12, dtype=np.float32))
+    assert first["replay_size"] == 12.0
+    assert first["train_size"] == 0.0
+    assert first["holdout_size"] == 12.0
+
+    slow.window_states = [
+        np.full(obs_dim, 1.0 + index / 12.0, dtype=np.float32) for index in range(12)
+    ]
+    second = slow._update_window_critic(np.linspace(-18.0, -3.0, 12, dtype=np.float32))
+    assert second["replay_size"] == 24.0
+    assert second["train_size"] == 12.0
+    assert second["holdout_size"] == 12.0
+    assert np.isfinite(second["value_loss"])
+    assert np.isfinite(second["raw_value_mse"])
+    assert np.isfinite(second["train_explained_variance"])
+    assert np.isfinite(second["holdout_explained_variance"])
+    assert slow.critic_return_std > 0.0
+
+
 def test_count_advantages_are_centered_within_service_stage():
     advantages = np.asarray([10.0, 14.0, -5.0, 3.0], dtype=np.float32)
     weights = np.asarray([1.0, 3.0, 2.0, 2.0], dtype=np.float32)
@@ -296,8 +333,15 @@ def test_dual_ppo_rollout_and_update():
     assert losses["slow"]["window_count"] == 1
     assert np.isclose(losses["slow"]["placement_entropy_coef"], 0.005)
     assert losses["slow"]["placement_updates_completed"] == 1
-    assert losses["slow"]["count_global_advantage_coef"] == 0.25
-    assert losses["slow"]["placement_global_advantage_coef"] == 0.35
+    assert losses["slow"]["count_global_advantage_coef"] == 0.0
+    assert losses["slow"]["placement_global_advantage_coef"] == 0.0
+    assert losses["slow"]["count_global_advantage_configured_coef"] == 0.25
+    assert losses["slow"]["placement_global_advantage_configured_coef"] == 0.35
+    assert losses["slow"]["global_advantage_reliability"] == 0.0
+    assert losses["slow"]["window_critic_replay_size"] == 1.0
+    assert losses["slow"]["window_critic_train_size"] == 0.0
+    assert losses["slow"]["window_critic_holdout_size"] == 1.0
+    assert np.isfinite(losses["slow"]["window_critic_holdout_explained_variance"])
     assert np.isclose(agent.slow_agent.placement_entropy_coefficient(), 0.005)
     assert np.isfinite(losses["slow"]["critic_explained_variance"])
     assert np.isfinite(losses["fast"]["loss"])
@@ -660,6 +704,18 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     assert np.isclose(agent.fast_agent.ppo.entropy_coef, 0.001)
     assert agent.slow_agent.count_global_advantage_coef == 0.25
     assert agent.slow_agent.placement_global_advantage_coef == 0.35
+    assert agent.slow_agent.global_advantage_ev_full == 0.20
+    assert agent.slow_agent.critic_replay_windows == 96
+    assert agent.slow_agent.critic_holdout_windows == 12
+    assert agent.slow_agent.critic_k_epochs == 8
+    assert np.isclose(agent.slow_agent.critic_optimizer.param_groups[0]["lr"], 5e-4)
+    agent.slow_agent.last_window_critic_holdout_ev = -0.1
+    assert agent.slow_agent.global_advantage_reliability() == 0.0
+    agent.slow_agent.last_window_critic_holdout_ev = 0.1
+    assert np.isclose(agent.slow_agent.global_advantage_reliability(), 0.5)
+    agent.slow_agent.last_window_critic_holdout_ev = 0.3
+    assert agent.slow_agent.global_advantage_reliability() == 1.0
+    agent.slow_agent.last_window_critic_holdout_ev = 0.0
     assert agent.slow_idle_replica_coef == 0.05
     assert agent.slow_placement_idle_coef == 0.02
 

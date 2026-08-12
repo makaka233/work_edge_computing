@@ -100,10 +100,15 @@ class SlowDeploymentPPOAgent:
     placement_entropy_adaptation_rate: float = 5e-4
     count_global_advantage_coef: float = 0.25
     placement_global_advantage_coef: float = 0.35
+    global_advantage_ev_full: float = 0.20
     value_coef: float = 0.5
     count_value_coef: float = 0.0
-    critic_lr: float | None = None
-    critic_k_epochs: int = 4
+    critic_lr: float | None = 5e-4
+    critic_k_epochs: int = 8
+    critic_replay_windows: int = 96
+    critic_replay_decay: float = 0.90
+    critic_holdout_windows: int = 12
+    critic_gradient_clip: float = 5.0
     window_gamma: float = 0.95
     target_kl: float | None = 0.03
     count_target_kl: float | None = 0.015
@@ -135,6 +140,13 @@ class SlowDeploymentPPOAgent:
     last_window_feedback: dict[str, float] = field(default_factory=dict)
     placement_updates_completed: int = field(default=0, init=False)
     placement_entropy_current_coef: float = field(default=0.0, init=False)
+    last_window_critic_holdout_ev: float = field(default=0.0, init=False)
+    critic_return_mean: float = field(default=0.0, init=False)
+    critic_return_std: float = field(default=1.0, init=False)
+    critic_update_index: int = field(default=0, init=False)
+    critic_replay_states: list[np.ndarray] = field(default_factory=list)
+    critic_replay_returns: list[float] = field(default_factory=list)
+    critic_replay_update_ids: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.tail_latency_coef <= 1.0:
@@ -159,8 +171,20 @@ class SlowDeploymentPPOAgent:
             raise ValueError("placement_entropy_adaptation_rate must be non-negative")
         if self.count_global_advantage_coef < 0.0 or self.placement_global_advantage_coef < 0.0:
             raise ValueError("Slow global advantage coefficients must be non-negative")
+        if self.global_advantage_ev_full <= 0.0:
+            raise ValueError("global_advantage_ev_full must be positive")
         if not 0.0 <= self.window_gamma <= 1.0:
             raise ValueError("window_gamma must be in [0, 1]")
+        if self.critic_replay_windows < 1:
+            raise ValueError("critic_replay_windows must be positive")
+        if self.critic_holdout_windows < 1:
+            raise ValueError("critic_holdout_windows must be positive")
+        if self.critic_replay_windows <= self.critic_holdout_windows:
+            raise ValueError("critic_replay_windows must exceed critic_holdout_windows")
+        if not 0.0 < self.critic_replay_decay <= 1.0:
+            raise ValueError("critic_replay_decay must be in (0, 1]")
+        if self.critic_gradient_clip <= 0.0:
+            raise ValueError("critic_gradient_clip must be positive")
         self.placement_entropy_current_coef = placement_entropy_start
         self.count_ppo = PPOAgent(
             obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types),
@@ -250,6 +274,18 @@ class SlowDeploymentPPOAgent:
         self.placement_ppo.entropy_coef = self.placement_entropy_current_coef
         return self.placement_entropy_current_coef
 
+    def global_advantage_reliability(self) -> float:
+        """Scale global credit by predictive performance on unseen recent windows."""
+
+        return float(
+            np.clip(
+                max(self.last_window_critic_holdout_ev, 0.0)
+                / self.global_advantage_ev_full,
+                0.0,
+                1.0,
+            )
+        )
+
     def plan_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> np.ndarray:
         env._require_ready()
         assert env.scenario is not None
@@ -271,7 +307,8 @@ class SlowDeploymentPPOAgent:
             window_state = self._build_window_state(env, demand, remaining_memory, remaining_storage)
             state_t = torch.as_tensor(window_state, dtype=torch.float32, device=self.device).unsqueeze(0)
             with torch.no_grad():
-                old_value = float(self.window_critic(state_t).item())
+                normalized_value = float(self.window_critic(state_t).item())
+                old_value = normalized_value * self.critic_return_std + self.critic_return_mean
             window_id = len(self.window_states)
             self.window_states.append(window_state)
             self.window_old_values.append(old_value)
@@ -469,6 +506,13 @@ class SlowDeploymentPPOAgent:
             raise ValueError("slow placement action stage keys are misaligned")
         count_returns = np.asarray(self.count_action_returns, dtype=np.float32)
         placement_returns = np.asarray(self.placement_action_returns, dtype=np.float32)
+        global_advantage_reliability = self.global_advantage_reliability()
+        effective_count_global_coef = (
+            self.count_global_advantage_coef * global_advantage_reliability
+        )
+        effective_placement_global_coef = (
+            self.placement_global_advantage_coef * global_advantage_reliability
+        )
         count_metrics = self.count_ppo.update_from_returns(
             count_returns,
             sample_weights=self._equal_window_action_weights(count_ids),
@@ -481,7 +525,7 @@ class SlowDeploymentPPOAgent:
             ),
             actor_use_value_baseline=False,
             auxiliary_advantages=window_advantages[count_ids],
-            auxiliary_advantage_coef=self.count_global_advantage_coef,
+            auxiliary_advantage_coef=effective_count_global_coef,
             progress_label=f"{progress_label} count",
             progress_interval_seconds=progress_interval_seconds,
         )
@@ -499,11 +543,14 @@ class SlowDeploymentPPOAgent:
             ),
             actor_use_value_baseline=False,
             auxiliary_advantages=window_advantages[placement_ids],
-            auxiliary_advantage_coef=self.placement_global_advantage_coef,
+            auxiliary_advantage_coef=effective_placement_global_coef,
             progress_label=f"{progress_label} placement",
             progress_interval_seconds=progress_interval_seconds,
         )
         critic_metrics = self._update_window_critic(trajectory_returns)
+        self.last_window_critic_holdout_ev = float(
+            critic_metrics["holdout_explained_variance"]
+        )
         placement_entropy_next_coef = self._adapt_placement_entropy_coefficient(
             placement_metrics.get("entropy", 0.0)
         )
@@ -546,12 +593,26 @@ class SlowDeploymentPPOAgent:
             ),
             "window_critic_explained_variance": critic_metrics["explained_variance"],
             "window_critic_value_loss": critic_metrics["value_loss"],
+            "window_critic_raw_value_mse": critic_metrics["raw_value_mse"],
+            "window_critic_train_explained_variance": critic_metrics[
+                "train_explained_variance"
+            ],
+            "window_critic_holdout_explained_variance": critic_metrics[
+                "holdout_explained_variance"
+            ],
+            "window_critic_replay_size": critic_metrics["replay_size"],
+            "window_critic_train_size": critic_metrics["train_size"],
+            "window_critic_holdout_size": critic_metrics["holdout_size"],
+            "window_critic_return_mean": self.critic_return_mean,
+            "window_critic_return_std": self.critic_return_std,
+            "global_advantage_reliability": global_advantage_reliability,
             "count_loss": count_metrics["loss"],
             "count_advantage_mean": count_metrics.get("advantage_mean", 0.0),
             "count_advantage_std": count_metrics.get("advantage_std", 0.0),
             "count_global_advantage_mean": count_metrics.get("auxiliary_advantage_mean", 0.0),
             "count_global_advantage_std": count_metrics.get("auxiliary_advantage_std", 0.0),
-            "count_global_advantage_coef": self.count_global_advantage_coef,
+            "count_global_advantage_coef": effective_count_global_coef,
+            "count_global_advantage_configured_coef": self.count_global_advantage_coef,
             "count_combined_advantage_std": count_metrics.get("combined_advantage_std", 0.0),
             "count_policy_loss": count_metrics["policy_loss"],
             "count_value_loss": count_metrics["value_loss"],
@@ -564,7 +625,8 @@ class SlowDeploymentPPOAgent:
             "placement_advantage_std": placement_metrics.get("advantage_std", 0.0),
             "placement_global_advantage_mean": placement_metrics.get("auxiliary_advantage_mean", 0.0),
             "placement_global_advantage_std": placement_metrics.get("auxiliary_advantage_std", 0.0),
-            "placement_global_advantage_coef": self.placement_global_advantage_coef,
+            "placement_global_advantage_coef": effective_placement_global_coef,
+            "placement_global_advantage_configured_coef": self.placement_global_advantage_coef,
             "placement_combined_advantage_std": placement_metrics.get("combined_advantage_std", 0.0),
             "placement_policy_loss": placement_metrics["policy_loss"],
             "placement_value_loss": placement_metrics["value_loss"],
@@ -604,12 +666,22 @@ class SlowDeploymentPPOAgent:
             "critic_explained_variance": 0.0,
             "window_critic_explained_variance": 0.0,
             "window_critic_value_loss": 0.0,
+            "window_critic_raw_value_mse": 0.0,
+            "window_critic_train_explained_variance": 0.0,
+            "window_critic_holdout_explained_variance": self.last_window_critic_holdout_ev,
+            "window_critic_replay_size": float(len(self.critic_replay_returns)),
+            "window_critic_train_size": 0.0,
+            "window_critic_holdout_size": 0.0,
+            "window_critic_return_mean": self.critic_return_mean,
+            "window_critic_return_std": self.critic_return_std,
+            "global_advantage_reliability": self.global_advantage_reliability(),
             "count_loss": 0.0,
             "count_advantage_mean": 0.0,
             "count_advantage_std": 0.0,
             "count_global_advantage_mean": 0.0,
             "count_global_advantage_std": 0.0,
-            "count_global_advantage_coef": self.count_global_advantage_coef,
+            "count_global_advantage_coef": 0.0,
+            "count_global_advantage_configured_coef": self.count_global_advantage_coef,
             "count_combined_advantage_std": 0.0,
             "count_policy_loss": 0.0,
             "count_value_loss": 0.0,
@@ -622,7 +694,8 @@ class SlowDeploymentPPOAgent:
             "placement_advantage_std": 0.0,
             "placement_global_advantage_mean": 0.0,
             "placement_global_advantage_std": 0.0,
-            "placement_global_advantage_coef": self.placement_global_advantage_coef,
+            "placement_global_advantage_coef": 0.0,
+            "placement_global_advantage_configured_coef": self.placement_global_advantage_coef,
             "placement_combined_advantage_std": 0.0,
             "placement_policy_loss": 0.0,
             "placement_value_loss": 0.0,
@@ -646,22 +719,124 @@ class SlowDeploymentPPOAgent:
         return np.asarray([1.0 / max(float(counts[idx]), 1.0) for idx in window_ids], dtype=np.float32)
 
     def _update_window_critic(self, returns: np.ndarray) -> dict[str, float]:
-        states = torch.as_tensor(np.stack(self.window_states), dtype=torch.float32, device=self.device)
-        targets = torch.as_tensor(returns, dtype=torch.float32, device=self.device)
+        current_states = np.stack(self.window_states).astype(np.float32, copy=False)
+        current_returns = np.asarray(returns, dtype=np.float32)
+        self.critic_update_index += 1
+        self.critic_replay_states.extend(state.copy() for state in current_states)
+        self.critic_replay_returns.extend(float(value) for value in current_returns)
+        self.critic_replay_update_ids.extend(
+            [self.critic_update_index] * len(current_returns)
+        )
+        excess = len(self.critic_replay_returns) - self.critic_replay_windows
+        if excess > 0:
+            del self.critic_replay_states[:excess]
+            del self.critic_replay_returns[:excess]
+            del self.critic_replay_update_ids[:excess]
+
+        replay_states = np.stack(self.critic_replay_states).astype(np.float32, copy=False)
+        replay_returns = np.asarray(self.critic_replay_returns, dtype=np.float32)
+        replay_update_ids = np.asarray(self.critic_replay_update_ids, dtype=np.int64)
+        holdout_count = min(self.critic_holdout_windows, len(replay_returns))
+        train_end = len(replay_returns) - holdout_count
+        train_indices = np.arange(train_end, dtype=np.int64)
+        holdout_indices = np.arange(train_end, len(replay_returns), dtype=np.int64)
+
         value_loss = 0.0
-        for _ in range(max(self.critic_k_epochs, 1)):
-            values = self.window_critic(states)
-            loss = nn.functional.mse_loss(values, targets)
-            self.critic_optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.window_critic.parameters(), 0.5)
-            self.critic_optimizer.step()
-            value_loss = float(loss.item())
-        with torch.no_grad():
-            predictions = self.window_critic(states).detach().cpu().numpy()
-        target_variance = float(np.var(returns))
-        explained_variance = 0.0 if target_variance <= 1e-8 else 1.0 - float(np.var(returns - predictions)) / target_variance
-        return {"value_loss": value_loss, "explained_variance": explained_variance}
+        if len(train_indices) > 0:
+            train_weights = np.power(
+                float(self.critic_replay_decay),
+                (self.critic_update_index - replay_update_ids[train_indices]).astype(
+                    np.float64
+                ),
+            ).astype(np.float32)
+            train_weights /= max(float(train_weights.mean()), 1e-8)
+            weighted_mean = float(
+                np.average(replay_returns[train_indices], weights=train_weights)
+            )
+            weighted_variance = float(
+                np.average(
+                    np.square(replay_returns[train_indices] - weighted_mean),
+                    weights=train_weights,
+                )
+            )
+            self.critic_return_mean = weighted_mean
+            self.critic_return_std = max(float(np.sqrt(weighted_variance)), 1e-3)
+
+            minibatch_size = min(32, len(train_indices))
+            for _ in range(max(self.critic_k_epochs, 1)):
+                order = np.random.permutation(train_indices)
+                for start in range(0, len(train_indices), minibatch_size):
+                    batch_indices = order[start : start + minibatch_size]
+                    states = torch.as_tensor(
+                        replay_states[batch_indices],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    normalized_targets = torch.as_tensor(
+                        (replay_returns[batch_indices] - self.critic_return_mean)
+                        / self.critic_return_std,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    weights = torch.as_tensor(
+                        train_weights[batch_indices],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    predictions = self.window_critic(states)
+                    losses = nn.functional.smooth_l1_loss(
+                        predictions,
+                        normalized_targets,
+                        reduction="none",
+                    )
+                    loss = (losses * weights).sum() / weights.sum().clamp_min(1e-8)
+                    self.critic_optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self.window_critic.parameters(),
+                        self.critic_gradient_clip,
+                    )
+                    self.critic_optimizer.step()
+                    value_loss = float(loss.item())
+
+        def raw_predictions(states_np: np.ndarray) -> np.ndarray:
+            if len(states_np) == 0:
+                return np.asarray([], dtype=np.float32)
+            with torch.no_grad():
+                normalized = self.window_critic(
+                    torch.as_tensor(states_np, dtype=torch.float32, device=self.device)
+                ).detach().cpu().numpy()
+            return normalized * self.critic_return_std + self.critic_return_mean
+
+        def explained_variance(targets: np.ndarray, predictions: np.ndarray) -> float:
+            if len(targets) == 0 or len(predictions) == 0:
+                return 0.0
+            target_variance = float(np.var(targets))
+            if target_variance <= 1e-8:
+                return 0.0
+            return 1.0 - float(np.var(targets - predictions)) / target_variance
+
+        current_predictions = raw_predictions(current_states)
+        train_predictions = raw_predictions(replay_states[train_indices])
+        holdout_predictions = raw_predictions(replay_states[holdout_indices])
+        return {
+            "value_loss": value_loss,
+            "raw_value_mse": float(
+                np.mean(np.square(current_returns - current_predictions))
+            ),
+            "explained_variance": explained_variance(
+                current_returns, current_predictions
+            ),
+            "train_explained_variance": explained_variance(
+                replay_returns[train_indices], train_predictions
+            ),
+            "holdout_explained_variance": explained_variance(
+                replay_returns[holdout_indices], holdout_predictions
+            ),
+            "replay_size": float(len(replay_returns)),
+            "train_size": float(len(train_indices)),
+            "holdout_size": float(len(holdout_indices)),
+        }
 
     def _build_state(
         self,
@@ -1430,14 +1605,19 @@ class HierarchicalPPOAgent:
         slow_placement_entropy_adaptation_rate: float = 5e-4,
         slow_count_global_advantage_coef: float = 0.25,
         slow_placement_global_advantage_coef: float = 0.35,
+        slow_global_advantage_ev_full: float = 0.20,
         fast_entropy_coef: float = 0.001,
         fast_entropy_target: float | None = 0.7,
         fast_entropy_max_coef: float = 0.01,
         fast_entropy_adaptation_rate: float = 5e-4,
         slow_value_coef: float = 0.5,
         slow_count_value_coef: float = 0.0,
-        slow_critic_lr: float | None = None,
-        slow_critic_k_epochs: int = 4,
+        slow_critic_lr: float | None = 5e-4,
+        slow_critic_k_epochs: int = 8,
+        slow_critic_replay_windows: int = 96,
+        slow_critic_replay_decay: float = 0.90,
+        slow_critic_holdout_windows: int = 12,
+        slow_critic_gradient_clip: float = 5.0,
         slow_window_gamma: float = 0.95,
         fast_value_coef: float = 0.5,
         slow_target_kl: float | None = 0.03,
@@ -1486,10 +1666,15 @@ class HierarchicalPPOAgent:
                 placement_entropy_adaptation_rate=slow_placement_entropy_adaptation_rate,
                 count_global_advantage_coef=slow_count_global_advantage_coef,
                 placement_global_advantage_coef=slow_placement_global_advantage_coef,
+                global_advantage_ev_full=slow_global_advantage_ev_full,
                 value_coef=slow_value_coef,
                 count_value_coef=slow_count_value_coef,
                 critic_lr=slow_critic_lr,
                 critic_k_epochs=slow_critic_k_epochs,
+                critic_replay_windows=slow_critic_replay_windows,
+                critic_replay_decay=slow_critic_replay_decay,
+                critic_holdout_windows=slow_critic_holdout_windows,
+                critic_gradient_clip=slow_critic_gradient_clip,
                 window_gamma=slow_window_gamma,
                 target_kl=slow_target_kl,
                 count_target_kl=slow_count_target_kl,
