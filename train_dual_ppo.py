@@ -2638,7 +2638,11 @@ def load_checkpoint(
     path: Path,
     random_streams: TrainingRandomStreams | None = None,
 ) -> dict[str, object]:
-    checkpoint = torch.load(path, map_location=agent.fast_agent.ppo.device)
+    # Keep serialized RNG states on the CPU.  Mapping the whole checkpoint to
+    # CUDA also moves ``torch_random_state`` to CUDA, but the default PyTorch
+    # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
+    # copy their tensors to the parameter device themselves.
+    checkpoint = torch.load(path, map_location="cpu")
     if "slow_count_agent" in checkpoint:
         agent.slow_agent.count_ppo.policy.load_state_dict(checkpoint["slow_count_agent"])
     if "slow_count_optimizer" in checkpoint:
@@ -2681,10 +2685,20 @@ def load_checkpoint(
             )
         )
     if "torch_random_state" in checkpoint:
-        torch.set_rng_state(checkpoint["torch_random_state"])
+        torch.set_rng_state(_cpu_byte_rng_state(checkpoint["torch_random_state"]))
     if torch.cuda.is_available() and checkpoint.get("torch_cuda_random_state") is not None:
-        torch.cuda.set_rng_state_all(checkpoint["torch_cuda_random_state"])
+        torch.cuda.set_rng_state_all(
+            [_cpu_byte_rng_state(state) for state in checkpoint["torch_cuda_random_state"]]
+        )
     return checkpoint.get("metadata", {})
+
+
+def _cpu_byte_rng_state(state: object) -> torch.Tensor:
+    """Canonicalize saved CPU/CUDA RNG state for PyTorch generators."""
+
+    if torch.is_tensor(state):
+        return state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    return torch.as_tensor(state, dtype=torch.uint8, device="cpu").contiguous()
 
 
 def append_log(path: Path, row: dict[str, float | int | str]) -> None:

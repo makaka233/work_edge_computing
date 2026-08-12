@@ -3,10 +3,12 @@ import sys
 import csv
 import math
 import numpy as np
+import torch
 from argparse import Namespace
 from pathlib import Path
 
 from train_dual_ppo import (
+    _cpu_byte_rng_state,
     apply_pressure_profile,
     apply_training_design,
     demand_seed_for_training_rollout,
@@ -20,6 +22,18 @@ from train_dual_ppo import (
     TrainingRandomStreams,
     use_deterministic_fast_collection,
 )
+
+
+def test_checkpoint_rng_state_is_canonicalized_for_cpu_generator():
+    original = torch.get_rng_state()
+    noncanonical = original.to(dtype=torch.int64)
+
+    restored = _cpu_byte_rng_state(noncanonical)
+
+    assert restored.device.type == "cpu"
+    assert restored.dtype == torch.uint8
+    assert restored.is_contiguous()
+    torch.set_rng_state(restored)
 
 
 def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
