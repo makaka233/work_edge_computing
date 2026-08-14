@@ -96,10 +96,11 @@ class SlowDeploymentPPOAgent:
     placement_entropy_hold_updates: int = 64
     placement_entropy_decay_updates: int = 64
     placement_entropy_target: float | None = 1.8
-    placement_entropy_max_coef: float = 0.015
-    placement_entropy_adaptation_rate: float = 5e-4
+    placement_entropy_max_coef: float = 0.05
+    placement_entropy_adaptation_rate: float = 2e-3
     count_global_advantage_coef: float = 0.25
     placement_global_advantage_coef: float = 0.35
+    placement_global_attribution_coef: float = 0.50
     global_advantage_ev_full: float = 0.20
     value_coef: float = 0.5
     count_value_coef: float = 0.0
@@ -108,6 +109,7 @@ class SlowDeploymentPPOAgent:
     critic_replay_windows: int = 96
     critic_replay_decay: float = 0.90
     critic_holdout_windows: int = 12
+    critic_holdout_episodes: int = 2
     critic_gradient_clip: float = 5.0
     window_gamma: float = 0.95
     target_kl: float | None = 0.03
@@ -136,6 +138,7 @@ class SlowDeploymentPPOAgent:
     window_old_values: list[float] = field(default_factory=list)
     window_returns: list[float] = field(default_factory=list)
     window_dones: list[bool] = field(default_factory=list)
+    window_episode_ids: list[int] = field(default_factory=list)
     pending_window_id: int | None = None
     last_window_feedback: dict[str, float] = field(default_factory=dict)
     placement_updates_completed: int = field(default=0, init=False)
@@ -147,6 +150,8 @@ class SlowDeploymentPPOAgent:
     critic_replay_states: list[np.ndarray] = field(default_factory=list)
     critic_replay_returns: list[float] = field(default_factory=list)
     critic_replay_update_ids: list[int] = field(default_factory=list)
+    critic_replay_episode_ids: list[int] = field(default_factory=list)
+    critic_episode_index: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.tail_latency_coef <= 1.0:
@@ -171,6 +176,8 @@ class SlowDeploymentPPOAgent:
             raise ValueError("placement_entropy_adaptation_rate must be non-negative")
         if self.count_global_advantage_coef < 0.0 or self.placement_global_advantage_coef < 0.0:
             raise ValueError("Slow global advantage coefficients must be non-negative")
+        if self.placement_global_attribution_coef < 0.0:
+            raise ValueError("placement_global_attribution_coef must be non-negative")
         if self.global_advantage_ev_full <= 0.0:
             raise ValueError("global_advantage_ev_full must be positive")
         if not 0.0 <= self.window_gamma <= 1.0:
@@ -179,6 +186,8 @@ class SlowDeploymentPPOAgent:
             raise ValueError("critic_replay_windows must be positive")
         if self.critic_holdout_windows < 1:
             raise ValueError("critic_holdout_windows must be positive")
+        if self.critic_holdout_episodes < 1:
+            raise ValueError("critic_holdout_episodes must be positive")
         if self.critic_replay_windows <= self.critic_holdout_windows:
             raise ValueError("critic_replay_windows must exceed critic_holdout_windows")
         if not 0.0 < self.critic_replay_decay <= 1.0:
@@ -443,6 +452,9 @@ class SlowDeploymentPPOAgent:
             raise RuntimeError("slow deployment windows must be completed in collection order")
         self.window_returns.append(float(reward))
         self.window_dones.append(bool(done))
+        self.window_episode_ids.append(self.critic_episode_index)
+        if done:
+            self.critic_episode_index += 1
         stage_returns = {} if stage_returns is None else stage_returns
         count_stage_returns = stage_returns if count_stage_returns is None else count_stage_returns
         placement_stage_returns = stage_returns if placement_stage_returns is None else placement_stage_returns
@@ -482,6 +494,8 @@ class SlowDeploymentPPOAgent:
             raise ValueError("slow deployment window states and returns are misaligned")
         if len(self.window_dones) != len(self.window_returns):
             raise ValueError("slow deployment window dones and returns are misaligned")
+        if len(self.window_episode_ids) != len(self.window_returns):
+            raise ValueError("slow deployment window episode ids and returns are misaligned")
 
         immediate_returns = np.asarray(self.window_returns, dtype=np.float32)
         trajectory_returns = _discounted_window_returns(
@@ -506,6 +520,19 @@ class SlowDeploymentPPOAgent:
             raise ValueError("slow placement action stage keys are misaligned")
         count_returns = np.asarray(self.count_action_returns, dtype=np.float32)
         placement_returns = np.asarray(self.placement_action_returns, dtype=np.float32)
+        placement_group_ids = np.asarray(
+            [
+                service_id * self.max_service_stages + stage_id
+                for service_id, stage_id in self.placement_action_stage_keys
+            ],
+            dtype=np.int64,
+        )
+        placement_action_weights = self._equal_window_action_weights(placement_ids)
+        placement_attribution = self._placement_credit_attribution(
+            placement_returns,
+            placement_group_ids,
+            placement_action_weights,
+        )
         global_advantage_reliability = self.global_advantage_reliability()
         effective_count_global_coef = (
             self.count_global_advantage_coef * global_advantage_reliability
@@ -533,17 +560,13 @@ class SlowDeploymentPPOAgent:
         self.placement_ppo.entropy_coef = placement_entropy_coef
         placement_metrics = self.placement_ppo.update_from_returns(
             placement_returns,
-            sample_weights=self._equal_window_action_weights(placement_ids),
-            advantage_group_ids=np.asarray(
-                [
-                    service_id * self.max_service_stages + stage_id
-                    for service_id, stage_id in self.placement_action_stage_keys
-                ],
-                dtype=np.int64,
-            ),
+            sample_weights=placement_action_weights,
+            advantage_group_ids=placement_group_ids,
             actor_use_value_baseline=False,
             auxiliary_advantages=window_advantages[placement_ids],
             auxiliary_advantage_coef=effective_placement_global_coef,
+            auxiliary_attribution=placement_attribution,
+            auxiliary_attribution_coef=self.placement_global_attribution_coef,
             progress_label=f"{progress_label} placement",
             progress_interval_seconds=progress_interval_seconds,
         )
@@ -565,6 +588,7 @@ class SlowDeploymentPPOAgent:
         self.window_old_values.clear()
         self.window_returns.clear()
         self.window_dones.clear()
+        self.window_episode_ids.clear()
         return {
             "loss": count_metrics["loss"] + placement_metrics["loss"] + self.value_coef * critic_metrics["value_loss"],
             "policy_loss": count_metrics["policy_loss"] + placement_metrics["policy_loss"],
@@ -603,6 +627,8 @@ class SlowDeploymentPPOAgent:
             "window_critic_replay_size": critic_metrics["replay_size"],
             "window_critic_train_size": critic_metrics["train_size"],
             "window_critic_holdout_size": critic_metrics["holdout_size"],
+            "window_critic_train_episode_count": critic_metrics["train_episode_count"],
+            "window_critic_holdout_episode_count": critic_metrics["holdout_episode_count"],
             "window_critic_return_mean": self.critic_return_mean,
             "window_critic_return_std": self.critic_return_std,
             "global_advantage_reliability": global_advantage_reliability,
@@ -627,6 +653,10 @@ class SlowDeploymentPPOAgent:
             "placement_global_advantage_std": placement_metrics.get("auxiliary_advantage_std", 0.0),
             "placement_global_advantage_coef": effective_placement_global_coef,
             "placement_global_advantage_configured_coef": self.placement_global_advantage_coef,
+            "placement_global_attribution_coef": self.placement_global_attribution_coef,
+            "placement_global_attribution_mean_abs": placement_metrics.get(
+                "auxiliary_attribution_mean_abs", 0.0
+            ),
             "placement_combined_advantage_std": placement_metrics.get("combined_advantage_std", 0.0),
             "placement_policy_loss": placement_metrics["policy_loss"],
             "placement_value_loss": placement_metrics["value_loss"],
@@ -636,6 +666,14 @@ class SlowDeploymentPPOAgent:
             "placement_entropy_schedule_coef": self.placement_entropy_schedule_coefficient(),
             "placement_entropy_target": (
                 float(self.placement_entropy_target) if self.placement_entropy_target is not None else 0.0
+            ),
+            "placement_entropy_shortfall": max(
+                float(self.placement_entropy_target or 0.0)
+                - float(placement_metrics.get("entropy", 0.0)),
+                0.0,
+            ),
+            "placement_entropy_saturated": float(
+                np.isclose(placement_entropy_next_coef, self.placement_entropy_max_coef)
             ),
             "placement_updates_completed": float(self.placement_updates_completed),
             "placement_approx_kl": placement_metrics.get("approx_kl", 0.0),
@@ -672,6 +710,8 @@ class SlowDeploymentPPOAgent:
             "window_critic_replay_size": float(len(self.critic_replay_returns)),
             "window_critic_train_size": 0.0,
             "window_critic_holdout_size": 0.0,
+            "window_critic_train_episode_count": 0.0,
+            "window_critic_holdout_episode_count": 0.0,
             "window_critic_return_mean": self.critic_return_mean,
             "window_critic_return_std": self.critic_return_std,
             "global_advantage_reliability": self.global_advantage_reliability(),
@@ -696,6 +736,8 @@ class SlowDeploymentPPOAgent:
             "placement_global_advantage_std": 0.0,
             "placement_global_advantage_coef": 0.0,
             "placement_global_advantage_configured_coef": self.placement_global_advantage_coef,
+            "placement_global_attribution_coef": self.placement_global_attribution_coef,
+            "placement_global_attribution_mean_abs": 0.0,
             "placement_combined_advantage_std": 0.0,
             "placement_policy_loss": 0.0,
             "placement_value_loss": 0.0,
@@ -705,6 +747,10 @@ class SlowDeploymentPPOAgent:
             "placement_entropy_schedule_coef": self.placement_entropy_schedule_coefficient(),
             "placement_entropy_target": (
                 float(self.placement_entropy_target) if self.placement_entropy_target is not None else 0.0
+            ),
+            "placement_entropy_shortfall": 0.0,
+            "placement_entropy_saturated": float(
+                np.isclose(self.placement_entropy_coefficient(), self.placement_entropy_max_coef)
             ),
             "placement_updates_completed": float(self.placement_updates_completed),
             "placement_approx_kl": 0.0,
@@ -718,6 +764,40 @@ class SlowDeploymentPPOAgent:
         counts = np.bincount(window_ids, minlength=len(self.window_returns)).astype(np.float32)
         return np.asarray([1.0 / max(float(counts[idx]), 1.0) for idx in window_ids], dtype=np.float32)
 
+    @staticmethod
+    def _placement_credit_attribution(
+        local_returns: np.ndarray,
+        group_ids: np.ndarray,
+        sample_weights: np.ndarray,
+    ) -> np.ndarray:
+        """Score node choices relative to comparable service-stage actions.
+
+        The Slow critic emits one residual per ten-minute window.  Without this
+        attribution every node chosen in that window receives exactly the same
+        global credit.  The standardized local return preserves the mean window
+        signal while shifting bonus toward good nodes and penalty toward bad
+        nodes.
+        """
+
+        values = np.asarray(local_returns, dtype=np.float32)
+        groups = np.asarray(group_ids)
+        weights = np.asarray(sample_weights, dtype=np.float32)
+        if values.shape != groups.shape or values.shape != weights.shape:
+            raise ValueError("placement credit arrays must have matching shapes")
+        attribution = np.zeros_like(values)
+        for group_id in np.unique(groups):
+            indices = np.flatnonzero(groups == group_id)
+            group_weights = weights[indices]
+            group_values = values[indices]
+            mean = float(np.average(group_values, weights=group_weights))
+            variance = float(
+                np.average(np.square(group_values - mean), weights=group_weights)
+            )
+            std = float(np.sqrt(variance))
+            if std > 1e-8:
+                attribution[indices] = (group_values - mean) / (std + 1e-8)
+        return np.clip(attribution, -2.0, 2.0)
+
     def _update_window_critic(self, returns: np.ndarray) -> dict[str, float]:
         current_states = np.stack(self.window_states).astype(np.float32, copy=False)
         current_returns = np.asarray(returns, dtype=np.float32)
@@ -727,19 +807,30 @@ class SlowDeploymentPPOAgent:
         self.critic_replay_update_ids.extend(
             [self.critic_update_index] * len(current_returns)
         )
-        excess = len(self.critic_replay_returns) - self.critic_replay_windows
-        if excess > 0:
-            del self.critic_replay_states[:excess]
-            del self.critic_replay_returns[:excess]
-            del self.critic_replay_update_ids[:excess]
+        self.critic_replay_episode_ids.extend(self.window_episode_ids)
+        while len(self.critic_replay_returns) > self.critic_replay_windows:
+            oldest_episode = self.critic_replay_episode_ids[0]
+            drop_count = 0
+            while (
+                drop_count < len(self.critic_replay_episode_ids)
+                and self.critic_replay_episode_ids[drop_count] == oldest_episode
+            ):
+                drop_count += 1
+            del self.critic_replay_states[:drop_count]
+            del self.critic_replay_returns[:drop_count]
+            del self.critic_replay_update_ids[:drop_count]
+            del self.critic_replay_episode_ids[:drop_count]
 
         replay_states = np.stack(self.critic_replay_states).astype(np.float32, copy=False)
         replay_returns = np.asarray(self.critic_replay_returns, dtype=np.float32)
         replay_update_ids = np.asarray(self.critic_replay_update_ids, dtype=np.int64)
-        holdout_count = min(self.critic_holdout_windows, len(replay_returns))
-        train_end = len(replay_returns) - holdout_count
-        train_indices = np.arange(train_end, dtype=np.int64)
-        holdout_indices = np.arange(train_end, len(replay_returns), dtype=np.int64)
+        replay_episode_ids = np.asarray(self.critic_replay_episode_ids, dtype=np.int64)
+        unique_episodes = np.unique(replay_episode_ids)
+        holdout_episode_count = min(self.critic_holdout_episodes, len(unique_episodes))
+        holdout_episode_ids = unique_episodes[-holdout_episode_count:]
+        holdout_mask = np.isin(replay_episode_ids, holdout_episode_ids)
+        train_indices = np.flatnonzero(~holdout_mask)
+        holdout_indices = np.flatnonzero(holdout_mask)
 
         value_loss = 0.0
         if len(train_indices) > 0:
@@ -836,6 +927,8 @@ class SlowDeploymentPPOAgent:
             "replay_size": float(len(replay_returns)),
             "train_size": float(len(train_indices)),
             "holdout_size": float(len(holdout_indices)),
+            "train_episode_count": float(len(np.unique(replay_episode_ids[train_indices]))),
+            "holdout_episode_count": float(len(np.unique(replay_episode_ids[holdout_indices]))),
         }
 
     def _build_state(
@@ -1054,8 +1147,8 @@ class FastSchedulingPPOAgent:
     k_epochs: int = 4
     entropy_coef: float = 0.001
     entropy_target: float | None = 0.7
-    entropy_max_coef: float = 0.01
-    entropy_adaptation_rate: float = 5e-4
+    entropy_max_coef: float = 0.03
+    entropy_adaptation_rate: float = 2e-3
     value_coef: float = 0.5
     target_kl: float | None = 0.015
     minibatch_size: int = 512
@@ -1269,6 +1362,14 @@ class FastSchedulingPPOAgent:
         metrics["entropy_coef"] = float(entropy_coef)
         metrics["entropy_next_coef"] = self.entropy_current_coef
         metrics["entropy_target"] = float(self.entropy_target) if self.entropy_target is not None else 0.0
+        metrics["entropy_shortfall"] = (
+            max(float(self.entropy_target or 0.0) - observed_entropy, 0.0)
+            if has_samples
+            else 0.0
+        )
+        metrics["entropy_saturated"] = float(
+            np.isclose(self.entropy_current_coef, self.entropy_max_coef)
+        )
         return metrics
 
     def _build_state(
@@ -1601,15 +1702,16 @@ class HierarchicalPPOAgent:
         slow_placement_entropy_hold_updates: int = 64,
         slow_placement_entropy_decay_updates: int = 64,
         slow_placement_entropy_target: float | None = 1.8,
-        slow_placement_entropy_max_coef: float = 0.015,
-        slow_placement_entropy_adaptation_rate: float = 5e-4,
+        slow_placement_entropy_max_coef: float = 0.05,
+        slow_placement_entropy_adaptation_rate: float = 2e-3,
         slow_count_global_advantage_coef: float = 0.25,
         slow_placement_global_advantage_coef: float = 0.35,
+        slow_placement_global_attribution_coef: float = 0.50,
         slow_global_advantage_ev_full: float = 0.20,
         fast_entropy_coef: float = 0.001,
         fast_entropy_target: float | None = 0.7,
-        fast_entropy_max_coef: float = 0.01,
-        fast_entropy_adaptation_rate: float = 5e-4,
+        fast_entropy_max_coef: float = 0.03,
+        fast_entropy_adaptation_rate: float = 2e-3,
         slow_value_coef: float = 0.5,
         slow_count_value_coef: float = 0.0,
         slow_critic_lr: float | None = 5e-4,
@@ -1617,6 +1719,7 @@ class HierarchicalPPOAgent:
         slow_critic_replay_windows: int = 96,
         slow_critic_replay_decay: float = 0.90,
         slow_critic_holdout_windows: int = 12,
+        slow_critic_holdout_episodes: int = 2,
         slow_critic_gradient_clip: float = 5.0,
         slow_window_gamma: float = 0.95,
         fast_value_coef: float = 0.5,
@@ -1666,6 +1769,7 @@ class HierarchicalPPOAgent:
                 placement_entropy_adaptation_rate=slow_placement_entropy_adaptation_rate,
                 count_global_advantage_coef=slow_count_global_advantage_coef,
                 placement_global_advantage_coef=slow_placement_global_advantage_coef,
+                placement_global_attribution_coef=slow_placement_global_attribution_coef,
                 global_advantage_ev_full=slow_global_advantage_ev_full,
                 value_coef=slow_value_coef,
                 count_value_coef=slow_count_value_coef,
@@ -1674,6 +1778,7 @@ class HierarchicalPPOAgent:
                 critic_replay_windows=slow_critic_replay_windows,
                 critic_replay_decay=slow_critic_replay_decay,
                 critic_holdout_windows=slow_critic_holdout_windows,
+                critic_holdout_episodes=slow_critic_holdout_episodes,
                 critic_gradient_clip=slow_critic_gradient_clip,
                 window_gamma=slow_window_gamma,
                 target_kl=slow_target_kl,

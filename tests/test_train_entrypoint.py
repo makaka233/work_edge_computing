@@ -7,6 +7,9 @@ import torch
 from argparse import Namespace
 from pathlib import Path
 
+from edge_drl.agents.drl import HierarchicalPPOAgent
+from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
+
 from train_dual_ppo import (
     _cpu_byte_rng_state,
     apply_pressure_profile,
@@ -16,9 +19,12 @@ from train_dual_ppo import (
     effective_replicas_per_stage,
     load_assignments_for_update,
     load_multiplier_for_rollout,
+    load_adjusted_rolling_latency,
     parse_args,
+    load_checkpoint,
     rollout_start_minute,
     scenario_seed_for_offset,
+    save_checkpoint,
     TrainingRandomStreams,
     use_deterministic_fast_collection,
 )
@@ -36,6 +42,56 @@ def test_checkpoint_rng_state_is_canonicalized_for_cpu_generator():
     torch.set_rng_state(restored)
 
 
+def test_checkpoint_atomically_restores_episode_replay_and_resume_metadata(tmp_path):
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=77,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=60,
+        )
+    )
+    env.reset()
+    source = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    # Use the critic's actual input width rather than coupling the test to a
+    # hard-coded observation layout.
+    critic_width = source.slow_agent.window_critic.network[0].in_features
+    source.slow_agent.critic_replay_states = [np.zeros(critic_width, dtype=np.float32)]
+    source.slow_agent.critic_replay_returns = [-1.25]
+    source.slow_agent.critic_replay_update_ids = [7]
+    source.slow_agent.critic_replay_episode_ids = [13]
+    source.slow_agent.critic_episode_index = 14
+    source.slow_agent.placement_updates_completed = 9
+    source.slow_agent.placement_entropy_current_coef = 0.012
+    source.fast_agent.entropy_current_coef = 0.008
+    streams = TrainingRandomStreams(2026)
+    checkpoint_path = tmp_path / "latest.pt"
+    metadata = {
+        "update": 7,
+        "completed_updates": 7,
+        "completed_rollouts": 84,
+        "completed_episodes": 14,
+    }
+
+    save_checkpoint(source, checkpoint_path, metadata, streams)
+
+    assert checkpoint_path.exists()
+    assert not checkpoint_path.with_suffix(".pt.tmp").exists()
+    restored = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    restored_metadata = load_checkpoint(
+        restored,
+        checkpoint_path,
+        TrainingRandomStreams(999),
+    )
+    assert restored_metadata == metadata
+    assert restored.slow_agent.critic_replay_episode_ids == [13]
+    assert restored.slow_agent.critic_episode_index == 14
+    assert restored.slow_agent.placement_updates_completed == 9
+    assert np.isclose(restored.slow_agent.placement_entropy_current_coef, 0.012)
+    assert np.isclose(restored.fast_agent.entropy_current_coef, 0.008)
+
+
 def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_dual_ppo.py"])
     args = parse_args()
@@ -45,20 +101,25 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.fast_full_batch_kl_stop is True
     assert args.fast_entropy_coef == 0.001
     assert args.fast_entropy_target == 0.7
-    assert args.fast_entropy_max_coef == 0.01
+    assert args.fast_entropy_max_coef == 0.03
+    assert args.fast_entropy_adaptation_rate == 0.002
     assert args.slow_count_lr == 2e-4
     assert args.slow_placement_entropy_coef == 0.005
     assert args.slow_placement_entropy_final_coef == 0.0035
     assert args.slow_placement_entropy_hold_updates == 64
     assert args.slow_placement_entropy_decay_updates == 64
+    assert args.slow_placement_entropy_max_coef == 0.05
+    assert args.slow_placement_entropy_adaptation_rate == 0.002
     assert args.slow_count_global_advantage_coef == 0.25
     assert args.slow_placement_global_advantage_coef == 0.35
+    assert args.slow_placement_global_attribution_coef == 0.50
     assert args.slow_global_advantage_ev_full == 0.20
     assert args.slow_critic_lr == 5e-4
     assert args.slow_critic_k_epochs == 8
     assert args.slow_critic_replay_windows == 96
     assert args.slow_critic_replay_decay == 0.90
     assert args.slow_critic_holdout_windows == 12
+    assert args.slow_critic_holdout_episodes == 2
     assert args.slow_critic_gradient_clip == 5.0
     assert args.slow_idle_replica_coef == 0.05
     assert args.slow_placement_idle_coef == 0.02
@@ -69,6 +130,21 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.load_sampling_mode == "distribution-random"
     assert args.demand_scenario_schedule == "stream"
     assert args.training_design == "legacy-alternating"
+    assert args.save_best is True
+    assert args.best_checkpoint_window == 10
+    assert args.checkpoint_interval == 20
+
+
+def test_checkpoint_score_uses_rolling_load_adjusted_latency():
+    history = [
+        {"latency_s": 0.8 + 0.4 * load, "load_multiplier": load}
+        for load in (0.8, 1.0, 1.2, 1.4)
+    ]
+
+    score, slope = load_adjusted_rolling_latency(history, window=3, reference_load=1.1)
+
+    assert np.isclose(slope, 0.4)
+    assert np.isclose(score, 1.24)
 
 
 def test_mec_pressure_profile_scales_demand_and_fixed_capacity():

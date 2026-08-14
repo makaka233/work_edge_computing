@@ -171,18 +171,21 @@ discarding the remaining load signals. The training log records optimizer steps,
 sample and minimum-load coverage, full-buffer/worst-load KL, and serialized per-load
 KL/clip fractions. Both options have `--no-...` forms for ablation runs.
 Fast entropy also has a default floor target of `0.7`: its coefficient starts at
-`0.001` and adapts only when Fast actually updates, up to `0.01`. This prevents
+`0.001` and adapts only when Fast actually updates, up to `0.03`. This prevents
 Slow-only phases from changing Fast exploration state and counters the observed
 late concentration onto a small replica subset.
 Slow window rewards are discounted across the six decisions with
 `--slow-window-gamma 0.95` and stop at episode boundaries. The window critic
 learns these trajectory returns from a recency-weighted 96-window replay. The
-newest 12 windows are a temporal holdout and are not used for the current critic
-fit. Training uses running return normalization, Huber loss, eight critic epochs,
+newest two complete 60-minute episodes (12 windows with the default horizon) are
+an episode-aware temporal holdout and are not used for the current critic fit.
+Training uses running return normalization, Huber loss, eight critic epochs,
 and gradient clipping; logs report raw MSE plus current, replay-train, and holdout
 explained variance. Critic replay, normalization, holdout reliability, optimizer,
 and RNG state are persisted in checkpoints. Count and Placement retain local stage
-credit while mixing only the reliability-gated trajectory residual. No additional
+credit; Placement additionally redistributes the reliability-gated trajectory
+residual according to each selected node's local quality, instead of copying an
+identical residual to every placement action. No additional
 Count capacity or redundancy penalty is introduced by this critic change. Because
 replica count is ordinal, deterministic Slow deployment
 uses the ceiling of the Count distribution's expected replica count instead of an
@@ -196,6 +199,16 @@ critic ablation; doing so reintroduces shared-backbone critic gradients.
 simultaneous updates, no warm-up phases, and 12 Fast/Slow windows per update.
 Explicit batch settings must still contain a whole number of complete trajectories.
 Use `legacy-alternating` to reproduce archived one-window experiments.
+Every update atomically replaces the fully resumable `checkpoints/latest.pt`.
+`best.pt` is selected by a load-adjusted rolling latency (10 updates by default),
+`best_rolling.pt` records the first statistically eligible rolling best, and
+held-out evaluation improvements use `best_eval.pt`. Resumable periodic snapshots
+are written under `checkpoints/snapshots/` every 20 updates and the completed run
+uses `last.pt`. Change these with `--best-checkpoint-window` and
+`--checkpoint-interval`; `--no-save-best` disables only the best-model files.
+Loading `latest.pt` restores policy/critic optimizers, entropy controllers, critic
+replay and normalization, random streams, and the global update/rollout/Episode
+counters, so `--updates` means the number of additional updates to run.
 Training episodes use stratified temporal approximation by default:
 `--sampled-seconds-per-window 60` performs 60 neural-policy/KKT settlements that
 represent all 600 logical seconds in a ten-minute window. Instantaneous KKT

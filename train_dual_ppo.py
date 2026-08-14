@@ -382,8 +382,8 @@ def parse_args() -> argparse.Namespace:
         help="Completed Slow PPO updates over which Placement entropy decays after the hold period.",
     )
     parser.add_argument("--slow-placement-entropy-target", type=float, default=1.8)
-    parser.add_argument("--slow-placement-entropy-max-coef", type=float, default=0.015)
-    parser.add_argument("--slow-placement-entropy-adaptation-rate", type=float, default=5e-4)
+    parser.add_argument("--slow-placement-entropy-max-coef", type=float, default=0.05)
+    parser.add_argument("--slow-placement-entropy-adaptation-rate", type=float, default=2e-3)
     parser.add_argument(
         "--slow-count-global-advantage-coef",
         type=float,
@@ -395,6 +395,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.35,
         help="Window-critic residual mixed into each stage-centered Placement advantage.",
+    )
+    parser.add_argument(
+        "--slow-placement-global-attribution-coef",
+        type=float,
+        default=0.50,
+        help="Action-level redistribution of each window residual using node-local Placement quality.",
     )
     parser.add_argument(
         "--slow-global-advantage-ev-full",
@@ -416,8 +422,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fast-entropy-coef", type=float, default=0.001)
     parser.add_argument("--fast-entropy-target", type=float, default=0.7)
-    parser.add_argument("--fast-entropy-max-coef", type=float, default=0.01)
-    parser.add_argument("--fast-entropy-adaptation-rate", type=float, default=5e-4)
+    parser.add_argument("--fast-entropy-max-coef", type=float, default=0.03)
+    parser.add_argument("--fast-entropy-adaptation-rate", type=float, default=2e-3)
     parser.add_argument(
         "--fast-congestion-credit-coef",
         type=float,
@@ -442,6 +448,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-critic-replay-windows", type=int, default=96)
     parser.add_argument("--slow-critic-replay-decay", type=float, default=0.90)
     parser.add_argument("--slow-critic-holdout-windows", type=int, default=12)
+    parser.add_argument(
+        "--slow-critic-holdout-episodes",
+        type=int,
+        default=2,
+        help="Newest complete 60-minute episodes reserved from Slow critic optimization.",
+    )
     parser.add_argument("--slow-critic-gradient-clip", type=float, default=5.0)
     parser.add_argument(
         "--slow-window-gamma",
@@ -585,7 +597,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default="")
     parser.add_argument("--log-dir", type=str, default="")
     parser.add_argument("--save-dir", type=str, default="")
-    parser.add_argument("--save-best", action="store_true")
+    parser.add_argument(
+        "--save-best",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save robust rolling-best checkpoints (enabled by default).",
+    )
+    parser.add_argument(
+        "--best-checkpoint-window",
+        type=int,
+        default=10,
+        help="Updates in the load-adjusted rolling score used for best.pt.",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=20,
+        help="Save a resumable snapshots/update_NNNN.pt every N updates; 0 disables snapshots.",
+    )
     parser.add_argument("--append-log", action="store_true")
     parser.add_argument(
         "--progress-interval-seconds",
@@ -643,6 +672,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-critic-replay-windows must be >= 1")
     if args.slow_critic_holdout_windows < 1:
         parser.error("--slow-critic-holdout-windows must be >= 1")
+    if args.slow_critic_holdout_episodes < 1:
+        parser.error("--slow-critic-holdout-episodes must be >= 1")
     if args.slow_critic_replay_windows <= args.slow_critic_holdout_windows:
         parser.error("--slow-critic-replay-windows must exceed --slow-critic-holdout-windows")
     if not 0.0 < args.slow_critic_replay_decay <= 1.0:
@@ -675,6 +706,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-placement-entropy-max-coef must be at least the initial coefficient")
     if args.slow_placement_entropy_adaptation_rate < 0.0:
         parser.error("--slow-placement-entropy-adaptation-rate must be >= 0")
+    if args.slow_placement_global_attribution_coef < 0.0:
+        parser.error("--slow-placement-global-attribution-coef must be >= 0")
     if args.slow_count_global_advantage_coef < 0.0 or args.slow_placement_global_advantage_coef < 0.0:
         parser.error("Slow global advantage coefficients must be >= 0")
     if args.slow_global_advantage_ev_full <= 0.0:
@@ -685,6 +718,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fast-entropy-max-coef must be at least --fast-entropy-coef")
     if args.fast_entropy_adaptation_rate < 0.0:
         parser.error("--fast-entropy-adaptation-rate must be >= 0")
+    if args.best_checkpoint_window < 1:
+        parser.error("--best-checkpoint-window must be >= 1")
+    if args.checkpoint_interval < 0:
+        parser.error("--checkpoint-interval must be >= 0")
     if args.synchronized_window_block < 0:
         parser.error("--synchronized-window-block must be >= 0")
     if args.episode_minutes < 1:
@@ -2620,7 +2657,7 @@ def pretrain_fast_agent(
 def save_checkpoint(
     agent: HierarchicalPPOAgent,
     path: Path,
-    metadata: dict[str, float | int | str],
+    metadata: dict[str, object],
     random_streams: TrainingRandomStreams | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2632,8 +2669,7 @@ def save_checkpoint(
         "has_gauss": int(numpy_state[3]),
         "cached_gaussian": float(numpy_state[4]),
     }
-    torch.save(
-        {
+    checkpoint = {
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
             "slow_count_optimizer": agent.slow_agent.count_ppo.optimizer.state_dict(),
             "slow_placement_agent": agent.slow_agent.placement_ppo.policy.state_dict(),
@@ -2662,6 +2698,11 @@ def save_checkpoint(
                 agent.slow_agent.critic_replay_update_ids,
                 dtype=torch.int64,
             ),
+            "slow_window_critic_replay_episode_ids": torch.as_tensor(
+                agent.slow_agent.critic_replay_episode_ids,
+                dtype=torch.int64,
+            ),
+            "slow_window_critic_episode_index": agent.slow_agent.critic_episode_index,
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
             "fast_optimizer": agent.fast_agent.ppo.optimizer.state_dict(),
             "fast_entropy_current_coef": agent.fast_agent.entropy_current_coef,
@@ -2670,9 +2711,10 @@ def save_checkpoint(
             "torch_random_state": torch.get_rng_state(),
             "torch_cuda_random_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "metadata": metadata,
-        },
-        path,
-    )
+        }
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint, temporary_path)
+    temporary_path.replace(path)
 
 
 def load_checkpoint(
@@ -2715,6 +2757,7 @@ def load_checkpoint(
         replay_states = checkpoint.get("slow_window_critic_replay_states")
         replay_returns = checkpoint.get("slow_window_critic_replay_returns")
         replay_update_ids = checkpoint.get("slow_window_critic_replay_update_ids")
+        replay_episode_ids = checkpoint.get("slow_window_critic_replay_episode_ids")
         if torch.is_tensor(replay_states) and replay_states.numel() > 0:
             agent.slow_agent.critic_replay_states = [
                 state.numpy().copy() for state in replay_states.cpu()
@@ -2727,6 +2770,28 @@ def load_checkpoint(
             agent.slow_agent.critic_replay_update_ids = [
                 int(value) for value in replay_update_ids.cpu().tolist()
             ]
+        if torch.is_tensor(replay_episode_ids):
+            agent.slow_agent.critic_replay_episode_ids = [
+                int(value) for value in replay_episode_ids.cpu().tolist()
+            ]
+        elif agent.slow_agent.critic_replay_returns:
+            # Old checkpoints did not persist episode ids. Keep them loadable by
+            # reconstructing the historical default of six windows per episode.
+            fallback_windows_per_episode = max(
+                agent.slow_agent.critic_holdout_windows
+                // agent.slow_agent.critic_holdout_episodes,
+                1,
+            )
+            agent.slow_agent.critic_replay_episode_ids = list(
+                index // fallback_windows_per_episode
+                for index in range(len(agent.slow_agent.critic_replay_returns))
+            )
+        agent.slow_agent.critic_episode_index = int(
+            checkpoint.get(
+                "slow_window_critic_episode_index",
+                max(agent.slow_agent.critic_replay_episode_ids, default=-1) + 1,
+            )
+        )
     if "fast_agent" in checkpoint:
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
     if "fast_optimizer" in checkpoint:
@@ -2799,6 +2864,49 @@ def format_group_diagnostics(
     )
 
 
+def load_adjusted_rolling_latency(
+    history: list[dict[str, float]],
+    window: int,
+    reference_load: float,
+) -> tuple[float, float]:
+    """Return a rolling latency score corrected to one fixed demand load.
+
+    A non-negative least-squares slope is fitted over all available update
+    observations.  Checkpoint ranking then averages only the newest ``window``
+    load-adjusted observations, avoiding selection of a single easy rollout.
+    """
+
+    if window < 1:
+        raise ValueError("checkpoint rolling window must be positive")
+    finite = [
+        item
+        for item in history
+        if np.isfinite(item.get("latency_s", np.nan))
+        and np.isfinite(item.get("load_multiplier", np.nan))
+    ]
+    if not finite:
+        return float("inf"), 0.0
+    loads = np.asarray([item["load_multiplier"] for item in finite], dtype=np.float64)
+    latencies = np.asarray([item["latency_s"] for item in finite], dtype=np.float64)
+    centered_loads = loads - float(loads.mean())
+    denominator = float(np.dot(centered_loads, centered_loads))
+    slope = 0.0
+    if denominator > 1e-12:
+        slope = max(
+            float(np.dot(centered_loads, latencies - float(latencies.mean())) / denominator),
+            0.0,
+        )
+    adjusted = latencies - slope * (loads - float(reference_load))
+    return float(np.mean(adjusted[-window:])), slope
+
+
+def checkpoint_reference_load(args: argparse.Namespace) -> float:
+    strata = _load_strata_for_args(args)
+    probabilities = _load_probabilities_for_args(args, len(strata))
+    midpoints = np.asarray([(low + high) * 0.5 for low, high in strata], dtype=np.float64)
+    return float(np.dot(midpoints, np.asarray(probabilities, dtype=np.float64)))
+
+
 def make_run_paths(args: argparse.Namespace) -> tuple[str, Path, Path, Path]:
     mode_tag = args.train_mode.replace("-", "_")
     run_name = args.run_name or (
@@ -2861,6 +2969,7 @@ def main() -> None:
         slow_placement_entropy_adaptation_rate=args.slow_placement_entropy_adaptation_rate,
         slow_count_global_advantage_coef=args.slow_count_global_advantage_coef,
         slow_placement_global_advantage_coef=args.slow_placement_global_advantage_coef,
+        slow_placement_global_attribution_coef=args.slow_placement_global_attribution_coef,
         slow_global_advantage_ev_full=args.slow_global_advantage_ev_full,
         fast_entropy_coef=args.fast_entropy_coef,
         fast_entropy_target=args.fast_entropy_target,
@@ -2873,6 +2982,7 @@ def main() -> None:
         slow_critic_replay_windows=args.slow_critic_replay_windows,
         slow_critic_replay_decay=args.slow_critic_replay_decay,
         slow_critic_holdout_windows=args.slow_critic_holdout_windows,
+        slow_critic_holdout_episodes=args.slow_critic_holdout_episodes,
         slow_critic_gradient_clip=args.slow_critic_gradient_clip,
         slow_window_gamma=args.slow_window_gamma,
         fast_value_coef=args.fast_value_coef,
@@ -2914,7 +3024,7 @@ def main() -> None:
     bc_metrics = pretrain_fast_agent(
         args,
         agent,
-        requests=args.fast_bc_requests,
+        requests=0 if args.load_checkpoint else args.fast_bc_requests,
         epochs=args.fast_bc_epochs,
     )
 
@@ -3064,14 +3174,20 @@ def main() -> None:
     print(
         f"  slow_global_advantage count_coef={args.slow_count_global_advantage_coef} "
         f"placement_coef={args.slow_placement_global_advantage_coef} "
+        f"placement_attribution={args.slow_placement_global_attribution_coef} "
         f"ev_full={args.slow_global_advantage_ev_full} window_gamma={args.slow_window_gamma}"
     )
     print(
         f"  slow_critic replay={args.slow_critic_replay_windows} "
         f"decay={args.slow_critic_replay_decay} "
-        f"holdout={args.slow_critic_holdout_windows} "
+        f"holdout={args.slow_critic_holdout_episodes}episodes/"
+        f"{args.slow_critic_holdout_windows}windows(legacy) "
         f"gradient_clip={args.slow_critic_gradient_clip} "
         "target=running_normalized_huber"
+    )
+    print(
+        f"  checkpoints latest=each_update best_window={args.best_checkpoint_window} "
+        f"snapshot_interval={args.checkpoint_interval} atomic=true"
     )
     print(
         f"  ppo_target_kl count={args.slow_count_target_kl} "
@@ -3096,7 +3212,41 @@ def main() -> None:
             if path.exists():
                 path.unlink()
     write_metadata(run_dir, args, bc_metrics, loaded_metadata)
-    best_latency = float("inf")
+    resume_update_offset = int(
+        loaded_metadata.get("completed_updates", loaded_metadata.get("update", 0))
+    ) if args.load_checkpoint else 0
+    inferred_rollouts = resume_update_offset * int(args.fast_windows_per_update)
+    resume_rollout_offset = int(
+        loaded_metadata.get("completed_rollouts", inferred_rollouts)
+    ) if args.load_checkpoint else 0
+    windows_per_episode = max(
+        int(np.ceil(args.episode_minutes / args.deployment_interval_minutes)),
+        1,
+    )
+    resume_episode_offset = int(
+        loaded_metadata.get(
+            "completed_episodes",
+            resume_rollout_offset // windows_per_episode,
+        )
+    ) if args.load_checkpoint else 0
+    best_latency = float(loaded_metadata.get("best_latency_s", float("inf")))
+    best_checkpoint_score = float(
+        loaded_metadata.get("best_checkpoint_score", float("inf"))
+    )
+    best_checkpoint_ready = bool(loaded_metadata.get("best_checkpoint_ready", False))
+    raw_selection_history = loaded_metadata.get("checkpoint_selection_history", [])
+    checkpoint_selection_history: list[dict[str, float]] = []
+    if isinstance(raw_selection_history, list):
+        for item in raw_selection_history:
+            if isinstance(item, dict):
+                checkpoint_selection_history.append(
+                    {
+                        "latency_s": float(item.get("latency_s", np.nan)),
+                        "load_multiplier": float(item.get("load_multiplier", np.nan)),
+                    }
+                )
+    reference_checkpoint_load = checkpoint_reference_load(args)
+    target_update = resume_update_offset + args.updates
 
     if args.eval_baseline:
         baseline_env = build_env(args, seed_offset=20_000)
@@ -3285,6 +3435,8 @@ def main() -> None:
             "slow_window_critic_replay_size": 0,
             "slow_window_critic_train_size": 0,
             "slow_window_critic_holdout_size": 0,
+            "slow_window_critic_train_episode_count": 0,
+            "slow_window_critic_holdout_episode_count": 0,
             "slow_window_critic_return_mean": np.nan,
             "slow_window_critic_return_std": np.nan,
             "slow_global_advantage_reliability": 0.0,
@@ -3308,6 +3460,8 @@ def main() -> None:
             "slow_placement_global_advantage_std": np.nan,
             "slow_placement_global_advantage_coef": 0.0,
             "slow_placement_global_advantage_configured_coef": args.slow_placement_global_advantage_coef,
+            "slow_placement_global_attribution_coef": args.slow_placement_global_attribution_coef,
+            "slow_placement_global_attribution_mean_abs": 0.0,
             "slow_placement_combined_advantage_std": np.nan,
             "slow_placement_value_loss": 0.0,
             "slow_placement_explained_variance": np.nan,
@@ -3317,6 +3471,8 @@ def main() -> None:
             "slow_placement_entropy_next_coef": args.slow_placement_entropy_coef,
             "slow_placement_entropy_schedule_coef": args.slow_placement_entropy_coef,
             "slow_placement_entropy_target": args.slow_placement_entropy_target,
+            "slow_placement_entropy_shortfall": 0.0,
+            "slow_placement_entropy_saturated": 0,
             "slow_placement_updates_completed": 0,
             "slow_placement_approx_kl": 0.0,
             "fast_loss": 0.0,
@@ -3326,6 +3482,8 @@ def main() -> None:
             "fast_entropy_coef": args.fast_entropy_coef,
             "fast_entropy_next_coef": args.fast_entropy_coef,
             "fast_entropy_target": args.fast_entropy_target,
+            "fast_entropy_shortfall": 0.0,
+            "fast_entropy_saturated": 0,
             "fast_approx_kl": 0.0,
             "fast_clip_fraction": 0.0,
             "fast_advantage_mean": np.nan,
@@ -3414,11 +3572,15 @@ def main() -> None:
             best_latency = eval_stats["eval_avg_latency_s"]
             save_checkpoint(
                 agent,
-                save_dir / "best.pt",
+                save_dir / "best_eval.pt",
                 {
-                    "update": 0,
+                    "update": resume_update_offset,
+                    "completed_updates": resume_update_offset,
+                    "completed_rollouts": resume_rollout_offset,
+                    "completed_episodes": resume_episode_offset,
                     "avg_latency_s": best_latency,
                     "avg_reward": np.nan,
+                    "selection_kind": "held_out_eval",
                     "run_name": run_name,
                     "train_mode": args.train_mode,
                 },
@@ -3426,15 +3588,16 @@ def main() -> None:
             )
 
     train_env: EdgeComputingEnv | None = None
-    train_episode_idx = 0
-    training_rollout_idx = 0
+    train_episode_idx = resume_episode_offset
+    training_rollout_idx = resume_rollout_offset
     episode_rollout_stats: list[dict[str, float]] = []
     episode_rollout_contexts: list[dict[str, float | int | str]] = []
     total_windows = max(
         int(np.ceil(args.episode_minutes / args.deployment_interval_minutes)),
         1,
     )
-    for update in range(args.updates):
+    for local_update in range(args.updates):
+        update = resume_update_offset + local_update
         alternating_joint = args.train_mode == "joint" and args.joint_training_schedule == "alternating"
         fast_warmup_phase = alternating_joint and update < args.fast_warmup_updates
         slow_warmup_start = args.fast_warmup_updates
@@ -3557,7 +3720,7 @@ def main() -> None:
                 window_in_episode = min(int(env.current_time_minute // env.config.deployment_interval_minutes) + 1, total_windows)
                 demand_seed = int(env.config.scenario_seed)
                 progress_label = (
-                    f"update={update + 1:03d}/{args.updates:03d}{batch_suffix} "
+                    f"update={update + 1:03d}/{target_update:03d}{batch_suffix} "
                     f"ep={episode_number:03d} win={window_in_episode:02d}/{total_windows:02d}"
                 )
                 one_stats = rollout(
@@ -3607,7 +3770,7 @@ def main() -> None:
                     args=args,
                     reward_scale=args.reward_scale,
                     train_mode=args.train_mode,
-                    progress_label=f"update={update + 1:03d}/{args.updates:03d}{batch_suffix}",
+                    progress_label=f"update={update + 1:03d}/{target_update:03d}{batch_suffix}",
                     progress_interval_seconds=args.progress_interval_seconds,
                     rollout_unit=args.rollout_unit,
                     record_fast=record_fast_phase,
@@ -3693,7 +3856,7 @@ def main() -> None:
         start_minute = start_minutes[0]
         start_minute_end = start_minutes[-1]
         fast_metrics = agent.update_fast(
-            progress_label=f"update={update + 1:03d}/{args.updates:03d} fast PPO",
+            progress_label=f"update={update + 1:03d}/{target_update:03d} fast PPO",
             progress_interval_seconds=args.progress_interval_seconds,
         )
         slow_updated = False
@@ -3706,7 +3869,7 @@ def main() -> None:
             agent.window_steps = 0
         elif record_slow_phase and slow_windows_available >= args.slow_windows_per_update:
             slow_metrics = agent.update_slow(
-                progress_label=f"update={update + 1:03d}/{args.updates:03d} slow PPO",
+                progress_label=f"update={update + 1:03d}/{target_update:03d} slow PPO",
                 progress_interval_seconds=args.progress_interval_seconds,
             )
             slow_updated = True
@@ -3900,6 +4063,12 @@ def main() -> None:
             "slow_window_critic_holdout_size": losses["slow"].get(
                 "window_critic_holdout_size", 0.0
             ),
+            "slow_window_critic_train_episode_count": losses["slow"].get(
+                "window_critic_train_episode_count", 0.0
+            ),
+            "slow_window_critic_holdout_episode_count": losses["slow"].get(
+                "window_critic_holdout_episode_count", 0.0
+            ),
             "slow_window_critic_return_mean": losses["slow"].get(
                 "window_critic_return_mean", np.nan
             ),
@@ -3955,6 +4124,13 @@ def main() -> None:
                 "placement_global_advantage_configured_coef",
                 args.slow_placement_global_advantage_coef,
             ),
+            "slow_placement_global_attribution_coef": losses["slow"].get(
+                "placement_global_attribution_coef",
+                args.slow_placement_global_attribution_coef,
+            ),
+            "slow_placement_global_attribution_mean_abs": losses["slow"].get(
+                "placement_global_attribution_mean_abs", 0.0
+            ),
             "slow_placement_combined_advantage_std": losses["slow"].get(
                 "placement_combined_advantage_std", np.nan
             ),
@@ -3976,6 +4152,12 @@ def main() -> None:
             "slow_placement_entropy_target": losses["slow"].get(
                 "placement_entropy_target", args.slow_placement_entropy_target
             ),
+            "slow_placement_entropy_shortfall": losses["slow"].get(
+                "placement_entropy_shortfall", 0.0
+            ),
+            "slow_placement_entropy_saturated": losses["slow"].get(
+                "placement_entropy_saturated", 0.0
+            ),
             "slow_placement_updates_completed": int(
                 losses["slow"].get("placement_updates_completed", 0.0)
             ),
@@ -3987,6 +4169,8 @@ def main() -> None:
             "fast_entropy_coef": losses["fast"].get("entropy_coef", np.nan),
             "fast_entropy_next_coef": losses["fast"].get("entropy_next_coef", np.nan),
             "fast_entropy_target": losses["fast"].get("entropy_target", args.fast_entropy_target),
+            "fast_entropy_shortfall": losses["fast"].get("entropy_shortfall", 0.0),
+            "fast_entropy_saturated": losses["fast"].get("entropy_saturated", 0.0),
             "fast_approx_kl": losses["fast"].get("approx_kl", 0.0),
             "fast_clip_fraction": losses["fast"].get("clip_fraction", 0.0),
             "fast_advantage_mean": losses["fast"].get("advantage_mean", np.nan),
@@ -4181,34 +4365,90 @@ def main() -> None:
                     eval_stats["eval_hot_link_rate"],
                 )
             )
-        selection_latency = eval_stats.get("eval_avg_latency_s", stats["avg_latency_s"])
-        if args.save_best and selection_latency < best_latency:
-            best_latency = selection_latency
+        checkpoint_selection_history.append(
+            {
+                "latency_s": float(stats["avg_latency_s"]),
+                "load_multiplier": float(load_multiplier_mean),
+            }
+        )
+        checkpoint_score, checkpoint_load_slope = load_adjusted_rolling_latency(
+            checkpoint_selection_history,
+            args.best_checkpoint_window,
+            reference_checkpoint_load,
+        )
+        checkpoint_ready = len(checkpoint_selection_history) >= args.best_checkpoint_window
+        should_replace_best = (
+            (checkpoint_ready and not best_checkpoint_ready)
+            or (checkpoint_ready == best_checkpoint_ready and checkpoint_score < best_checkpoint_score)
+        )
+        common_checkpoint_metadata: dict[str, object] = {
+            "update": update + 1,
+            "completed_updates": update + 1,
+            "completed_rollouts": training_rollout_idx,
+            "completed_episodes": train_episode_idx,
+            "episode_minutes": args.episode_minutes,
+            "checkpoint_at_episode_boundary": bool(train_env is None or train_env.done),
+            "avg_latency_s": float(stats["avg_latency_s"]),
+            "avg_reward": float(stats["avg_reward"]),
+            "best_latency_s": best_latency,
+            "best_checkpoint_score": min(best_checkpoint_score, checkpoint_score)
+            if should_replace_best
+            else best_checkpoint_score,
+            "best_checkpoint_ready": best_checkpoint_ready or checkpoint_ready,
+            "checkpoint_score": checkpoint_score,
+            "checkpoint_score_load_slope": checkpoint_load_slope,
+            "checkpoint_reference_load": reference_checkpoint_load,
+            "checkpoint_selection_window": args.best_checkpoint_window,
+            "checkpoint_selection_history": checkpoint_selection_history,
+            "run_name": run_name,
+            "train_mode": args.train_mode,
+        }
+        if args.save_best and should_replace_best:
+            best_checkpoint_score = checkpoint_score
+            best_checkpoint_ready = checkpoint_ready
+            common_checkpoint_metadata["best_checkpoint_score"] = best_checkpoint_score
+            common_checkpoint_metadata["best_checkpoint_ready"] = best_checkpoint_ready
             save_checkpoint(
                 agent,
                 save_dir / "best.pt",
-                {
-                    "update": update + 1,
-                    "avg_latency_s": best_latency,
-                    "avg_reward": stats["avg_reward"],
-                    "run_name": run_name,
-                    "train_mode": args.train_mode,
-                },
+                {**common_checkpoint_metadata, "selection_kind": "load_adjusted_rolling_train"},
                 training_random_streams,
             )
+            if checkpoint_ready:
+                save_checkpoint(
+                    agent,
+                    save_dir / "best_rolling.pt",
+                    {**common_checkpoint_metadata, "selection_kind": "load_adjusted_rolling_train"},
+                    training_random_streams,
+                )
+        if eval_stats and args.save_best:
+            selection_latency = float(eval_stats["eval_avg_latency_s"])
+            if selection_latency < best_latency:
+                best_latency = selection_latency
+                common_checkpoint_metadata["best_latency_s"] = best_latency
+                save_checkpoint(
+                    agent,
+                    save_dir / "best_eval.pt",
+                    {
+                        **common_checkpoint_metadata,
+                        "avg_latency_s": best_latency,
+                        "selection_kind": "held_out_eval",
+                    },
+                    training_random_streams,
+                )
         save_checkpoint(
             agent,
             save_dir / "latest.pt",
-            {
-                "update": update + 1,
-                "avg_latency_s": stats["avg_latency_s"],
-                "avg_reward": stats["avg_reward"],
-                "best_latency_s": best_latency,
-                "run_name": run_name,
-                "train_mode": args.train_mode,
-            },
+            {**common_checkpoint_metadata, "selection_kind": "latest"},
             training_random_streams,
         )
+        if args.checkpoint_interval and (update + 1) % args.checkpoint_interval == 0:
+            save_checkpoint(
+                agent,
+                save_dir / "snapshots" / f"update_{update + 1:04d}.pt",
+                {**common_checkpoint_metadata, "selection_kind": "periodic_snapshot"},
+                training_random_streams,
+            )
 
     if episode_rollout_stats:
         append_log(
@@ -4246,7 +4486,21 @@ def main() -> None:
             agent,
             save_dir / "last.pt",
             {
-                "update": args.updates,
+                "update": target_update,
+                "completed_updates": target_update,
+                "completed_rollouts": training_rollout_idx,
+                "completed_episodes": train_episode_idx,
+                "episode_minutes": args.episode_minutes,
+                "checkpoint_at_episode_boundary": bool(train_env is None or train_env.done),
+                "best_latency_s": best_latency,
+                "best_checkpoint_score": best_checkpoint_score,
+                "best_checkpoint_ready": best_checkpoint_ready,
+                "checkpoint_score": checkpoint_score,
+                "checkpoint_score_load_slope": checkpoint_load_slope,
+                "checkpoint_reference_load": reference_checkpoint_load,
+                "checkpoint_selection_window": args.best_checkpoint_window,
+                "checkpoint_selection_history": checkpoint_selection_history,
+                "selection_kind": "final",
                 "run_name": run_name,
                 "train_mode": args.train_mode,
             },

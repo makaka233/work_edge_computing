@@ -1128,6 +1128,8 @@ class PPOAgent:
         actor_use_value_baseline: bool = True,
         auxiliary_advantages: np.ndarray | None = None,
         auxiliary_advantage_coef: float = 0.0,
+        auxiliary_attribution: np.ndarray | None = None,
+        auxiliary_attribution_coef: float = 0.0,
         progress_label: str = "",
         progress_interval_seconds: float = 0.0,
     ) -> dict[str, float]:
@@ -1154,12 +1156,16 @@ class PPOAgent:
                 "auxiliary_advantage_mean": 0.0,
                 "auxiliary_advantage_std": 0.0,
                 "auxiliary_advantage_coef": float(auxiliary_advantage_coef),
+                "auxiliary_attribution_mean_abs": 0.0,
+                "auxiliary_attribution_coef": float(auxiliary_attribution_coef),
                 "combined_advantage_std": 0.0,
                 "explained_variance": 0.0,
                 "post_explained_variance": 0.0,
             }
         if not np.isfinite(auxiliary_advantage_coef) or auxiliary_advantage_coef < 0.0:
             raise ValueError("auxiliary_advantage_coef must be finite and non-negative")
+        if not np.isfinite(auxiliary_attribution_coef) or auxiliary_attribution_coef < 0.0:
+            raise ValueError("auxiliary_attribution_coef must be finite and non-negative")
         returns_np = np.asarray(returns, dtype=np.float32)
         if returns_np.shape != (n,):
             raise ValueError(f"returns must have shape ({n},), got {returns_np.shape}")
@@ -1200,12 +1206,29 @@ class PPOAgent:
 
         auxiliary_advantage_mean = 0.0
         auxiliary_advantage_std = 0.0
+        auxiliary_attribution_mean_abs = 0.0
         if auxiliary_advantages is not None:
             auxiliary_np = np.asarray(auxiliary_advantages, dtype=np.float32)
             if auxiliary_np.shape != (n,):
                 raise ValueError(f"auxiliary_advantages must have shape ({n},), got {auxiliary_np.shape}")
             if not np.isfinite(auxiliary_np).all():
                 raise ValueError("auxiliary_advantages must be finite")
+            if auxiliary_attribution is not None:
+                attribution_np = np.asarray(auxiliary_attribution, dtype=np.float32)
+                if attribution_np.shape != (n,):
+                    raise ValueError(f"auxiliary_attribution must have shape ({n},), got {attribution_np.shape}")
+                if not np.isfinite(attribution_np).all():
+                    raise ValueError("auxiliary_attribution must be finite")
+                attribution_np = np.clip(attribution_np, -2.0, 2.0)
+                correction = (
+                    float(auxiliary_attribution_coef)
+                    * np.abs(auxiliary_np)
+                    * attribution_np
+                )
+                auxiliary_np = auxiliary_np + correction
+                auxiliary_attribution_mean_abs = float(
+                    np.average(np.abs(correction), weights=weights_np)
+                )
             auxiliary_advantage_mean = float(np.average(auxiliary_np, weights=weights_np))
             auxiliary_variance = float(
                 np.average(
@@ -1278,6 +1301,8 @@ class PPOAgent:
             "auxiliary_advantage_mean": auxiliary_advantage_mean,
             "auxiliary_advantage_std": auxiliary_advantage_std,
             "auxiliary_advantage_coef": float(auxiliary_advantage_coef),
+            "auxiliary_attribution_mean_abs": auxiliary_attribution_mean_abs,
+            "auxiliary_attribution_coef": float(auxiliary_attribution_coef),
             "combined_advantage_std": combined_advantage_std,
         }
         optimizer_steps = 0
@@ -1342,6 +1367,8 @@ class PPOAgent:
                     "auxiliary_advantage_mean": auxiliary_advantage_mean,
                     "auxiliary_advantage_std": auxiliary_advantage_std,
                     "auxiliary_advantage_coef": float(auxiliary_advantage_coef),
+                    "auxiliary_attribution_mean_abs": auxiliary_attribution_mean_abs,
+                    "auxiliary_attribution_coef": float(auxiliary_attribution_coef),
                     "combined_advantage_std": combined_advantage_std,
                     "explained_variance": explained_variance,
                 }

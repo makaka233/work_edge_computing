@@ -50,6 +50,7 @@ def test_slow_window_critic_uses_temporal_holdout_and_replay():
     slow.window_states = [
         np.full(obs_dim, index / 12.0, dtype=np.float32) for index in range(12)
     ]
+    slow.window_episode_ids = [0] * 6 + [1] * 6
     first = slow._update_window_critic(np.linspace(-20.0, -5.0, 12, dtype=np.float32))
     assert first["replay_size"] == 12.0
     assert first["train_size"] == 0.0
@@ -58,10 +59,13 @@ def test_slow_window_critic_uses_temporal_holdout_and_replay():
     slow.window_states = [
         np.full(obs_dim, 1.0 + index / 12.0, dtype=np.float32) for index in range(12)
     ]
+    slow.window_episode_ids = [2] * 6 + [3] * 6
     second = slow._update_window_critic(np.linspace(-18.0, -3.0, 12, dtype=np.float32))
     assert second["replay_size"] == 24.0
     assert second["train_size"] == 12.0
     assert second["holdout_size"] == 12.0
+    assert second["train_episode_count"] == 2.0
+    assert second["holdout_episode_count"] == 2.0
     assert np.isfinite(second["value_loss"])
     assert np.isfinite(second["raw_value_mse"])
     assert np.isfinite(second["train_explained_variance"])
@@ -200,6 +204,31 @@ def test_component_actor_mixes_normalized_window_advantage():
     assert np.isclose(metrics["auxiliary_advantage_std"], 2.0)
     assert np.isclose(metrics["auxiliary_advantage_coef"], 0.5)
     assert metrics["combined_advantage_std"] > 1.0
+
+
+def test_component_actor_attributes_shared_window_credit_to_local_actions():
+    ppo = PPOAgent(obs_dim=2, action_dim=2, hidden_dim=8, k_epochs=1, minibatch_size=4)
+    mask = np.asarray([True, True])
+    for index in range(4):
+        state = np.asarray([float(index), 1.0], dtype=np.float32)
+        action, logprob, value = ppo.act(state, mask, deterministic=False)
+        ppo.buffer.states.append(state)
+        ppo.buffer.masks.append(mask.copy())
+        ppo.buffer.actions.append(action)
+        ppo.buffer.logprobs.append(logprob)
+        ppo.buffer.values.append(value)
+
+    metrics = ppo.update_from_returns(
+        np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.float32),
+        actor_use_value_baseline=False,
+        auxiliary_advantages=np.asarray([-2.0, -2.0, 2.0, 2.0], dtype=np.float32),
+        auxiliary_advantage_coef=0.5,
+        auxiliary_attribution=np.asarray([1.0, -1.0, 1.0, -1.0], dtype=np.float32),
+        auxiliary_attribution_coef=0.5,
+    )
+
+    assert np.isclose(metrics["auxiliary_attribution_mean_abs"], 1.0)
+    assert np.isclose(metrics["auxiliary_attribution_coef"], 0.5)
 
 
 def test_fast_ppo_reports_full_batch_diagnostics_and_strict_kl_stop():
@@ -704,9 +733,11 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
     assert np.isclose(agent.fast_agent.ppo.entropy_coef, 0.001)
     assert agent.slow_agent.count_global_advantage_coef == 0.25
     assert agent.slow_agent.placement_global_advantage_coef == 0.35
+    assert agent.slow_agent.placement_global_attribution_coef == 0.50
     assert agent.slow_agent.global_advantage_ev_full == 0.20
     assert agent.slow_agent.critic_replay_windows == 96
     assert agent.slow_agent.critic_holdout_windows == 12
+    assert agent.slow_agent.critic_holdout_episodes == 2
     assert agent.slow_agent.critic_k_epochs == 8
     assert np.isclose(agent.slow_agent.critic_optimizer.param_groups[0]["lr"], 5e-4)
     agent.slow_agent.last_window_critic_holdout_ev = -0.1
@@ -726,7 +757,7 @@ def test_slow_agent_uses_explicit_count_and_unique_placements():
 
     agent.slow_agent.placement_entropy_current_coef = 0.005
     adapted_coef = agent.slow_agent._adapt_placement_entropy_coefficient(observed_entropy=1.0)
-    assert np.isclose(adapted_coef, 0.0054)
+    assert np.isclose(adapted_coef, 0.0066)
 
     def count_two(state, mask, deterministic=False):
         assert mask[1]
