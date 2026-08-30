@@ -1,0 +1,3 @@
+# Additional dependencies for the isolated IEEE comparison framework.
+ortools==9.15.6755
+pypdf==6.16.2
