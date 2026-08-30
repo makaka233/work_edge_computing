@@ -2,6 +2,7 @@ comparison:
   formal_schemes: [Proposed, Monolithic, DMDR, SICP]
   greedy_role: smoke_test_only
   checkpoint: runs/placement_credit_episode60_large_s30_u320_20260826_123639/checkpoints/best.pt
+  monolithic_checkpoint: runs/monolithic_ppo_<run_id>/checkpoints/best.pt
   nominal_request_load_multiplier: 1.0
   represented_seconds: 1
   deployment_window_minutes: 10

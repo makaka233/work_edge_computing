@@ -7,8 +7,9 @@ settlement without changing the training entry point or the Proposed policy.
 The paper-facing schemes are exactly:
 
 - **Proposed**: deterministic inference from an explicit checkpoint; no retraining.
-- **Monolithic**: optimization-backed whole-service placement, adapted from [2];
-  it is not presented as a reproduction of SD3.
+- **Monolithic**: a separately trained copy of the same dual-scale PPO/KKT
+  controller, with each service represented as one aggregated stage. It is not
+  an MILP baseline and is not presented as a reproduction of SD3.
 - **DMDR**: native AES-JDR/RDMP adaptation following Peng et al., IEEE TSC 2024.
   Integer instance multiplicity is retained as a native diagnostic; the common
   physical simulator projects it to `N_integer > 0`, and memory/storage are
@@ -39,7 +40,18 @@ Run Phase 1 from PowerShell:
 ```powershell
 python run_comparison.py `
   --checkpoint "runs\placement_credit_episode60_large_s30_u320_20260826_123639\checkpoints\best.pt" `
+  --monolithic-checkpoint "runs\monolithic_ppo_<run_id>\checkpoints\best.pt" `
   --phase 1 `
+  --device cuda
+```
+
+Train the Monolithic checkpoint separately before comparison:
+
+```powershell
+python .\train_monolithic.py `
+  --base-checkpoint ".\runs\placement_credit_episode60_large_s30_u320_20260826_123639\checkpoints\best.pt" `
+  --updates 320 `
+  --episode-minutes 60 `
   --device cuda
 ```
 

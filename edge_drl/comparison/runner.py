@@ -51,9 +51,15 @@ def run_comparison(
     run_id: str | None = None,
     schemes: tuple[str, ...] = FORMAL_SCHEMES,
     phase2_validation_run: str | Path | None = None,
+    monolithic_checkpoint: str | Path | None = None,
 ) -> Path:
     if phase == 3:
         _require_phase2_validation(phase2_validation_run)
+    if "Monolithic" in schemes and monolithic_checkpoint is None:
+        raise ValueError(
+            "Monolithic is trainable and requires --monolithic-checkpoint; "
+            "it is never replaced by an optimization baseline"
+        )
     checkpoint_path, checkpoint_args, checkpoint_internal = load_checkpoint_configuration(checkpoint)
     unknown = sorted(set(schemes) - set(FORMAL_SCHEMES))
     if unknown:
@@ -81,6 +87,7 @@ def run_comparison(
         "eval_seeds": eval_seeds,
         "dmdr_routing_repeats": dmdr_repeats,
         "checkpoint": str(checkpoint_path),
+        "monolithic_checkpoint": None if monolithic_checkpoint is None else str(monolithic_checkpoint),
         "checkpoint_metadata": checkpoint_internal,
         "checkpoint_args": checkpoint_args,
         "proposed_offline_training_time_s": None,
@@ -93,7 +100,7 @@ def run_comparison(
             "torch": torch.__version__,
         },
         "labels": {
-            "Monolithic": "adapted from [2]; not an SD3 reproduction",
+            "Monolithic": "separately trained dual-scale PPO with one aggregated stage per service",
             "DMDR": "native AES-JDR adaptation from Peng et al., IEEE TSC 2024",
             "SICP": "adapted JPS-CP; TSN gate scheduling omitted",
         },
@@ -156,6 +163,8 @@ def run_comparison(
                             routing_seed=request_seed + 10_000 * (repeat + 1),
                             phase=phase,
                             dmdr_plan_cache=dmdr_plan_cache,
+                            monolithic_checkpoint=monolithic_checkpoint,
+                            point=point,
                         )
                         result = evaluate_scheme_episode(
                             scheme=scheme,
@@ -257,11 +266,16 @@ def _make_scheme(
     routing_seed: int,
     phase: int,
     dmdr_plan_cache: dict[int, dict[str, object]] | None = None,
+    monolithic_checkpoint: str | Path | None = None,
+    point: ExperimentPoint | None = None,
 ):
     if name == "Proposed":
         return ProposedScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name == "Monolithic":
-        return MonolithicScheme(solver_time_limit_s=30.0 if phase == 1 else 120.0)
+        assert monolithic_checkpoint is not None
+        assert point is not None
+        resolved = _resolve_monolithic_checkpoint(monolithic_checkpoint, point)
+        return MonolithicScheme(env, resolved, device=device)
     if name == "SICP":
         return SICPScheme(solver_time_limit_s=30.0 if phase == 1 else 120.0)
     if name == "DMDR":
@@ -271,6 +285,30 @@ def _make_scheme(
             plan_cache=dmdr_plan_cache,
         )
     raise ValueError(name)
+
+
+def _resolve_monolithic_checkpoint(path: str | Path, point: ExperimentPoint) -> Path:
+    raw = str(path)
+    if "{family}" in raw or "{value}" in raw:
+        candidate = Path(raw.format(family=point.family, value=f"{point.value:g}"))
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(candidate)
+    candidate = Path(path)
+    if candidate.is_file():
+        return candidate
+    if candidate.is_dir():
+        stem = f"{point.family}_{point.value:g}"
+        options = (
+            candidate / f"{stem}.pt",
+            candidate / stem / "checkpoints" / "best.pt",
+            candidate / f"{stem}_best.pt",
+        )
+        for option in options:
+            if option.is_file():
+                return option
+        raise FileNotFoundError(f"no Monolithic checkpoint for {stem} under {candidate}")
+    raise FileNotFoundError(candidate)
 
 
 def _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics) -> None:

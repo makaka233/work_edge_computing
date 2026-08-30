@@ -61,8 +61,8 @@ kept thin. The problem model is different, so the code is specialized for:
 
 The formal five-sweep, four-scheme IEEE evaluation protocol is recorded in
 `docs/IEEE_COMPARISON.md`. Its paper-facing labels are Proposed, Monolithic
-(orchestration adapted from [2], not an SD3 reproduction), DMDR (native
-AES-JDR adaptation), and SICP (adapted JPS-CP without TSN gate scheduling).
+(separately trained one-stage-per-service PPO), DMDR (native AES-JDR
+adaptation), and SICP (adapted JPS-CP without TSN gate scheduling).
 Greedy is restricted to smoke sanity checks and component ablations stay outside
 the main comparison.
 

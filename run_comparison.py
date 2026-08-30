@@ -8,6 +8,11 @@ from edge_drl.comparison.runner import FORMAL_SCHEMES, run_comparison
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run isolated IEEE scheme comparisons")
     parser.add_argument("--checkpoint", required=True, help="Explicit Proposed best.pt checkpoint")
+    parser.add_argument(
+        "--monolithic-checkpoint",
+        default=None,
+        help="Explicit separately trained Monolithic PPO checkpoint",
+    )
     parser.add_argument("--phase", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-root", default="results/comparison")
@@ -31,6 +36,7 @@ def main() -> None:
         run_id=args.run_id,
         schemes=tuple(args.schemes),
         phase2_validation_run=args.phase2_validation_run,
+        monolithic_checkpoint=args.monolithic_checkpoint,
     )
     print(f"comparison results: {output.resolve()}")
 

@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 
 from edge_drl.comparison.metrics import evaluate_scheme_episode
-from edge_drl.comparison.monolithic import MonolithicScheme
 from edge_drl.comparison.sicp import SICPScheme
 from edge_drl.comparison.dmdr import DMDRScheme
 from edge_drl.comparison.scheme import BaseComparisonScheme
@@ -88,7 +87,6 @@ def test_phase3_requires_a_successful_phase2_marker(tmp_path) -> None:
 def test_all_comparison_scheme_interfaces_settle_without_invalid_actions() -> None:
     schemes = (
         FixedScheme(),
-        MonolithicScheme(solver_time_limit_s=10.0),
         SICPScheme(solver_time_limit_s=10.0, workers=1),
         DMDRScheme(routing_seed=77, solver_max_iterations=100),
     )
