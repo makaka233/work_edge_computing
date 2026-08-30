@@ -40,7 +40,7 @@ Run Phase 1 from PowerShell:
 ```powershell
 python run_comparison.py `
   --checkpoint "runs\placement_credit_episode60_large_s30_u320_20260826_123639\checkpoints\best.pt" `
-  --monolithic-checkpoint "runs\monolithic_ppo_<run_id>\checkpoints\best.pt" `
+  --monolithic-checkpoint "runs\monolithic_checkpoints\request_load_1\checkpoints\best.pt" `
   --phase 1 `
   --device cuda
 ```
@@ -52,8 +52,16 @@ python .\train_monolithic.py `
   --base-checkpoint ".\runs\placement_credit_episode60_large_s30_u320_20260826_123639\checkpoints\best.pt" `
   --updates 320 `
   --episode-minutes 60 `
+  --run-root ".\runs\monolithic_checkpoints" `
+  --run-name request_load_1 `
   --device cuda
 ```
+
+For Phase 2/3, train one Monolithic checkpoint per parameter point and place
+each run below a common directory (for example
+`runs/monolithic_checkpoints/request_load_0.8/checkpoints/best.pt`). Then pass
+that common directory to `--monolithic-checkpoint`; the runner resolves the
+`<family>_<value>` subdirectory for each point and fails if it is missing.
 
 Plot a completed run:
 

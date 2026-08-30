@@ -13,7 +13,9 @@ from edge_drl.agents.drl import HierarchicalPPOAgent
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
 from edge_drl.comparison.monolithic import collapse_scenario, collapse_trace
 from edge_drl.comparison.replay_env import TraceReplayEnv
+from edge_drl.comparison.scenario_transforms import transform_scenario, transform_trace
 from edge_drl.comparison.trace import generate_comparison_trace
+from edge_drl.comparison.types import ExperimentPoint
 from train_dual_ppo import rollout, save_checkpoint
 
 
@@ -27,6 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates", type=int, default=320)
     parser.add_argument("--episode-minutes", type=int, default=60)
     parser.add_argument("--episodes-per-update", type=int, default=2)
+    parser.add_argument(
+        "--scenario-family",
+        choices=("request_load", "compute_capacity", "wired_bandwidth", "intermediate_data", "stage_heterogeneity"),
+        default="request_load",
+    )
+    parser.add_argument("--scenario-value", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=3026)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--run-root", default="runs")
@@ -62,18 +70,21 @@ def main() -> None:
         episode_minutes=cli.episode_minutes,
         environment_seed=cli.seed + 100_000,
         demand_seed=cli.seed,
-        demand_load_multiplier=1.0,
+        demand_load_multiplier=cli.scenario_value if cli.scenario_family == "request_load" else 1.0,
     )
-    base_env = TraceReplayEnv(
-        config,
-        collapse_scenario(_scenario_from_config(config)),
-        _empty_trace(config.episode_minutes * 60),
-    )
+    from edge_drl.env.environment import EdgeComputingEnv
+
+    physical_env = EdgeComputingEnv(config)
+    physical_env.reset()
+    assert physical_env.scenario is not None
+    base_scenario = deepcopy(physical_env.scenario)
+    point = ExperimentPoint(cli.scenario_family, cli.scenario_value, f"{cli.scenario_family}:{cli.scenario_value:g}")
+    scenario = transform_scenario(base_scenario, point)
+    staged_scenario = deepcopy(scenario)
+    base_env = TraceReplayEnv(config, collapse_scenario(scenario), _empty_trace(config.episode_minutes * 60))
     base_env.reset()
-    scenario = deepcopy(base_env.scenario)
-    assert scenario is not None
     agent = _agent_from_config(base_env, base_args, cli.device)
-    run_name = cli.run_name or f"monolithic_ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = cli.run_name or f"monolithic_ppo_{cli.scenario_family}_{cli.scenario_value:g}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(cli.run_root) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
@@ -92,7 +103,7 @@ def main() -> None:
             )
             staged_base_env.reset()
             request_trace = generate_comparison_trace(
-                scenario=scenario,
+                scenario=base_scenario,
                 logical_steps=config.episode_minutes * 60,
                 requests_per_minute=staged_base_env._arrival_rate_per_minute(),
                 physical_seed=int(config.physical_seed or config.seed),
@@ -101,7 +112,8 @@ def main() -> None:
                 task_compute_scale=config.task_compute_scale,
                 task_data_scale=config.task_data_scale,
             )
-            env = TraceReplayEnv(config, collapse_scenario(scenario), collapse_trace(request_trace))
+            request_trace = transform_trace(request_trace, point)
+            env = TraceReplayEnv(config, collapse_scenario(staged_scenario), collapse_trace(request_trace))
             env.reset()
             episode_stats = rollout(
                 env,
@@ -144,7 +156,7 @@ def main() -> None:
             **{f"slow_{key}": float(value) for key, value in update_metrics.get("slow", {}).items() if isinstance(value, (int, float))},
         }
         history.append(row)
-        metadata = {"args": {**base_args, "seed": cli.seed, "episode_minutes": cli.episode_minutes, "run_name": run_name, "training_scheme": "Monolithic"}, "update": update, "history": row}
+        metadata = {"args": {**base_args, "seed": cli.seed, "episode_minutes": cli.episode_minutes, "run_name": run_name, "training_scheme": "Monolithic", "comparison_scenario_family": cli.scenario_family, "comparison_scenario_value": cli.scenario_value}, "update": update, "history": row}
         save_checkpoint(agent, checkpoint_dir / "latest.pt", metadata)
         score = float(stats.get("avg_latency_s", float("inf")))
         if score < best_score:
@@ -154,21 +166,13 @@ def main() -> None:
         print(f"monolithic update={update} avg_latency_s={score:.6f}")
     (run_dir / "metadata.json").write_text(
         json.dumps(
-            {"args": {**base_args, "seed": cli.seed, "episode_minutes": cli.episode_minutes, "run_name": run_name, "training_scheme": "Monolithic"}, "best_score_avg_latency_s": best_score},
+            {"args": {**base_args, "seed": cli.seed, "episode_minutes": cli.episode_minutes, "run_name": run_name, "training_scheme": "Monolithic", "comparison_scenario_family": cli.scenario_family, "comparison_scenario_value": cli.scenario_value}, "best_score_avg_latency_s": best_score},
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
     print(f"monolithic checkpoints: {checkpoint_dir.resolve()}")
-
-
-def _scenario_from_config(config):
-    from edge_drl.env.environment import EdgeComputingEnv
-
-    env = EdgeComputingEnv(config)
-    env.reset()
-    return env.scenario
 
 
 def _empty_trace(logical_steps: int):
