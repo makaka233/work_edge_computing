@@ -126,11 +126,12 @@ detached from the actor graph encoder so value fitting cannot flatten node score
 Placement actor returns are centered within the same service stage before
 normalization, making the policy compare alternative nodes rather than unrelated
 absolute latency scales across stages. Placement uses an independent `1.5e-4`
-learning rate and `0.015` KL limit. Its entropy coefficient starts at `0.005`,
+legacy learning rate (`7.5e-5` under `trajectory-simultaneous`) and `0.015` KL
+limit. Its entropy coefficient starts at `0.005`,
 is held for 64 completed Slow updates, then its scheduled floor decays to
 `0.0035` over another 64 updates. An adaptive controller raises the coefficient,
-up to `0.015`, whenever observed Placement entropy falls below the default target
-of `1.8`. The active, next, and scheduled coefficients are written to every
+up to `0.015` under trajectory training, whenever observed Placement entropy falls
+below its trajectory target of `1.10`. The active, next, and scheduled coefficients are written to every
 training row.
 Count receives a separate dense U-shaped return. Service-stage mean/P95 latency
 and deadline violations penalize under-provisioning, while a continuous effective-
@@ -177,8 +178,9 @@ epoch boundaries. This prevents one noisy or high-volume load minibatch from
 discarding the remaining load signals. The training log records optimizer steps,
 sample and minimum-load coverage, full-buffer/worst-load KL, and serialized per-load
 KL/clip fractions. Both options have `--no-...` forms for ablation runs.
-Fast entropy also has a default floor target of `0.7`: its coefficient starts at
-`0.001` and adapts only when Fast actually updates, up to `0.03`. This prevents
+Fast entropy has a legacy floor target/cap of `0.7`/`0.03`; trajectory training
+uses the less aggressive `0.45`/`0.01`. Its coefficient starts at `0.001` and
+adapts only when Fast actually updates. This prevents
 Slow-only phases from changing Fast exploration state and counters the observed
 late concentration onto a small replica subset.
 Slow window rewards are discounted across the six decisions with
@@ -203,8 +205,11 @@ intrinsic latency differences between easy and expensive stages do not overwhelm
 the replica-count comparison. Set a nonzero `--slow-count-value-coef` only for a
 critic ablation; doing so reintroduces shared-backbone critic gradients.
 `--training-design trajectory-simultaneous` resolves to 60-minute episodes,
-simultaneous updates, no warm-up phases, and 12 Fast/Slow windows per update.
-Explicit batch settings must still contain a whole number of complete trajectories.
+simultaneous collection, no warm-up phases, and one shared 12-window batch per
+joint Fast/Slow update. Thus both policies learn from the same two complete
+episodes and remain synchronized; Slow expresses its longer control timescale
+through Count/Placement learning rates `1e-4`/`7.5e-5` and two PPO epochs rather
+than by skipping updates. Explicit batch settings must contain whole trajectories.
 Use `legacy-alternating` to reproduce archived one-window experiments.
 Every update atomically replaces the fully resumable `checkpoints/latest.pt`.
 `best.pt` is selected by a load-adjusted rolling latency (10 updates by default),
@@ -214,8 +219,11 @@ are written under `checkpoints/snapshots/` every 20 updates and the completed ru
 uses `last.pt`. Change these with `--best-checkpoint-window` and
 `--checkpoint-interval`; `--no-save-best` disables only the best-model files.
 Loading `latest.pt` restores policy/critic optimizers, entropy controllers, critic
-replay and normalization, random streams, and the global update/rollout/Episode
-counters, so `--updates` means the number of additional updates to run.
+replay and normalization, completed Slow windows still awaiting the next Slow
+update, random streams, and the global update/rollout/Episode counters, so
+`--updates` means the number of additional updates to run. A plateau controller
+observes only completed Slow updates and halves both Slow learning rates after 20
+non-improving trajectory updates by default (floor `1e-5`). Its state is also resumable.
 Training episodes use stratified temporal approximation by default:
 `--sampled-seconds-per-window 60` performs 60 neural-policy/KKT settlements that
 represent all 600 logical seconds in a ten-minute window. Instantaneous KKT
@@ -233,6 +241,10 @@ utilization, replica usage, and completion state. If an episode spans multiple
 deployment windows or PPO updates, its windows are accumulated into one row when
 the episode completes; an unfinished final episode is flushed with
 `episode_complete=0`.
+For higher-resolution plots, `logs/rollout_metrics.csv` writes one row immediately
+after every collected rollout/window. It contains global and within-update rollout
+indices, episode/window identity, seeds and load context, average and total reward,
+mean/P95 latency, resource utilization, replica usage, and all Slow return components.
 `--service-resource-fraction` fixes the share of each physical
 node's memory/storage available to this controller, representing system and
 co-tenant reservations without imposing a per-service replica-count cap.
@@ -327,8 +339,8 @@ by default. Set `--eval-seeds` above 1 only when an explicit multi-seed sweep is
 needed. Periodic training no longer launches separate seen-demand and policy
 diagnostic rollouts.
 
-For trajectory-simultaneous PPO, Fast and Slow window counts must match and form
-a whole number of episodes. `--rollouts-per-update` remains a compatibility alias
+For trajectory-simultaneous PPO, Fast and Slow window counts must match and form a
+whole number of episodes. `--rollouts-per-update` remains a compatibility alias
 for the Fast count in legacy experiments.
 Slow deployment exploration can also be controlled separately with
 `--slow-count-entropy-coef` and `--slow-placement-entropy-coef`; the count policy

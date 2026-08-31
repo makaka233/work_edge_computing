@@ -3,6 +3,7 @@ import sys
 import csv
 import math
 import numpy as np
+import pytest
 import torch
 from argparse import Namespace
 from pathlib import Path
@@ -17,9 +18,11 @@ from train_dual_ppo import (
     demand_seed_for_training_rollout,
     demand_profile_summary,
     effective_replicas_per_stage,
+    finite_weighted_mean,
     load_assignments_for_update,
     load_multiplier_for_rollout,
     load_adjusted_rolling_latency,
+    SlowLearningRateController,
     parse_args,
     load_checkpoint,
     rollout_start_minute,
@@ -65,6 +68,35 @@ def test_checkpoint_atomically_restores_episode_replay_and_resume_metadata(tmp_p
     source.slow_agent.placement_updates_completed = 9
     source.slow_agent.placement_entropy_current_coef = 0.012
     source.fast_agent.entropy_current_coef = 0.008
+    source.slow_agent.count_ppo.buffer.add(
+        state=np.zeros(3, dtype=np.float32),
+        mask=np.ones(4, dtype=bool),
+        action=1,
+        logprob=-0.5,
+        reward=-1.0,
+        done=True,
+        value=0.25,
+    )
+    source.slow_agent.placement_ppo.buffer.add(
+        state=np.ones(3, dtype=np.float32),
+        mask=np.ones(16, dtype=bool),
+        action=2,
+        logprob=-0.75,
+        reward=-1.0,
+        done=True,
+        value=0.5,
+    )
+    source.slow_agent.count_action_returns = [-1.0]
+    source.slow_agent.placement_action_returns = [-1.2]
+    source.slow_agent.count_action_stage_keys = [(0, 0)]
+    source.slow_agent.placement_action_stage_keys = [(0, 0)]
+    source.slow_agent.count_window_ids = [0]
+    source.slow_agent.placement_window_ids = [0]
+    source.slow_agent.window_states = [np.zeros(critic_width, dtype=np.float32)]
+    source.slow_agent.window_old_values = [0.1]
+    source.slow_agent.window_returns = [-1.1]
+    source.slow_agent.window_dones = [True]
+    source.slow_agent.window_episode_ids = [14]
     streams = TrainingRandomStreams(2026)
     checkpoint_path = tmp_path / "latest.pt"
     metadata = {
@@ -90,6 +122,12 @@ def test_checkpoint_atomically_restores_episode_replay_and_resume_metadata(tmp_p
     assert restored.slow_agent.placement_updates_completed == 9
     assert np.isclose(restored.slow_agent.placement_entropy_current_coef, 0.012)
     assert np.isclose(restored.fast_agent.entropy_current_coef, 0.008)
+    assert restored.completed_slow_windows == 1
+    assert restored.slow_agent.count_ppo.buffer.actions == [1]
+    assert restored.slow_agent.placement_ppo.buffer.actions == [2]
+    assert restored.slow_agent.count_action_stage_keys == [(0, 0)]
+    assert restored.slow_agent.placement_action_returns == [-1.2]
+    assert np.allclose(restored.slow_agent.window_states[0], 0.0)
 
 
 def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
@@ -133,6 +171,8 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.save_best is True
     assert args.best_checkpoint_window == 10
     assert args.checkpoint_interval == 20
+    assert args.slow_lr_decay is False
+    assert args.slow_lr_decay_patience == 10
 
 
 def test_checkpoint_score_uses_rolling_load_adjusted_latency():
@@ -145,6 +185,13 @@ def test_checkpoint_score_uses_rolling_load_adjusted_latency():
 
     assert np.isclose(slope, 0.4)
     assert np.isclose(score, 1.24)
+
+
+def test_finite_weighted_mean_handles_empty_request_windows():
+    values = np.asarray([0.2, 0.4], dtype=np.float64)
+
+    assert np.isclose(finite_weighted_mean(values, np.zeros(2)), 0.3)
+    assert np.isclose(finite_weighted_mean(values, np.asarray([1.0, 3.0])), 0.35)
 
 
 def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
@@ -197,6 +244,44 @@ def test_trajectory_training_design_builds_complete_multi_window_batches():
     assert args.slow_windows_per_update == 12
     assert args.fast_warmup_updates == 0
     assert args.slow_warmup_updates == 0
+    assert args.slow_count_lr == 1e-4
+    assert args.slow_placement_lr == 7.5e-5
+    assert args.slow_k_epochs == 2
+    assert args.fast_entropy_target == 0.45
+    assert args.fast_entropy_max_coef == 0.01
+    assert args.slow_placement_entropy_target == 1.10
+    assert args.slow_placement_entropy_max_coef == 0.015
+    assert args.slow_lr_decay is True
+    assert args.slow_lr_decay_patience == 20
+
+
+def test_slow_lr_controller_counts_only_completed_slow_updates():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(seed=91, num_users=10_000, num_edge_nodes=8, num_service_types=2)
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=3,
+        slow_count_lr=1e-4,
+        slow_placement_lr=8e-5,
+    )
+    controller = SlowLearningRateController(
+        enabled=True,
+        patience=2,
+        factor=0.5,
+        min_delta=1e-3,
+        min_lr=1e-5,
+    )
+
+    assert controller.observe(0.20, ready=True, slow_updated=True, agent=agent) is False
+    assert controller.observe(0.21, ready=True, slow_updated=False, agent=agent) is False
+    assert controller.bad_updates == 0
+    assert controller.observe(0.21, ready=True, slow_updated=True, agent=agent) is False
+    assert controller.observe(0.22, ready=True, slow_updated=True, agent=agent) is True
+    assert np.isclose(controller.optimizer_lr(agent.slow_agent.count_ppo.optimizer), 5e-5)
+    assert np.isclose(controller.optimizer_lr(agent.slow_agent.placement_ppo.optimizer), 4e-5)
+    assert controller.reductions == 1
 
 
 def test_explicit_episode_horizon_survives_training_design_expansion():
@@ -213,6 +298,25 @@ def test_explicit_episode_horizon_survives_training_design_expansion():
     apply_training_design(args, argv=["--episode-minutes", "90"])
 
     assert args.episode_minutes == 90
+
+
+def test_trajectory_training_rejects_different_fast_and_slow_batches(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_dual_ppo.py",
+            "--training-design",
+            "trajectory-simultaneous",
+            "--fast-windows-per-update",
+            "12",
+            "--slow-windows-per-update",
+            "24",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        parse_args()
 
 
 def test_pressure_profile_does_not_override_explicit_scale():
@@ -488,6 +592,7 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "slowR=" in result.stdout
     assert (log_dir / "training.csv").exists()
     assert (log_dir / "episode_metrics.csv").exists()
+    assert (log_dir / "rollout_metrics.csv").exists()
     assert (save_dir / "last.pt").exists()
     assert (save_dir / "best.pt").exists()
 
@@ -519,6 +624,9 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "fast_min_group_seen_fraction" in rows[0]
     assert "fast_max_group_approx_kl" in rows[0]
     assert "fast_load_approx_kl" in rows[0]
+    assert "slow_count_lr" in rows[0]
+    assert "slow_placement_lr" in rows[0]
+    assert "slow_lr_reductions" in rows[0]
 
     with (log_dir / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
         episode_rows = list(csv.DictReader(handle))
@@ -532,6 +640,16 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "total_reward" in episode_row
     assert "avg_latency_s" in episode_row
     assert "p95_latency_s" in episode_row
+
+    with (log_dir / "rollout_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        rollout_rows = list(csv.DictReader(handle))
+    assert len(rollout_rows) == 1
+    assert rollout_rows[0]["rollout"] == "1"
+    assert rollout_rows[0]["rollout_in_update"] == "1"
+    assert "avg_reward" in rollout_rows[0]
+    assert "total_reward" in rollout_rows[0]
+    assert "avg_latency_s" in rollout_rows[0]
+    assert "p95_latency_s" in rollout_rows[0]
 
 
 def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):
@@ -827,6 +945,11 @@ def test_rollouts_per_update_batches_independent_demand_samples(tmp_path):
     assert rows[-1]["episode_end"] == "2"
     assert rows[-1]["demand_seed"] == "2026"
     assert rows[-1]["demand_seed_end"] == "2027"
+    with (log_dir / "rollout_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        rollout_rows = list(csv.DictReader(handle))
+    assert [row["rollout"] for row in rollout_rows] == ["1", "2"]
+    assert [row["rollout_in_update"] for row in rollout_rows] == ["1", "2"]
+    assert [row["demand_seed"] for row in rollout_rows] == ["2026", "2027"]
 
 
 def test_ten_minute_episode_mode_advances_episode_and_demand_pool(tmp_path):

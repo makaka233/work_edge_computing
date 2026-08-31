@@ -112,15 +112,32 @@ def apply_training_design(
         "episode_minutes": 60,
         "joint_training_schedule": "simultaneous",
         "fast_windows_per_update": 12,
+        # Fast and Slow learn from the same two complete trajectories.  Their
+        # timescale difference is represented by optimizer strength rather
+        # than by withholding every other Slow update.
         "slow_windows_per_update": 12,
         "fast_warmup_updates": 0,
         "slow_warmup_updates": 0,
+        "slow_count_lr": 1e-4,
+        "slow_placement_lr": 7.5e-5,
+        "slow_k_epochs": 2,
+        # The former targets forced both controllers to their coefficient
+        # caps throughout late training and prevented exploration decay.
+        "fast_entropy_target": 0.45,
+        "fast_entropy_max_coef": 0.01,
+        "slow_placement_entropy_target": 1.10,
+        "slow_placement_entropy_max_coef": 0.015,
+        "slow_lr_decay": True,
+        # With one Slow update per training update, preserve the previous
+        # twenty-update observation horizon before reducing its step size.
+        "slow_lr_decay_patience": 20,
     }
     for field, value in defaults.items():
         option = "--" + field.replace("_", "-")
         if field == "episode_minutes" and "--episode-hours" in explicit_options:
             continue
-        if option not in explicit_options:
+        negative_option = "--no-" + field.replace("_", "-")
+        if option not in explicit_options and negative_option not in explicit_options:
             setattr(args, field, value)
     return args
 
@@ -615,6 +632,26 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Save a resumable snapshots/update_NNNN.pt every N updates; 0 disables snapshots.",
     )
+    parser.add_argument(
+        "--slow-lr-decay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Halve Slow actor learning rates after a sustained rolling-latency plateau.",
+    )
+    parser.add_argument(
+        "--slow-lr-decay-patience",
+        type=int,
+        default=10,
+        help="Completed Slow PPO updates without sufficient improvement before reducing its learning rates.",
+    )
+    parser.add_argument("--slow-lr-decay-factor", type=float, default=0.5)
+    parser.add_argument(
+        "--slow-lr-decay-min-delta",
+        type=float,
+        default=5e-4,
+        help="Minimum rolling latency improvement in seconds that resets Slow LR patience.",
+    )
+    parser.add_argument("--slow-min-lr", type=float, default=1e-5)
     parser.add_argument("--append-log", action="store_true")
     parser.add_argument(
         "--progress-interval-seconds",
@@ -722,6 +759,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--best-checkpoint-window must be >= 1")
     if args.checkpoint_interval < 0:
         parser.error("--checkpoint-interval must be >= 0")
+    if args.slow_lr_decay_patience < 1:
+        parser.error("--slow-lr-decay-patience must be >= 1")
+    if not 0.0 < args.slow_lr_decay_factor < 1.0:
+        parser.error("--slow-lr-decay-factor must be in (0, 1)")
+    if args.slow_lr_decay_min_delta < 0.0:
+        parser.error("--slow-lr-decay-min-delta must be >= 0")
+    if args.slow_min_lr <= 0.0:
+        parser.error("--slow-min-lr must be positive")
     if args.synchronized_window_block < 0:
         parser.error("--synchronized-window-block must be >= 0")
     if args.episode_minutes < 1:
@@ -742,10 +787,12 @@ def parse_args() -> argparse.Namespace:
         if args.episode_minutes % args.deployment_interval_minutes != 0:
             parser.error("trajectory episode length must be divisible by the deployment interval")
         trajectory_windows = args.episode_minutes // args.deployment_interval_minutes
-        if args.fast_windows_per_update != args.slow_windows_per_update:
-            parser.error("trajectory-simultaneous training requires equal Fast and Slow window counts")
         if args.fast_windows_per_update % trajectory_windows != 0:
-            parser.error("windows per update must contain a whole number of complete trajectories")
+            parser.error("Fast windows per update must contain a whole number of complete trajectories")
+        if args.slow_windows_per_update % trajectory_windows != 0:
+            parser.error("Slow windows per update must contain a whole number of complete trajectories")
+        if args.fast_windows_per_update != args.slow_windows_per_update:
+            parser.error("trajectory-simultaneous training requires one shared Fast/Slow window batch")
     try:
         load_anchors = _parse_float_list(args.load_multipliers, "--load-multipliers")
         load_strata = _load_strata_for_args(args)
@@ -1922,6 +1969,20 @@ def _resource_usage_stats(env: EdgeComputingEnv, args: argparse.Namespace | None
     }
 
 
+def finite_weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    """Average finite observations, falling back safely when all weights are zero."""
+
+    finite = np.isfinite(values) & np.isfinite(weights)
+    if not finite.any():
+        return float("nan")
+    finite_values = values[finite]
+    finite_weights = weights[finite]
+    weight_sum = float(finite_weights.sum())
+    if weight_sum <= 0.0:
+        return float(np.mean(finite_values))
+    return float(np.average(finite_values, weights=finite_weights))
+
+
 def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float]:
     if not rollouts:
         raise ValueError("cannot aggregate an empty rollout batch")
@@ -2045,12 +2106,10 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
     )
     for key in request_weighted:
         values = np.asarray([r[key] for r in rollouts], dtype=np.float64)
-        finite = np.isfinite(values)
-        aggregated[key] = float(np.average(values[finite], weights=requests[finite])) if finite.any() else float("nan")
+        aggregated[key] = finite_weighted_mean(values, requests)
     for key in valid_weighted:
         values = np.asarray([r[key] for r in rollouts], dtype=np.float64)
-        finite = np.isfinite(values) & (valid_requests > 0)
-        aggregated[key] = float(np.average(values[finite], weights=valid_requests[finite])) if finite.any() else float("nan")
+        aggregated[key] = finite_weighted_mean(values, valid_requests)
     for key in simple_mean:
         values = np.asarray([r[key] for r in rollouts], dtype=np.float64)
         aggregated[key] = float(np.nanmean(values))
@@ -2091,6 +2150,33 @@ def build_episode_metrics_row(
         "rollouts_collected": len(rollouts),
         "window_start": int(first["window"]),
         "window_end": int(last["window"]),
+        "total_reward": float(stats["avg_reward"] * requests),
+        "total_train_reward": float(stats["avg_train_reward"] * requests),
+        **stats,
+    }
+
+
+def build_rollout_metrics_row(
+    stats: dict[str, float],
+    context: dict[str, float | int | str],
+    rollout_in_update: int,
+) -> dict[str, float | int | str]:
+    """Build one plot-ready record for every independently collected window."""
+
+    requests = float(stats["requests"])
+    return {
+        "rollout": int(context["rollout"]),
+        "update": int(context["update"]),
+        "rollout_in_update": int(rollout_in_update),
+        "episode": int(context["episode"]),
+        "window": int(context["window"]),
+        "training_phase": str(context["training_phase"]),
+        "demand_seed": int(context["demand_seed"]),
+        "environment_seed": int(context["environment_seed"]),
+        "load_multiplier": float(context["load_multiplier"]),
+        "load_group": int(context["load_group"]),
+        "load_target_probability": float(context["load_target_probability"]),
+        "start_minute": float(context["start_minute"]),
         "total_reward": float(stats["avg_reward"] * requests),
         "total_train_reward": float(stats["avg_train_reward"] * requests),
         **stats,
@@ -2654,6 +2740,107 @@ def pretrain_fast_agent(
     return metrics
 
 
+def _serialize_rollout_buffer(buffer: object) -> dict[str, object]:
+    """Store an on-policy buffer without binding checkpoints to CUDA tensors."""
+
+    states = getattr(buffer, "states")
+    masks = getattr(buffer, "masks")
+    return {
+        "states": torch.as_tensor(np.stack(states), dtype=torch.float32)
+        if states
+        else torch.empty((0,), dtype=torch.float32),
+        "masks": torch.as_tensor(np.stack(masks), dtype=torch.bool)
+        if masks
+        else torch.empty((0,), dtype=torch.bool),
+        "actions": torch.as_tensor(getattr(buffer, "actions"), dtype=torch.int64),
+        "logprobs": torch.as_tensor(getattr(buffer, "logprobs"), dtype=torch.float32),
+        "rewards": torch.as_tensor(getattr(buffer, "rewards"), dtype=torch.float32),
+        "dones": torch.as_tensor(getattr(buffer, "dones"), dtype=torch.bool),
+        "values": torch.as_tensor(getattr(buffer, "values"), dtype=torch.float32),
+        "weights": torch.as_tensor(getattr(buffer, "weights"), dtype=torch.float32),
+        "sample_groups": torch.as_tensor(getattr(buffer, "sample_groups"), dtype=torch.float32),
+    }
+
+
+def _restore_rollout_buffer(buffer: object, state: object) -> None:
+    if not isinstance(state, dict):
+        return
+    buffer.clear()
+    states = state.get("states")
+    masks = state.get("masks")
+    if torch.is_tensor(states) and states.numel() > 0:
+        buffer.states.extend(item.numpy().copy() for item in states.cpu())
+    if torch.is_tensor(masks) and masks.numel() > 0:
+        buffer.masks.extend(item.numpy().astype(bool, copy=True) for item in masks.cpu())
+    tensor_fields = {
+        "actions": int,
+        "logprobs": float,
+        "rewards": float,
+        "dones": bool,
+        "values": float,
+        "weights": float,
+        "sample_groups": float,
+    }
+    for field, converter in tensor_fields.items():
+        values = state.get(field)
+        if torch.is_tensor(values):
+            getattr(buffer, field).extend(converter(value) for value in values.cpu().tolist())
+
+
+def _serialize_pending_slow_collection(agent: HierarchicalPPOAgent) -> dict[str, object]:
+    slow = agent.slow_agent
+    if slow.pending_window_id is not None:
+        raise RuntimeError("checkpoints may only be saved after the current Slow window receives feedback")
+    return {
+        "count_buffer": _serialize_rollout_buffer(slow.count_ppo.buffer),
+        "placement_buffer": _serialize_rollout_buffer(slow.placement_ppo.buffer),
+        "count_action_returns": list(slow.count_action_returns),
+        "placement_action_returns": list(slow.placement_action_returns),
+        "count_action_stage_keys": [list(key) for key in slow.count_action_stage_keys],
+        "placement_action_stage_keys": [list(key) for key in slow.placement_action_stage_keys],
+        "count_window_ids": list(slow.count_window_ids),
+        "placement_window_ids": list(slow.placement_window_ids),
+        "window_states": torch.as_tensor(np.stack(slow.window_states), dtype=torch.float32)
+        if slow.window_states
+        else torch.empty((0,), dtype=torch.float32),
+        "window_old_values": list(slow.window_old_values),
+        "window_returns": list(slow.window_returns),
+        "window_dones": list(slow.window_dones),
+        "window_episode_ids": list(slow.window_episode_ids),
+    }
+
+
+def _restore_pending_slow_collection(agent: HierarchicalPPOAgent, state: object) -> None:
+    if not isinstance(state, dict):
+        return
+    slow = agent.slow_agent
+    _restore_rollout_buffer(slow.count_ppo.buffer, state.get("count_buffer"))
+    _restore_rollout_buffer(slow.placement_ppo.buffer, state.get("placement_buffer"))
+    slow.count_action_returns = [float(value) for value in state.get("count_action_returns", [])]
+    slow.placement_action_returns = [float(value) for value in state.get("placement_action_returns", [])]
+    slow.count_action_stage_keys = [tuple(map(int, key)) for key in state.get("count_action_stage_keys", [])]
+    slow.placement_action_stage_keys = [
+        tuple(map(int, key)) for key in state.get("placement_action_stage_keys", [])
+    ]
+    slow.count_window_ids = [int(value) for value in state.get("count_window_ids", [])]
+    slow.placement_window_ids = [int(value) for value in state.get("placement_window_ids", [])]
+    window_states = state.get("window_states")
+    slow.window_states = (
+        [item.numpy().copy() for item in window_states.cpu()]
+        if torch.is_tensor(window_states) and window_states.numel() > 0
+        else []
+    )
+    slow.window_old_values = [float(value) for value in state.get("window_old_values", [])]
+    slow.window_returns = [float(value) for value in state.get("window_returns", [])]
+    slow.window_dones = [bool(value) for value in state.get("window_dones", [])]
+    slow.window_episode_ids = [int(value) for value in state.get("window_episode_ids", [])]
+    slow.pending_window_id = None
+    slow.pending_count_indices.clear()
+    slow.pending_placement_indices.clear()
+    slow.pending_count_stage_keys.clear()
+    slow.pending_placement_stage_keys.clear()
+
+
 def save_checkpoint(
     agent: HierarchicalPPOAgent,
     path: Path,
@@ -2703,6 +2890,7 @@ def save_checkpoint(
                 dtype=torch.int64,
             ),
             "slow_window_critic_episode_index": agent.slow_agent.critic_episode_index,
+            "pending_slow_collection": _serialize_pending_slow_collection(agent),
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
             "fast_optimizer": agent.fast_agent.ppo.optimizer.state_dict(),
             "fast_entropy_current_coef": agent.fast_agent.entropy_current_coef,
@@ -2806,6 +2994,7 @@ def load_checkpoint(
     if "fast_entropy_current_coef" in checkpoint:
         agent.fast_agent.entropy_current_coef = float(checkpoint["fast_entropy_current_coef"])
         agent.fast_agent.ppo.entropy_coef = agent.fast_agent.entropy_current_coef
+    _restore_pending_slow_collection(agent, checkpoint.get("pending_slow_collection"))
     if random_streams is not None and checkpoint.get("training_random_streams") is not None:
         random_streams.load_state_dict(checkpoint["training_random_streams"])
     if "numpy_random_state" in checkpoint:
@@ -2898,6 +3087,77 @@ def load_adjusted_rolling_latency(
         )
     adjusted = latencies - slope * (loads - float(reference_load))
     return float(np.mean(adjusted[-window:])), slope
+
+
+class SlowLearningRateController:
+    """Reduce Slow actor step sizes after a sustained, load-adjusted plateau."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        patience: int,
+        factor: float,
+        min_delta: float,
+        min_lr: float,
+        state: object = None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.patience = int(patience)
+        self.factor = float(factor)
+        self.min_delta = float(min_delta)
+        self.min_lr = float(min_lr)
+        self.best_score = float("inf")
+        self.bad_updates = 0
+        self.reductions = 0
+        if isinstance(state, dict):
+            self.best_score = float(state.get("best_score", self.best_score))
+            self.bad_updates = int(state.get("bad_updates", 0))
+            self.reductions = int(state.get("reductions", 0))
+
+    @staticmethod
+    def optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
+        return float(optimizer.param_groups[0]["lr"])
+
+    def observe(
+        self,
+        score: float,
+        *,
+        ready: bool,
+        slow_updated: bool,
+        agent: HierarchicalPPOAgent,
+    ) -> bool:
+        if not self.enabled or not ready or not slow_updated or not np.isfinite(score):
+            return False
+        if score < self.best_score - self.min_delta:
+            self.best_score = float(score)
+            self.bad_updates = 0
+            return False
+        self.bad_updates += 1
+        if self.bad_updates < self.patience:
+            return False
+
+        changed = False
+        for optimizer in (
+            agent.slow_agent.count_ppo.optimizer,
+            agent.slow_agent.placement_ppo.optimizer,
+        ):
+            for group in optimizer.param_groups:
+                old_lr = float(group["lr"])
+                new_lr = min(old_lr, max(self.min_lr, old_lr * self.factor))
+                group["lr"] = new_lr
+                changed = changed or new_lr < old_lr - 1e-15
+        self.bad_updates = 0
+        if changed:
+            self.reductions += 1
+        return changed
+
+    def state_dict(self) -> dict[str, float | int]:
+        return {
+            "best_score": self.best_score,
+            "bad_updates": self.bad_updates,
+            "reductions": self.reductions,
+        }
 
 
 def checkpoint_reference_load(args: argparse.Namespace) -> float:
@@ -3190,6 +3450,11 @@ def main() -> None:
         f"snapshot_interval={args.checkpoint_interval} atomic=true"
     )
     print(
+        f"  slow_lr_decay enabled={args.slow_lr_decay} patience={args.slow_lr_decay_patience} "
+        f"factor={args.slow_lr_decay_factor} min_delta={args.slow_lr_decay_min_delta}s "
+        f"min_lr={args.slow_min_lr}"
+    )
+    print(
         f"  ppo_target_kl count={args.slow_count_target_kl} "
         f"placement={args.slow_placement_target_kl} fast={args.fast_target_kl}"
     )
@@ -3207,8 +3472,9 @@ def main() -> None:
     run_name, run_dir, log_dir, save_dir = make_run_paths(args)
     log_path = log_dir / "training.csv"
     episode_log_path = log_dir / "episode_metrics.csv"
+    rollout_log_path = log_dir / "rollout_metrics.csv"
     if not args.append_log:
-        for path in (log_path, episode_log_path):
+        for path in (log_path, episode_log_path, rollout_log_path):
             if path.exists():
                 path.unlink()
     write_metadata(run_dir, args, bc_metrics, loaded_metadata)
@@ -3246,6 +3512,14 @@ def main() -> None:
                     }
                 )
     reference_checkpoint_load = checkpoint_reference_load(args)
+    slow_lr_controller = SlowLearningRateController(
+        enabled=args.slow_lr_decay,
+        patience=args.slow_lr_decay_patience,
+        factor=args.slow_lr_decay_factor,
+        min_delta=args.slow_lr_decay_min_delta,
+        min_lr=args.slow_min_lr,
+        state=loaded_metadata.get("slow_lr_controller_state"),
+    )
     target_update = resume_update_offset + args.updates
 
     if args.eval_baseline:
@@ -3410,6 +3684,17 @@ def main() -> None:
             "slow_updated": 0,
             "slow_windows_available": 0,
             "slow_windows_buffered": 0,
+            "checkpoint_score": np.nan,
+            "checkpoint_score_load_slope": np.nan,
+            "slow_count_lr": SlowLearningRateController.optimizer_lr(
+                agent.slow_agent.count_ppo.optimizer
+            ),
+            "slow_placement_lr": SlowLearningRateController.optimizer_lr(
+                agent.slow_agent.placement_ppo.optimizer
+            ),
+            "slow_lr_bad_updates": slow_lr_controller.bad_updates,
+            "slow_lr_reductions": slow_lr_controller.reductions,
+            "slow_lr_decayed": 0,
             "slow_policy_loss": 0.0,
             "slow_value_loss": 0.0,
             "slow_approx_kl": 0.0,
@@ -3801,6 +4086,10 @@ def main() -> None:
                 "rollout": rollout_idx + 1,
                 "window": window_in_episode,
             }
+            append_log(
+                rollout_log_path,
+                build_rollout_metrics_row(one_stats, episode_context, rollout_in_update + 1),
+            )
             if (
                 episode_rollout_contexts
                 and int(episode_rollout_contexts[-1]["episode"]) != episode_number
@@ -3877,6 +4166,35 @@ def main() -> None:
             slow_metrics = agent.slow_agent.empty_update_metrics()
         losses = {"slow": slow_metrics, "fast": fast_metrics}
         slow_windows_buffered = agent.completed_slow_windows
+        checkpoint_selection_history.append(
+            {
+                "latency_s": float(stats["avg_latency_s"]),
+                "load_multiplier": float(load_multiplier_mean),
+            }
+        )
+        checkpoint_score, checkpoint_load_slope = load_adjusted_rolling_latency(
+            checkpoint_selection_history,
+            args.best_checkpoint_window,
+            reference_checkpoint_load,
+        )
+        checkpoint_ready = len(checkpoint_selection_history) >= args.best_checkpoint_window
+        slow_lr_decayed = slow_lr_controller.observe(
+            checkpoint_score,
+            ready=checkpoint_ready,
+            slow_updated=slow_updated,
+            agent=agent,
+        )
+        slow_count_lr = SlowLearningRateController.optimizer_lr(
+            agent.slow_agent.count_ppo.optimizer
+        )
+        slow_placement_lr = SlowLearningRateController.optimizer_lr(
+            agent.slow_agent.placement_ppo.optimizer
+        )
+        if slow_lr_decayed:
+            print(
+                f"  slow_lr_decay score={checkpoint_score:.6f}s "
+                f"count_lr={slow_count_lr:.3g} placement_lr={slow_placement_lr:.3g}"
+            )
 
         eval_stats = {}
         seen_eval_stats = {}
@@ -4022,6 +4340,13 @@ def main() -> None:
             "slow_updated": int(slow_updated),
             "slow_windows_available": int(slow_windows_available),
             "slow_windows_buffered": int(slow_windows_buffered),
+            "checkpoint_score": checkpoint_score,
+            "checkpoint_score_load_slope": checkpoint_load_slope,
+            "slow_count_lr": slow_count_lr,
+            "slow_placement_lr": slow_placement_lr,
+            "slow_lr_bad_updates": slow_lr_controller.bad_updates,
+            "slow_lr_reductions": slow_lr_controller.reductions,
+            "slow_lr_decayed": int(slow_lr_decayed),
             "slow_policy_loss": losses["slow"]["policy_loss"],
             "slow_value_loss": losses["slow"]["value_loss"],
             "slow_approx_kl": losses["slow"].get("approx_kl", 0.0),
@@ -4365,18 +4690,6 @@ def main() -> None:
                     eval_stats["eval_hot_link_rate"],
                 )
             )
-        checkpoint_selection_history.append(
-            {
-                "latency_s": float(stats["avg_latency_s"]),
-                "load_multiplier": float(load_multiplier_mean),
-            }
-        )
-        checkpoint_score, checkpoint_load_slope = load_adjusted_rolling_latency(
-            checkpoint_selection_history,
-            args.best_checkpoint_window,
-            reference_checkpoint_load,
-        )
-        checkpoint_ready = len(checkpoint_selection_history) >= args.best_checkpoint_window
         should_replace_best = (
             (checkpoint_ready and not best_checkpoint_ready)
             or (checkpoint_ready == best_checkpoint_ready and checkpoint_score < best_checkpoint_score)
@@ -4400,6 +4713,7 @@ def main() -> None:
             "checkpoint_reference_load": reference_checkpoint_load,
             "checkpoint_selection_window": args.best_checkpoint_window,
             "checkpoint_selection_history": checkpoint_selection_history,
+            "slow_lr_controller_state": slow_lr_controller.state_dict(),
             "run_name": run_name,
             "train_mode": args.train_mode,
         }
@@ -4500,6 +4814,7 @@ def main() -> None:
                 "checkpoint_reference_load": reference_checkpoint_load,
                 "checkpoint_selection_window": args.best_checkpoint_window,
                 "checkpoint_selection_history": checkpoint_selection_history,
+                "slow_lr_controller_state": slow_lr_controller.state_dict(),
                 "selection_kind": "final",
                 "run_name": run_name,
                 "train_mode": args.train_mode,
@@ -4508,6 +4823,7 @@ def main() -> None:
         )
         print(f"log={log_path}")
         print(f"episode_log={episode_log_path}")
+        print(f"rollout_log={rollout_log_path}")
         print(f"checkpoint={save_dir / 'last.pt'}")
     print(f"elapsed={datetime.now().replace(microsecond=0) - start}")
 
