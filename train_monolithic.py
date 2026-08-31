@@ -20,9 +20,16 @@ from edge_drl.comparison.types import ExperimentPoint
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 from edge_drl.env.scenario import EdgeScenario
 from train_dual_ppo import (
+    SlowLearningRateController,
     TrainingRandomStreams,
     aggregate_rollout_stats,
+    append_log,
+    build_episode_metrics_row,
+    build_rollout_metrics_row,
+    checkpoint_reference_load,
     load_assignments_for_update,
+    load_adjusted_rolling_latency,
+    load_probability_for_group,
     rollout,
     save_checkpoint,
 )
@@ -318,7 +325,14 @@ def main() -> None:
     run_dir = Path(cli.run_root) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
-    best_score = float("inf")
+    log_dir = run_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    update_log_path = log_dir / "training.csv"
+    episode_log_path = log_dir / "episode_metrics.csv"
+    rollout_log_path = log_dir / "rollout_metrics.csv"
+    best_checkpoint_score = float("inf")
+    best_checkpoint_ready = False
+    checkpoint_selection_history: list[dict[str, float]] = []
     history: list[dict[str, float]] = []
     total_episodes = cli.updates * cli.episodes_per_update
     total_windows_per_episode = max(
@@ -333,6 +347,16 @@ def main() -> None:
     )
     training_random_streams = TrainingRandomStreams(effective_seed)
     training_rollout_idx = 0
+    best_checkpoint_window = int(base_args.get("best_checkpoint_window", 10))
+    checkpoint_interval = int(base_args.get("checkpoint_interval", 20))
+    reference_checkpoint_load = checkpoint_reference_load(synchronized_args)
+    slow_lr_controller = SlowLearningRateController(
+        enabled=bool(base_args.get("slow_lr_decay", False)),
+        patience=int(base_args.get("slow_lr_decay_patience", 10)),
+        factor=float(base_args.get("slow_lr_decay_factor", 0.5)),
+        min_delta=float(base_args.get("slow_lr_decay_min_delta", 5e-4)),
+        min_lr=float(base_args.get("slow_min_lr", 1e-5)),
+    )
     synchronization = {
         "source_proposed_checkpoint": str(base_path),
         "master_seed": effective_seed,
@@ -343,7 +367,15 @@ def main() -> None:
         "load_strata": synchronized_args.load_strata,
         "load_stratum_probabilities": synchronized_args.load_stratum_probabilities,
         "fast_windows_per_update": total_windows_per_episode * cli.episodes_per_update,
+        "slow_windows_per_update": total_windows_per_episode * cli.episodes_per_update,
         "sampled_seconds_per_window": effective_sampled_seconds,
+        "best_checkpoint_window": best_checkpoint_window,
+        "checkpoint_reference_load": reference_checkpoint_load,
+        "slow_lr_decay": slow_lr_controller.enabled,
+        "slow_lr_decay_patience": slow_lr_controller.patience,
+        "slow_lr_decay_factor": slow_lr_controller.factor,
+        "slow_lr_decay_min_delta": slow_lr_controller.min_delta,
+        "slow_min_lr": slow_lr_controller.min_lr,
         "request_trace_rng": "Proposed environment_seed stream",
         "structural_difference": "Monolithic stage collapse only",
     }
@@ -430,6 +462,7 @@ def main() -> None:
                 }
             )
             window_stats: list[dict[str, float]] = []
+            window_contexts: list[dict[str, float | int | str]] = []
             for window_offset in range(total_windows_per_episode):
                 one_stats = rollout(
                     env,
@@ -460,9 +493,35 @@ def main() -> None:
                     progress_interval_seconds=cli.progress_interval_seconds,
                 )
                 window_stats.append(one_stats)
+                load_multiplier, load_group = episode_assignments[window_offset]
+                context: dict[str, float | int | str] = {
+                    "rollout": training_rollout_idx + 1,
+                    "update": update,
+                    "episode": episode_index + 1,
+                    "window": window_offset + 1,
+                    "training_phase": "joint_1to1",
+                    "demand_seed": int(demand_seed),
+                    "environment_seed": int(environment_seed),
+                    "load_multiplier": float(load_multiplier),
+                    "load_group": int(load_group),
+                    "load_target_probability": load_probability_for_group(
+                        synchronized_args,
+                        int(load_group),
+                    ),
+                    "start_minute": float(window_offset * config.deployment_interval_minutes),
+                }
+                window_contexts.append(context)
+                append_log(
+                    rollout_log_path,
+                    build_rollout_metrics_row(one_stats, context, window_offset + 1),
+                )
                 training_rollout_idx += 1
             episode_stats = aggregate_rollout_stats(window_stats)
             episode_stats_for_update.append(episode_stats)
+            append_log(
+                episode_log_path,
+                build_episode_metrics_row(window_stats, window_contexts),
+            )
             completed_episodes = (update - 1) * cli.episodes_per_update + episode_offset + 1
             _print_training_progress(
                 completed_episodes=completed_episodes,
@@ -486,19 +545,75 @@ def main() -> None:
             encoding="utf-8",
         )
         stats = aggregate_rollout_stats(episode_stats_for_update)
-        update_metrics = agent.update(
-            progress_label=f"monolithic update {update}",
+        fast_metrics = agent.update_fast(
+            progress_label=f"monolithic update {update} fast PPO",
             progress_interval_seconds=cli.progress_interval_seconds,
+        )
+        slow_windows_available = agent.completed_slow_windows
+        if slow_windows_available < windows_this_update:
+            raise RuntimeError(
+                "Monolithic 1:1 update expected "
+                f"{windows_this_update} completed Slow windows, got {slow_windows_available}"
+            )
+        slow_metrics = agent.update_slow(
+            progress_label=f"monolithic update {update} slow PPO",
+            progress_interval_seconds=cli.progress_interval_seconds,
+        )
+        update_metrics = {"fast": fast_metrics, "slow": slow_metrics}
+        load_multiplier_mean = float(
+            np.mean([multiplier for multiplier, _ in update_load_assignments])
+        )
+        checkpoint_selection_history.append(
+            {
+                "latency_s": float(stats.get("avg_latency_s", np.nan)),
+                "load_multiplier": load_multiplier_mean,
+            }
+        )
+        checkpoint_score, checkpoint_load_slope = load_adjusted_rolling_latency(
+            checkpoint_selection_history,
+            best_checkpoint_window,
+            reference_checkpoint_load,
+        )
+        checkpoint_ready = len(checkpoint_selection_history) >= best_checkpoint_window
+        slow_updated = True
+        slow_lr_decayed = slow_lr_controller.observe(
+            checkpoint_score,
+            ready=checkpoint_ready,
+            slow_updated=slow_updated,
+            agent=agent,
+        )
+        slow_count_lr = SlowLearningRateController.optimizer_lr(
+            agent.slow_agent.count_ppo.optimizer
+        )
+        slow_placement_lr = SlowLearningRateController.optimizer_lr(
+            agent.slow_agent.placement_ppo.optimizer
+        )
+        should_replace_best = (
+            (checkpoint_ready and not best_checkpoint_ready)
+            or (
+                checkpoint_ready == best_checkpoint_ready
+                and checkpoint_score < best_checkpoint_score
+            )
         )
         row = {
             "update": float(update),
             "avg_latency_s": float(stats.get("avg_latency_s", 0.0)),
             "p95_latency_s": float(stats.get("p95_latency_s", 0.0)),
             "avg_reward": float(stats.get("avg_reward", 0.0)),
+            "load_multiplier_mean": load_multiplier_mean,
+            "checkpoint_score": checkpoint_score,
+            "checkpoint_score_load_slope": checkpoint_load_slope,
+            "checkpoint_ready": float(checkpoint_ready),
+            "slow_count_lr": slow_count_lr,
+            "slow_placement_lr": slow_placement_lr,
+            "slow_lr_bad_updates": float(slow_lr_controller.bad_updates),
+            "slow_lr_reductions": float(slow_lr_controller.reductions),
+            "slow_lr_decayed": float(slow_lr_decayed),
             **{f"fast_{key}": float(value) for key, value in update_metrics.get("fast", {}).items() if isinstance(value, (int, float))},
             **{f"slow_{key}": float(value) for key, value in update_metrics.get("slow", {}).items() if isinstance(value, (int, float))},
         }
         history.append(row)
+        append_log(update_log_path, row)
         metadata = {
             "args": {
                 **base_args,
@@ -515,14 +630,47 @@ def main() -> None:
             },
             "synchronization": synchronization,
             "update": update,
+            "completed_updates": update,
+            "completed_rollouts": training_rollout_idx,
+            "completed_episodes": update * cli.episodes_per_update,
+            "best_checkpoint_score": (
+                checkpoint_score if should_replace_best else best_checkpoint_score
+            ),
+            "best_checkpoint_ready": best_checkpoint_ready or checkpoint_ready,
+            "checkpoint_score": checkpoint_score,
+            "checkpoint_score_load_slope": checkpoint_load_slope,
+            "checkpoint_reference_load": reference_checkpoint_load,
+            "checkpoint_selection_window": best_checkpoint_window,
+            "checkpoint_selection_history": checkpoint_selection_history,
+            "slow_lr_controller_state": slow_lr_controller.state_dict(),
             "history": row,
         }
-        save_checkpoint(agent, checkpoint_dir / "latest.pt", metadata)
-        score = float(stats.get("avg_latency_s", float("inf")))
-        if score < best_score:
-            best_score = score
-            save_checkpoint(agent, checkpoint_dir / "best.pt", metadata)
+        save_checkpoint(
+            agent,
+            checkpoint_dir / "latest.pt",
+            {**metadata, "selection_kind": "latest"},
+            training_random_streams,
+        )
+        if should_replace_best:
+            best_checkpoint_score = checkpoint_score
+            best_checkpoint_ready = checkpoint_ready
+            metadata["best_checkpoint_score"] = best_checkpoint_score
+            metadata["best_checkpoint_ready"] = best_checkpoint_ready
+            save_checkpoint(
+                agent,
+                checkpoint_dir / "best.pt",
+                {**metadata, "selection_kind": "load_adjusted_rolling_train"},
+                training_random_streams,
+            )
+        if checkpoint_interval > 0 and update % checkpoint_interval == 0:
+            save_checkpoint(
+                agent,
+                checkpoint_dir / f"update_{update:04d}.pt",
+                {**metadata, "selection_kind": "periodic_snapshot"},
+                training_random_streams,
+            )
         (run_dir / "training_log.json").write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        score = float(stats.get("avg_latency_s", float("inf")))
         _print_training_progress(
             completed_episodes=update * cli.episodes_per_update,
             total_episodes=total_episodes,
@@ -552,13 +700,48 @@ def main() -> None:
                     "comparison_scenario_value": cli.scenario_value,
                 },
                 "synchronization": synchronization,
-                "best_score_avg_latency_s": best_score,
+                "best_checkpoint_score": best_checkpoint_score,
+                "best_checkpoint_ready": best_checkpoint_ready,
+                "checkpoint_reference_load": reference_checkpoint_load,
+                "checkpoint_selection_window": best_checkpoint_window,
+                "slow_lr_controller_state": slow_lr_controller.state_dict(),
             },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
+    if history:
+        save_checkpoint(
+            agent,
+            checkpoint_dir / "last.pt",
+            {
+                "args": {
+                    **base_args,
+                    "seed": effective_seed,
+                    "physical_seed": physical_seed,
+                    "episode_minutes": effective_episode_minutes,
+                    "episodes_per_update": cli.episodes_per_update,
+                    "sampled_seconds_per_window": effective_sampled_seconds,
+                    "run_name": run_name,
+                    "training_scheme": "Monolithic",
+                    "comparison_scenario_family": cli.scenario_family,
+                    "comparison_scenario_value": cli.scenario_value,
+                },
+                "synchronization": synchronization,
+                "update": cli.updates,
+                "completed_updates": cli.updates,
+                "completed_rollouts": training_rollout_idx,
+                "completed_episodes": total_episodes,
+                "best_checkpoint_score": best_checkpoint_score,
+                "best_checkpoint_ready": best_checkpoint_ready,
+                "checkpoint_selection_history": checkpoint_selection_history,
+                "slow_lr_controller_state": slow_lr_controller.state_dict(),
+                "history": history[-1],
+                "selection_kind": "last",
+            },
+            training_random_streams,
+        )
     print(f"monolithic checkpoints: {checkpoint_dir.resolve()}")
 
 

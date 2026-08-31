@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from train_monolithic import _format_duration, build_parser
+from train_monolithic import _format_duration, _synchronized_training_args, build_parser
 from edge_drl.comparison.trace import generate_comparison_trace
 from tests.comparison_helpers import tiny_scenario
 
@@ -20,6 +20,24 @@ def test_monolithic_progress_duration_format() -> None:
     assert _format_duration(5.9) == "00:05"
     assert _format_duration(65.0) == "01:05"
     assert _format_duration(3661.0) == "1:01:01"
+
+
+def test_monolithic_inherits_proposed_stability_and_sampling_settings() -> None:
+    base_args = {
+        "sampled_seconds_per_window": 6,
+        "best_checkpoint_window": 10,
+        "slow_lr_decay": True,
+        "slow_lr_decay_patience": 20,
+        "load_multipliers": "0.8,1.0,1.2,1.4",
+    }
+
+    synchronized = _synchronized_training_args(base_args, seed=2026, episode_minutes=60)
+
+    assert synchronized.sampled_seconds_per_window == 6
+    assert synchronized.best_checkpoint_window == 10
+    assert synchronized.slow_lr_decay is True
+    assert synchronized.slow_lr_decay_patience == 20
+    assert synchronized.load_multipliers == "0.8,1.0,1.2,1.4"
 
 
 def test_scheduled_trace_matches_constant_trace_for_constant_rate() -> None:

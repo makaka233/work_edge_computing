@@ -45,8 +45,9 @@ Run Phase 1 from PowerShell:
 
 ```powershell
 python run_comparison.py `
-  --checkpoint "runs\placement_credit_episode60_large_s30_u320_20260826_123639\checkpoints\best.pt" `
+  --checkpoint "runs\joint_1to1_stability_large_s30_u320_20260831_121230\checkpoints\best.pt" `
   --monolithic-checkpoint "runs\monolithic_checkpoints\request_load_1\checkpoints\best.pt" `
+  --monolithic-checkpoint-mode fixed `
   --phase 1 `
   --device cuda
 ```
@@ -58,7 +59,7 @@ structure change is the one-stage collapse:
 
 ```powershell
 python .\train_monolithic.py `
-  --base-checkpoint ".\runs\placement_credit_episode60_large_s30_u320_20260826_123639\checkpoints\best.pt" `
+  --base-checkpoint ".\runs\joint_1to1_stability_large_s30_u320_20260831_121230\checkpoints\best.pt" `
   --updates 320 `
   --episode-minutes 60 `
   --run-root ".\runs\monolithic_checkpoints" `
@@ -76,11 +77,15 @@ The run writes `training_manifest.json`, including the physical seed, demand
 seed, environment/request seed, load assignments, and trace hash for every
 episode so parity can be audited.
 
-For Phase 2/3, train one Monolithic checkpoint per parameter point and place
-each run below a common directory (for example
-`runs/monolithic_checkpoints/request_load_0.8/checkpoints/best.pt`). Then pass
-that common directory to `--monolithic-checkpoint`; the runner resolves the
-`<family>_<value>` subdirectory for each point and fails if it is missing.
+For the formal Phase 2/3 protocol, freeze one Proposed checkpoint and one
+Monolithic checkpoint trained on the same nominal training distribution and
+budget.  Reuse those two checkpoints unchanged over all five scenario families
+and 28 parameter points.  This makes stage decomposition the learning schemes'
+only structural difference and uses the sweeps to measure generalization.
+`--monolithic-checkpoint-mode fixed` is therefore the default and requires a
+checkpoint file.  The legacy `per-point` directory/template resolver remains
+available only for explicitly labelled exploratory experiments; its results
+must not be mixed into the formal fixed-checkpoint tables.
 
 Plot a completed run:
 

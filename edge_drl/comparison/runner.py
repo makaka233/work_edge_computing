@@ -52,6 +52,7 @@ def run_comparison(
     schemes: tuple[str, ...] = FORMAL_SCHEMES,
     phase2_validation_run: str | Path | None = None,
     monolithic_checkpoint: str | Path | None = None,
+    monolithic_checkpoint_mode: str = "fixed",
 ) -> Path:
     if phase == 3:
         _require_phase2_validation(phase2_validation_run)
@@ -59,6 +60,17 @@ def run_comparison(
         raise ValueError(
             "Monolithic is trainable and requires --monolithic-checkpoint; "
             "it is never replaced by an optimization baseline"
+        )
+    if monolithic_checkpoint_mode not in {"fixed", "per-point"}:
+        raise ValueError("monolithic_checkpoint_mode must be 'fixed' or 'per-point'")
+    if (
+        "Monolithic" in schemes
+        and monolithic_checkpoint_mode == "fixed"
+        and not Path(str(monolithic_checkpoint)).is_file()
+    ):
+        raise ValueError(
+            "formal fixed-checkpoint comparison requires --monolithic-checkpoint "
+            "to name one checkpoint file"
         )
     checkpoint_path, checkpoint_args, checkpoint_internal = load_checkpoint_configuration(checkpoint)
     unknown = sorted(set(schemes) - set(FORMAL_SCHEMES))
@@ -88,6 +100,12 @@ def run_comparison(
         "dmdr_routing_repeats": dmdr_repeats,
         "checkpoint": str(checkpoint_path),
         "monolithic_checkpoint": None if monolithic_checkpoint is None else str(monolithic_checkpoint),
+        "learning_checkpoint_protocol": (
+            "fixed_across_scenario_sweeps"
+            if monolithic_checkpoint_mode == "fixed"
+            else "exploratory_per_point"
+        ),
+        "monolithic_checkpoint_mode": monolithic_checkpoint_mode,
         "checkpoint_metadata": checkpoint_internal,
         "checkpoint_args": checkpoint_args,
         "proposed_offline_training_time_s": None,
@@ -164,6 +182,7 @@ def run_comparison(
                             phase=phase,
                             dmdr_plan_cache=dmdr_plan_cache,
                             monolithic_checkpoint=monolithic_checkpoint,
+                            monolithic_checkpoint_mode=monolithic_checkpoint_mode,
                             point=point,
                         )
                         result = evaluate_scheme_episode(
@@ -267,6 +286,7 @@ def _make_scheme(
     phase: int,
     dmdr_plan_cache: dict[int, dict[str, object]] | None = None,
     monolithic_checkpoint: str | Path | None = None,
+    monolithic_checkpoint_mode: str = "fixed",
     point: ExperimentPoint | None = None,
 ):
     if name == "Proposed":
@@ -274,7 +294,11 @@ def _make_scheme(
     if name == "Monolithic":
         assert monolithic_checkpoint is not None
         assert point is not None
-        resolved = _resolve_monolithic_checkpoint(monolithic_checkpoint, point)
+        resolved = _resolve_monolithic_checkpoint(
+            monolithic_checkpoint,
+            point,
+            mode=monolithic_checkpoint_mode,
+        )
         return MonolithicScheme(env, resolved, device=device)
     if name == "SICP":
         return SICPScheme(solver_time_limit_s=30.0 if phase == 1 else 120.0)
@@ -287,7 +311,19 @@ def _make_scheme(
     raise ValueError(name)
 
 
-def _resolve_monolithic_checkpoint(path: str | Path, point: ExperimentPoint) -> Path:
+def _resolve_monolithic_checkpoint(
+    path: str | Path,
+    point: ExperimentPoint,
+    *,
+    mode: str = "per-point",
+) -> Path:
+    if mode == "fixed":
+        candidate = Path(path)
+        if candidate.is_file():
+            return candidate
+        raise FileNotFoundError(candidate)
+    if mode != "per-point":
+        raise ValueError("Monolithic checkpoint mode must be 'fixed' or 'per-point'")
     raw = str(path)
     if "{family}" in raw or "{value}" in raw:
         candidate = Path(raw.format(family=point.family, value=f"{point.value:g}"))

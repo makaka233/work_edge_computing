@@ -7,7 +7,7 @@ from edge_drl.comparison.dmdr import DMDRScheme
 from edge_drl.comparison.scheme import BaseComparisonScheme
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
 from edge_drl.comparison.types import ExperimentPoint
-from edge_drl.comparison.runner import _require_phase2_validation
+from edge_drl.comparison.runner import _require_phase2_validation, _resolve_monolithic_checkpoint
 from edge_drl.comparison.io import write_json
 from tests.comparison_helpers import tiny_replay_env
 
@@ -82,6 +82,25 @@ def test_phase3_requires_a_successful_phase2_marker(tmp_path) -> None:
     run = tmp_path / "phase2"
     write_json(run / "diagnostics" / "phase2_validated.json", {"validated": True, "phase": 2})
     _require_phase2_validation(run)
+
+
+def test_formal_monolithic_checkpoint_is_fixed_across_points(tmp_path) -> None:
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    first = ExperimentPoint("request_load", 0.8, "low")
+    second = ExperimentPoint("wired_bandwidth", 2.0, "high")
+
+    assert _resolve_monolithic_checkpoint(checkpoint, first, mode="fixed") == checkpoint
+    assert _resolve_monolithic_checkpoint(checkpoint, second, mode="fixed") == checkpoint
+
+
+def test_exploratory_per_point_checkpoint_resolution_remains_available(tmp_path) -> None:
+    checkpoint = tmp_path / "request_load_0.8" / "checkpoints" / "best.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    point = ExperimentPoint("request_load", 0.8, "low")
+
+    assert _resolve_monolithic_checkpoint(tmp_path, point, mode="per-point") == checkpoint
 
 
 def test_all_comparison_scheme_interfaces_settle_without_invalid_actions() -> None:
