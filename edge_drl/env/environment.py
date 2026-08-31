@@ -69,6 +69,49 @@ def _link_kkt_externality_delays(
     return externalities
 
 
+def _allocate_serial_compute_kkt(
+    demands: list[ComputeDemand],
+    capacities: np.ndarray,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Settle compute demands one causal service-chain phase at a time.
+
+    Demands belonging to the same stage across different requests remain
+    concurrent and share node capacity through KKT.  Stages of one request are
+    serial, so they must not compete with one another in the same KKT problem.
+    """
+
+    delays: dict[str, float] = {}
+    externalities: dict[str, float] = {}
+    by_phase: dict[int, list[ComputeDemand]] = {}
+    for demand in demands:
+        by_phase.setdefault(int(demand.serial_phase), []).append(demand)
+    for phase in sorted(by_phase):
+        phase_demands = by_phase[phase]
+        _, phase_delays, _ = allocate_compute_kkt(phase_demands, capacities)
+        delays.update(phase_delays)
+        externalities.update(_compute_kkt_externality_delays(phase_demands, capacities))
+    return delays, externalities
+
+
+def _allocate_serial_link_kkt(
+    demands: list[LinkDemand],
+    capacities: np.ndarray,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Settle ingress and inter-stage transfers in causal chain phases."""
+
+    delays: dict[str, float] = {}
+    externalities: dict[str, float] = {}
+    by_phase: dict[int, list[LinkDemand]] = {}
+    for demand in demands:
+        by_phase.setdefault(int(demand.serial_phase), []).append(demand)
+    for phase in sorted(by_phase):
+        phase_demands = by_phase[phase]
+        _, phase_delays, _ = allocate_link_kkt(phase_demands, capacities)
+        delays.update(phase_delays)
+        externalities.update(_link_kkt_externality_delays(phase_demands, capacities))
+    return delays, externalities
+
+
 def _daily_arrival_factor(minute_of_day: float) -> float:
     morning_peak = np.exp(-0.5 * ((minute_of_day - 9 * 60) / 105.0) ** 2)
     lunch_peak = np.exp(-0.5 * ((minute_of_day - 13 * 60) / 90.0) ** 2)
@@ -488,12 +531,16 @@ class EdgeComputingEnv:
         finite = np.isfinite(link_capacity)
         link_capacity[finite] *= np.clip(1.0 - 0.75 * self.link_load[finite], 0.10, 1.0)
 
-        _, joint_compute_delays, _ = allocate_compute_kkt(all_compute_demands, node_capacity)
-        joint_compute_externalities = _compute_kkt_externality_delays(all_compute_demands, node_capacity)
+        joint_compute_delays, joint_compute_externalities = _allocate_serial_compute_kkt(
+            all_compute_demands,
+            node_capacity,
+        )
         link_allocation_failed = False
         try:
-            _, joint_link_delays, _ = allocate_link_kkt(all_link_demands, link_capacity)
-            joint_link_externalities = _link_kkt_externality_delays(all_link_demands, link_capacity)
+            joint_link_delays, joint_link_externalities = _allocate_serial_link_kkt(
+                all_link_demands,
+                link_capacity,
+            )
         except ValueError:
             joint_link_delays = {}
             joint_link_externalities = {}
@@ -591,13 +638,25 @@ class EdgeComputingEnv:
                 violations.append(f"service stage {stage_id} is not deployed on node {node_id}")
 
         compute_demands = [
-            ComputeDemand(f"stage-{stage_id}", node_id, request.stage_compute_gcycles[stage_id])
+            ComputeDemand(
+                f"stage-{stage_id}",
+                node_id,
+                request.stage_compute_gcycles[stage_id],
+                serial_phase=2 * stage_id + 1,
+            )
             for stage_id, node_id in enumerate(nodes)
         ]
         link_demands: list[LinkDemand] = []
         logical_propagation_delays: dict[str, float] = {}
 
-        def add_routed_link(demand_id: str, src_node: int, dst_node: int, data_mb: float) -> None:
+        def add_routed_link(
+            demand_id: str,
+            src_node: int,
+            dst_node: int,
+            data_mb: float,
+            *,
+            serial_phase: int,
+        ) -> None:
             nonlocal valid
             if src_node == dst_node:
                 logical_propagation_delays[demand_id] = 0.0
@@ -610,12 +669,26 @@ class EdgeComputingEnv:
                 return
             propagation_s = 0.0
             for hop_id, (hop_src, hop_dst) in enumerate(zip(path, path[1:])):
-                link_demands.append(LinkDemand(f"{demand_id}#h{hop_id}", hop_src, hop_dst, data_mb))
+                link_demands.append(
+                    LinkDemand(
+                        f"{demand_id}#h{hop_id}",
+                        hop_src,
+                        hop_dst,
+                        data_mb,
+                        serial_phase=serial_phase,
+                    )
+                )
                 propagation_s += float(self.scenario.propagation_ms[hop_src, hop_dst]) / 1000.0
             logical_propagation_delays[demand_id] = propagation_s
 
         if nodes and nodes[0] != request.home_node:
-            add_routed_link("ingress", request.home_node, nodes[0], request.input_mb)
+            add_routed_link(
+                "ingress",
+                request.home_node,
+                nodes[0],
+                request.input_mb,
+                serial_phase=0,
+            )
         for stage_id in range(max(len(nodes) - 1, 0)):
             if nodes[stage_id] != nodes[stage_id + 1]:
                 add_routed_link(
@@ -623,6 +696,7 @@ class EdgeComputingEnv:
                     nodes[stage_id],
                     nodes[stage_id + 1],
                     request.stage_output_mb[stage_id],
+                    serial_phase=2 * stage_id + 2,
                 )
 
         count = float(request.request_count)
@@ -632,6 +706,7 @@ class EdgeComputingEnv:
                 demand.node_id,
                 demand.compute_gcycles,
                 multiplicity=count,
+                serial_phase=demand.serial_phase,
             )
             for demand in compute_demands
         ]
@@ -642,6 +717,7 @@ class EdgeComputingEnv:
                 demand.dst_node,
                 demand.data_mb,
                 multiplicity=count,
+                serial_phase=demand.serial_phase,
             )
             for demand in link_demands
         ]

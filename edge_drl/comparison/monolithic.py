@@ -55,6 +55,49 @@ def collapse_trace(trace: ComparisonTrace) -> ComparisonTrace:
     return rehash_trace(trace, tuple(slots))
 
 
+def adapt_request_for_monolithic_evaluation(request: TaskRequest) -> TaskRequest:
+    """Keep the physical stage path while concentrating work in one stage.
+
+    Training uses a genuinely one-stage scenario and trace.  Evaluation must
+    still call the shared physical simulator with the original number of
+    stages, otherwise stage-wise deployment/resource metrics would no longer
+    be comparable.  The first stage carries the aggregate compute demand and
+    all remaining stages are zero-work; every inter-stage output is zero.
+    """
+
+    stage_count = len(request.stage_compute_gcycles)
+    if stage_count < 1:
+        raise ValueError("a TaskRequest must contain at least one stage")
+    return replace(
+        request,
+        stage_compute_gcycles=(sum(request.stage_compute_gcycles),)
+        + (0.0,) * (stage_count - 1),
+        stage_output_mb=(0.0,) * stage_count,
+    )
+
+
+def compact_request_for_monolithic_policy(request: TaskRequest) -> TaskRequest:
+    """Build the one-stage copy consumed by the Monolithic Fast policy."""
+
+    if not request.stage_compute_gcycles:
+        raise ValueError("a TaskRequest must contain at least one stage")
+    return replace(
+        request,
+        stage_compute_gcycles=(float(sum(request.stage_compute_gcycles)),),
+        stage_output_mb=(0.0,),
+    )
+
+
+def expand_monolithic_schedule(schedule: list[int] | tuple[int, ...], stage_count: int) -> list[int]:
+    """Project one aggregate node choice onto every original service stage."""
+
+    if stage_count < 1:
+        raise ValueError("stage_count must be positive")
+    if not schedule:
+        raise ValueError("Monolithic Fast policy returned an empty schedule")
+    return [int(schedule[0])] * stage_count
+
+
 def _copy_runtime_state(source: EdgeComputingEnv, target: EdgeComputingEnv) -> None:
     target.node_compute_load = source.node_compute_load.copy()
     target.link_load = source.link_load.copy()
@@ -126,14 +169,37 @@ class MonolithicScheme(BaseComparisonScheme):
         env.apply_deployment(projected)
 
     def adapt_requests(self, requests: list[TaskRequest]) -> list[TaskRequest]:
-        return [
-            replace(
-                request,
-                stage_compute_gcycles=(sum(request.stage_compute_gcycles),),
-                stage_output_mb=(0.0,),
-            )
-            for request in requests
-        ]
+        return [adapt_request_for_monolithic_evaluation(request) for request in requests]
 
     def schedule_batch(self, env: EdgeComputingEnv, requests: list[TaskRequest]) -> list[list[int]]:
-        return self.agent.fast_agent.schedule_batch(env, requests, deterministic=True, record=False)
+        if not requests:
+            return []
+
+        # The policy was trained against a one-stage scenario.  Run inference
+        # on one-stage copies, while preserving the original stage-shaped
+        # requests on the physical evaluation environment for env.step().
+        compact_requests = [compact_request_for_monolithic_policy(request) for request in requests]
+        previous_requests = env.current_requests
+        previous_request = env.current_request
+        env.current_requests = compact_requests
+        env.current_request = compact_requests[0]
+        try:
+            compact_schedules = self.agent.fast_agent.schedule_batch(
+                env, compact_requests, deterministic=True, record=False
+            )
+        finally:
+            env.current_requests = previous_requests
+            env.current_request = previous_request
+            # Avoid retaining a workload estimate computed for the temporary
+            # compact request list after restoring the physical view.
+            self.agent.fast_agent._workload_cache_key = None
+            self.agent.fast_agent._workload_cache = None
+
+        if len(compact_schedules) != len(requests):
+            raise RuntimeError(
+                "Monolithic Fast policy returned a schedule count different from the request count"
+            )
+        return [
+            expand_monolithic_schedule(schedule, len(request.stage_compute_gcycles))
+            for request, schedule in zip(requests, compact_schedules)
+        ]

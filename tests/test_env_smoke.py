@@ -5,7 +5,8 @@ import numpy as np
 from edge_drl.agents.hierarchical import build_baseline_agent
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig, _compute_kkt_externality_delays
-from edge_drl.env.scenario import generate_realistic_scenario
+from edge_drl.env.scenario import TaskRequest, generate_realistic_scenario
+from tests.comparison_helpers import tiny_replay_env
 
 
 def test_default_episode_uses_one_second_steps_and_ten_minute_deployment():
@@ -75,6 +76,70 @@ def test_kkt_group_multiplicity_matches_individual_equal_tasks():
 
     assert np.isclose(grouped_delays["group"], individual_delays["task-0"])
     assert np.isclose(grouped_total, individual_total)
+
+
+def test_environment_settles_stages_of_one_request_serially() -> None:
+    env = tiny_replay_env()
+    env.reset()
+    assert env.scenario is not None and env.deployment is not None
+    deployment = np.zeros_like(env.deployment)
+    for service in env.scenario.services:
+        for stage in service.stages:
+            deployment[service.service_id, stage.stage_id] = True
+    env.apply_deployment(deployment)
+    request = TaskRequest(
+        request_id=1,
+        arrival_minute=0.0,
+        request_count=1,
+        user_id=0,
+        home_node=0,
+        service_id=0,
+        input_mb=0.0,
+        stage_compute_gcycles=(1.0, 1.0),
+        stage_output_mb=(0.0, 0.0),
+        deadline_s=1.0,
+    )
+
+    info = env.evaluate_schedule(request, [0, 0])
+
+    capacity = env.scenario.nodes[0].compute_gcycles_per_s  # type: ignore[union-attr]
+    assert np.isclose(info["compute_delays"]["stage-0"], 1.0 / capacity)
+    assert np.isclose(info["compute_delays"]["stage-1"], 1.0 / capacity)
+    assert np.isclose(info["compute_delay_s"], 2.0 / capacity)
+    assert np.isclose(info["compute_externality_delays"]["stage-0"], 0.0)
+    assert np.isclose(info["compute_externality_delays"]["stage-1"], 0.0)
+
+
+def test_environment_settles_chain_transfers_serially() -> None:
+    env = tiny_replay_env()
+    env.reset()
+    assert env.scenario is not None and env.deployment is not None
+    deployment = np.zeros_like(env.deployment)
+    for service in env.scenario.services:
+        for stage in service.stages:
+            deployment[service.service_id, stage.stage_id] = True
+    env.apply_deployment(deployment)
+    request = TaskRequest(
+        request_id=2,
+        arrival_minute=0.0,
+        request_count=1,
+        user_id=0,
+        home_node=0,
+        service_id=1,
+        input_mb=1.0,
+        stage_compute_gcycles=(0.0, 0.0, 0.0),
+        stage_output_mb=(0.0, 1.0, 0.0),
+        deadline_s=1.0,
+    )
+
+    info = env.evaluate_schedule(request, [1, 0, 1])
+
+    bandwidth = env.scenario.bandwidth_mb_s[0, 1]  # type: ignore[union-attr]
+    assert np.isclose(info["link_delays"]["ingress"], 1.0 / bandwidth)
+    assert np.isclose(info["link_delays"]["stage-1"], 1.0 / bandwidth)
+    assert np.isclose(info["link_delay_s"], 2.0 / bandwidth)
+    assert np.isclose(info["link_externality_delays"]["ingress"], 0.0)
+    assert np.isclose(info["link_externality_delays"]["stage-1"], 0.0)
 
 
 def test_environment_constraints_and_rollout():

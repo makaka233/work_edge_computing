@@ -11,6 +11,10 @@ class ComputeDemand:
     node_id: int
     compute_gcycles: float
     multiplicity: float = 1.0
+    # Causal position in a serial service chain.  The bare KKT allocator still
+    # treats every demand passed to one call as concurrent; the environment
+    # uses this field to make one call per chain phase.
+    serial_phase: int = 0
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,7 @@ class LinkDemand:
     dst_node: int
     data_mb: float
     multiplicity: float = 1.0
+    serial_phase: int = 0
 
 
 def allocate_compute_kkt(

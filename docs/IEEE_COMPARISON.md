@@ -10,6 +10,12 @@ The paper-facing schemes are exactly:
 - **Monolithic**: a separately trained copy of the same dual-scale PPO/KKT
   controller, with each service represented as one aggregated stage. It is not
   an MILP baseline and is not presented as a reproduction of SD3.
+
+During evaluation, the original multi-stage request shape is retained for the
+shared physical simulator: compute is `(sum(stage_compute), 0, ...)`, all
+inter-stage outputs are zero, and the aggregate Fast decision is projected to
+the same node for every original stage. Thus the only structural difference is
+the stage aggregation, not the trace, resource accounting, or simulator.
 - **DMDR**: native AES-JDR/RDMP adaptation following Peng et al., IEEE TSC 2024.
   Integer instance multiplicity is retained as a native diagnostic; the common
   physical simulator projects it to `N_integer > 0`, and memory/storage are
@@ -45,7 +51,10 @@ python run_comparison.py `
   --device cuda
 ```
 
-Train the Monolithic checkpoint separately before comparison:
+Train the Monolithic checkpoint separately before comparison.  The trainer
+inherits the Proposed checkpoint's physical seed, demand random streams, load
+strata, episode length, and temporal sampling by default; the only training
+structure change is the one-stage collapse:
 
 ```powershell
 python .\train_monolithic.py `
@@ -54,8 +63,18 @@ python .\train_monolithic.py `
   --episode-minutes 60 `
   --run-root ".\runs\monolithic_checkpoints" `
   --run-name request_load_1 `
-  --device cuda
+  --device cuda `
+  --progress-interval-seconds 10
 ```
+
+The omitted seed, episode length, and sampled-seconds options are copied from
+the Proposed checkpoint (the reference run uses 30 representative settlement
+seconds per window).  Monolithic collects all six ten-minute windows of a
+60-minute episode and uses the same per-window load assignments and random
+streams before collapsing the generated trace.  Evaluation remains unsampled.
+The run writes `training_manifest.json`, including the physical seed, demand
+seed, environment/request seed, load assignments, and trace hash for every
+episode so parity can be audited.
 
 For Phase 2/3, train one Monolithic checkpoint per parameter point and place
 each run below a common directory (for example

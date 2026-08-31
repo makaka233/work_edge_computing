@@ -1,6 +1,11 @@
 import numpy as np
 
-from edge_drl.comparison.monolithic import collapse_scenario, collapse_trace
+from edge_drl.comparison.monolithic import (
+    adapt_request_for_monolithic_evaluation,
+    collapse_scenario,
+    collapse_trace,
+    expand_monolithic_schedule,
+)
 from tests.comparison_helpers import tiny_replay_env
 
 
@@ -21,3 +26,15 @@ def test_monolithic_collapses_each_service_to_one_aggregated_stage() -> None:
         for request in slot:
             assert len(request.stage_compute_gcycles) == 1
             assert request.stage_output_mb == (0.0,)
+
+
+def test_monolithic_evaluation_preserves_stage_shape_and_shared_node_projection() -> None:
+    env = tiny_replay_env()
+    env.reset()
+    original = next(request for slot in env._comparison_trace.slots for request in slot)
+    adapted = adapt_request_for_monolithic_evaluation(original)
+    assert len(adapted.stage_compute_gcycles) == len(original.stage_compute_gcycles)
+    assert adapted.stage_compute_gcycles[0] == sum(original.stage_compute_gcycles)
+    assert adapted.stage_compute_gcycles[1:] == (0.0,) * (len(original.stage_compute_gcycles) - 1)
+    assert adapted.stage_output_mb == (0.0,) * len(original.stage_output_mb)
+    assert expand_monolithic_schedule([4], len(adapted.stage_compute_gcycles)) == [4, 4]

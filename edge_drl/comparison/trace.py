@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import struct
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -73,17 +74,69 @@ def generate_comparison_trace(
     request_seed: int,
     task_compute_scale: float,
     task_data_scale: float,
+    requests_per_minute_schedule: Sequence[float] | None = None,
+    schedule_window_seconds: int = 600,
+    request_stride_seconds: int = 1,
+    reload_schedule_boundaries: bool = False,
+    reload_window_seconds: int = 600,
 ) -> ComparisonTrace:
     if logical_steps <= 0:
         raise ValueError("logical_steps must be positive")
     if requests_per_minute < 0.0:
         raise ValueError("requests_per_minute must be non-negative")
+    if requests_per_minute_schedule is not None:
+        if not requests_per_minute_schedule:
+            raise ValueError("requests_per_minute_schedule must not be empty")
+        if schedule_window_seconds <= 0:
+            raise ValueError("schedule_window_seconds must be positive")
+        schedule = tuple(float(value) for value in requests_per_minute_schedule)
+        if any(value < 0.0 for value in schedule):
+            raise ValueError("requests_per_minute_schedule values must be non-negative")
+    else:
+        schedule = None
+    if request_stride_seconds <= 0:
+        raise ValueError("request_stride_seconds must be positive")
+    if reload_schedule_boundaries and reload_window_seconds <= 0:
+        raise ValueError("reload_window_seconds must be positive")
     rng = np.random.default_rng(request_seed)
     slots: list[tuple[TaskRequest, ...]] = []
     request_id = 0
     for second in range(logical_steps):
-        count = int(rng.poisson(requests_per_minute / 60.0))
+        if schedule is None:
+            rate = float(requests_per_minute)
+        else:
+            schedule_index = min(second // int(schedule_window_seconds), len(schedule) - 1)
+            rate = schedule[schedule_index]
         requests: list[TaskRequest] = []
+        if second % int(request_stride_seconds) != 0:
+            slots.append(tuple(requests))
+            continue
+        # In the Proposed window collector, changing the multiplier at a
+        # boundary regenerates the current second once.  The first draw (made
+        # by the preceding env.step) is discarded and the second draw is the
+        # one consumed by the new window.  Reproduce that RNG progression when
+        # a synchronized training trace is requested.
+        if (
+            reload_schedule_boundaries
+            and second > 0
+            and second % int(reload_window_seconds) == 0
+            and schedule is not None
+        ):
+            previous_index = min((second - 1) // int(schedule_window_seconds), len(schedule) - 1)
+            if not np.isclose(schedule[previous_index], rate):
+                discarded_count = int(rng.poisson(schedule[previous_index] / 60.0))
+                for _ in range(discarded_count):
+                    generate_request(
+                        rng=rng,
+                        request_id=request_id,
+                        arrival_minute=second / 60.0,
+                        users=scenario.users,
+                        services=scenario.services,
+                        task_compute_scale=task_compute_scale,
+                        task_data_scale=task_data_scale,
+                    )
+                    request_id += 1
+        count = int(rng.poisson(rate / 60.0))
         for _ in range(count):
             requests.append(
                 generate_request(
