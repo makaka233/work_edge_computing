@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import sys
 
-from train_monolithic import _format_duration, _synchronized_training_args, build_parser
+import pytest
+
+from train_monolithic import (
+    _format_duration,
+    _resume_offsets,
+    _synchronized_training_args,
+    build_parser,
+)
 from edge_drl.comparison.trace import generate_comparison_trace
 from tests.comparison_helpers import tiny_scenario
 
@@ -14,6 +21,7 @@ def test_monolithic_progress_cli_defaults_to_ten_seconds(monkeypatch) -> None:
     assert args.sampled_seconds_per_window is None
     assert args.episode_minutes is None
     assert args.seed is None
+    assert args.load_checkpoint is None
 
 
 def test_monolithic_progress_duration_format() -> None:
@@ -38,6 +46,27 @@ def test_monolithic_inherits_proposed_stability_and_sampling_settings() -> None:
     assert synchronized.slow_lr_decay is True
     assert synchronized.slow_lr_decay_patience == 20
     assert synchronized.load_multipliers == "0.8,1.0,1.2,1.4"
+
+
+def test_monolithic_resume_offsets_require_an_update_boundary() -> None:
+    metadata = {
+        "completed_updates": 7,
+        "completed_episodes": 14,
+        "completed_rollouts": 84,
+    }
+    assert _resume_offsets(
+        metadata,
+        episodes_per_update=2,
+        windows_per_update=12,
+    ) == (7, 14, 84)
+
+    metadata["completed_rollouts"] = 83
+    with pytest.raises(ValueError, match="update-boundary"):
+        _resume_offsets(
+            metadata,
+            episodes_per_update=2,
+            windows_per_update=12,
+        )
 
 
 def test_scheduled_trace_matches_constant_trace_for_constant_rate() -> None:

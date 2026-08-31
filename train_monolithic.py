@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime
 import json
 from pathlib import Path
+import shutil
 import time
 
 import numpy as np
@@ -29,6 +30,7 @@ from train_dual_ppo import (
     checkpoint_reference_load,
     load_assignments_for_update,
     load_adjusted_rolling_latency,
+    load_checkpoint,
     load_probability_for_group,
     rollout,
     save_checkpoint,
@@ -43,6 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Proposed run metadata used only as the common physical/training configuration source",
     )
     parser.add_argument("--updates", type=int, default=320)
+    parser.add_argument(
+        "--load-checkpoint",
+        default=None,
+        help=(
+            "Resume from a Monolithic latest/last/periodic checkpoint. "
+            "--updates is the number of additional updates to run."
+        ),
+    )
     parser.add_argument(
         "--episode-minutes",
         type=int,
@@ -94,6 +104,30 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def _resume_offsets(
+    metadata: dict[str, object],
+    *,
+    episodes_per_update: int,
+    windows_per_update: int,
+) -> tuple[int, int, int]:
+    """Return validated update/episode/rollout offsets for boundary resume."""
+
+    updates = int(metadata.get("completed_updates", metadata.get("update", 0)))
+    episodes = int(metadata.get("completed_episodes", updates * episodes_per_update))
+    rollouts = int(metadata.get("completed_rollouts", updates * windows_per_update))
+    if updates < 0 or episodes < 0 or rollouts < 0:
+        raise ValueError("resume checkpoint counters must be non-negative")
+    expected_episodes = updates * episodes_per_update
+    expected_rollouts = updates * windows_per_update
+    if episodes != expected_episodes or rollouts != expected_rollouts:
+        raise ValueError(
+            "Monolithic resume requires an update-boundary checkpoint: "
+            f"updates={updates}, episodes={episodes}/{expected_episodes}, "
+            f"rollouts={rollouts}/{expected_rollouts}"
+        )
+    return updates, episodes, rollouts
 
 
 def _print_training_progress(
@@ -270,6 +304,15 @@ def main() -> None:
     base_path, base_args, _ = load_checkpoint_configuration(cli.base_checkpoint)
     base_seed = int(base_args.get("seed", 2026))
     effective_seed = base_seed if cli.seed is None else int(cli.seed)
+    resume_path: Path | None = None
+    resume_args: dict[str, object] = {}
+    resume_internal: dict[str, object] = {}
+    if cli.load_checkpoint:
+        resume_path, resume_args, resume_internal = load_checkpoint_configuration(
+            cli.load_checkpoint
+        )
+        if resume_args.get("training_scheme") != "Monolithic":
+            raise ValueError("--load-checkpoint must be a Monolithic training checkpoint")
     effective_episode_minutes = int(
         base_args.get("episode_minutes", 60) if cli.episode_minutes is None else cli.episode_minutes
     )
@@ -282,6 +325,10 @@ def main() -> None:
         raise ValueError("episode-minutes must be positive")
     if effective_sampled_seconds < 0:
         raise ValueError("sampled-seconds-per-window must be non-negative")
+    # Match the Proposed entrypoint: seed global model initialization before
+    # constructing either the environment-facing networks or their optimizers.
+    torch.manual_seed(effective_seed)
+    np.random.seed(effective_seed)
     if effective_seed != base_seed:
         print(
             f"[monolithic] warning: --seed={effective_seed} differs from Proposed checkpoint seed={base_seed}; "
@@ -321,20 +368,6 @@ def main() -> None:
     base_env = TraceReplayEnv(config, collapse_scenario(scenario), _empty_trace(config.episode_minutes * 60))
     base_env.reset()
     agent = _agent_from_config(base_env, base_args, cli.device)
-    run_name = cli.run_name or f"monolithic_ppo_{cli.scenario_family}_{cli.scenario_value:g}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir = Path(cli.run_root) / run_name
-    checkpoint_dir = run_dir / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=False)
-    log_dir = run_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    update_log_path = log_dir / "training.csv"
-    episode_log_path = log_dir / "episode_metrics.csv"
-    rollout_log_path = log_dir / "rollout_metrics.csv"
-    best_checkpoint_score = float("inf")
-    best_checkpoint_ready = False
-    checkpoint_selection_history: list[dict[str, float]] = []
-    history: list[dict[str, float]] = []
-    total_episodes = cli.updates * cli.episodes_per_update
     total_windows_per_episode = max(
         int(np.ceil(effective_episode_minutes / max(config.deployment_interval_minutes, 1))),
         1,
@@ -345,18 +378,87 @@ def main() -> None:
         if effective_sampled_seconds == 0
         else min(effective_sampled_seconds, window_seconds)
     )
+    windows_per_update = total_windows_per_episode * cli.episodes_per_update
+    if resume_path is not None:
+        expected_resume = {
+            "seed": effective_seed,
+            "episode_minutes": effective_episode_minutes,
+            "episodes_per_update": cli.episodes_per_update,
+            "sampled_seconds_per_window": effective_sampled_seconds,
+            "comparison_scenario_family": cli.scenario_family,
+        }
+        for key, expected in expected_resume.items():
+            actual = resume_args.get(key)
+            if actual != expected:
+                raise ValueError(
+                    f"resume configuration mismatch for {key}: "
+                    f"checkpoint={actual!r}, requested={expected!r}"
+                )
+        actual_value = float(resume_args.get("comparison_scenario_value", np.nan))
+        if not np.isclose(actual_value, float(cli.scenario_value)):
+            raise ValueError(
+                "resume configuration mismatch for comparison_scenario_value: "
+                f"checkpoint={actual_value!r}, requested={cli.scenario_value!r}"
+            )
     training_random_streams = TrainingRandomStreams(effective_seed)
-    training_rollout_idx = 0
+    if resume_path is not None:
+        resume_internal = load_checkpoint(agent, resume_path, training_random_streams)
+        if resume_internal.get("deterministic_initialization") is not True:
+            print(
+                "[monolithic] warning: resume checkpoint predates deterministic "
+                "initialization metadata; do not use it as a new formal-training seed",
+                flush=True,
+            )
+    resume_update_offset, resume_episode_offset, training_rollout_idx = _resume_offsets(
+        resume_internal,
+        episodes_per_update=cli.episodes_per_update,
+        windows_per_update=windows_per_update,
+    )
+    target_update = resume_update_offset + cli.updates
+    run_episodes = cli.updates * cli.episodes_per_update
     best_checkpoint_window = int(base_args.get("best_checkpoint_window", 10))
     checkpoint_interval = int(base_args.get("checkpoint_interval", 20))
     reference_checkpoint_load = checkpoint_reference_load(synchronized_args)
+    best_checkpoint_score = float(
+        resume_internal.get("best_checkpoint_score", float("inf"))
+    )
+    best_checkpoint_ready = bool(resume_internal.get("best_checkpoint_ready", False))
+    checkpoint_selection_history: list[dict[str, float]] = []
+    raw_selection_history = resume_internal.get("checkpoint_selection_history", [])
+    if isinstance(raw_selection_history, list):
+        for item in raw_selection_history:
+            if isinstance(item, dict):
+                checkpoint_selection_history.append(
+                    {
+                        "latency_s": float(item.get("latency_s", np.nan)),
+                        "load_multiplier": float(item.get("load_multiplier", np.nan)),
+                    }
+                )
     slow_lr_controller = SlowLearningRateController(
         enabled=bool(base_args.get("slow_lr_decay", False)),
         patience=int(base_args.get("slow_lr_decay_patience", 10)),
         factor=float(base_args.get("slow_lr_decay_factor", 0.5)),
         min_delta=float(base_args.get("slow_lr_decay_min_delta", 5e-4)),
         min_lr=float(base_args.get("slow_min_lr", 1e-5)),
+        state=resume_internal.get("slow_lr_controller_state"),
     )
+    run_name = cli.run_name or f"monolithic_ppo_{cli.scenario_family}_{cli.scenario_value:g}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = Path(cli.run_root) / run_name
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    log_dir = run_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    update_log_path = log_dir / "training.csv"
+    episode_log_path = log_dir / "episode_metrics.csv"
+    rollout_log_path = log_dir / "rollout_metrics.csv"
+    inherited_best_checkpoint: str | None = None
+    if resume_path is not None:
+        prior_best = resume_path.parent / "best.pt"
+        if prior_best.is_file():
+            destination = checkpoint_dir / "best.pt"
+            shutil.copy2(prior_best, destination)
+            inherited_best_checkpoint = str(prior_best)
+    history: list[dict[str, float]] = []
     synchronization = {
         "source_proposed_checkpoint": str(base_path),
         "master_seed": effective_seed,
@@ -376,6 +478,11 @@ def main() -> None:
         "slow_lr_decay_factor": slow_lr_controller.factor,
         "slow_lr_decay_min_delta": slow_lr_controller.min_delta,
         "slow_min_lr": slow_lr_controller.min_lr,
+        "resume_checkpoint": None if resume_path is None else str(resume_path),
+        "resume_update_offset": resume_update_offset,
+        "resume_episode_offset": resume_episode_offset,
+        "resume_rollout_offset": training_rollout_idx,
+        "inherited_best_checkpoint": inherited_best_checkpoint,
         "request_trace_rng": "Proposed environment_seed stream",
         "structural_difference": "Monolithic stage collapse only",
     }
@@ -393,17 +500,19 @@ def main() -> None:
     )
     training_started_at = time.monotonic()
     print(
-        f"[monolithic] start run={run_name} updates={cli.updates} "
+        f"[monolithic] start run={run_name} additional_updates={cli.updates} "
+        f"resume_update={resume_update_offset} target_update={target_update} "
         f"episodes_per_update={cli.episodes_per_update} episode_minutes={effective_episode_minutes} "
         f"windows_per_episode={total_windows_per_episode} "
         f"sampled_seconds_per_window={effective_sampled_seconds}/{window_seconds} "
-        f"total_episodes={total_episodes} device={cli.device}",
+        f"run_episodes={run_episodes} device={cli.device}",
         flush=True,
     )
 
     # The rollout seeds and load assignments follow train_dual_ppo.py exactly.
     # The generated trace is then collapsed only for the Monolithic view.
-    for update in range(1, cli.updates + 1):
+    for local_update in range(1, cli.updates + 1):
+        update = resume_update_offset + local_update
         update_started_at = time.monotonic()
         episode_stats_for_update: list[dict[str, float]] = []
         update_episode_manifest: list[dict[str, object]] = []
@@ -416,7 +525,11 @@ def main() -> None:
             rng=training_random_streams.load_rng,
         )
         for episode_offset in range(cli.episodes_per_update):
-            episode_index = (update - 1) * cli.episodes_per_update + episode_offset
+            episode_index = (
+                resume_episode_offset
+                + (local_update - 1) * cli.episodes_per_update
+                + episode_offset
+            )
             demand_seed = training_random_streams.demand_seed_for_episode(
                 episode_index,
                 synchronized_args.scenario_refresh_episodes,
@@ -486,7 +599,7 @@ def main() -> None:
                     rollout_unit="window",
                     reset_env=False,
                     progress_label=(
-                        f"monolithic update {update}/{cli.updates} "
+                        f"monolithic update {update}/{target_update} "
                         f"episode {episode_offset + 1}/{cli.episodes_per_update} "
                         f"window {window_offset + 1}/{total_windows_per_episode}"
                     ),
@@ -513,7 +626,11 @@ def main() -> None:
                 window_contexts.append(context)
                 append_log(
                     rollout_log_path,
-                    build_rollout_metrics_row(one_stats, context, window_offset + 1),
+                    build_rollout_metrics_row(
+                        one_stats,
+                        context,
+                        episode_offset * total_windows_per_episode + window_offset + 1,
+                    ),
                 )
                 training_rollout_idx += 1
             episode_stats = aggregate_rollout_stats(window_stats)
@@ -522,12 +639,14 @@ def main() -> None:
                 episode_log_path,
                 build_episode_metrics_row(window_stats, window_contexts),
             )
-            completed_episodes = (update - 1) * cli.episodes_per_update + episode_offset + 1
+            completed_run_episodes = (
+                (local_update - 1) * cli.episodes_per_update + episode_offset + 1
+            )
             _print_training_progress(
-                completed_episodes=completed_episodes,
-                total_episodes=total_episodes,
+                completed_episodes=completed_run_episodes,
+                total_episodes=run_episodes,
                 update=update,
-                updates=cli.updates,
+                updates=target_update,
                 episode=episode_offset + 1,
                 episodes_per_update=cli.episodes_per_update,
                 avg_latency_s=float(episode_stats.get("avg_latency_s", 0.0)),
@@ -622,6 +741,9 @@ def main() -> None:
                 "episode_minutes": effective_episode_minutes,
                 "episodes_per_update": cli.episodes_per_update,
                 "sampled_seconds_per_window": effective_sampled_seconds,
+                "updates": target_update,
+                "additional_updates": cli.updates,
+                "load_checkpoint": None if resume_path is None else str(resume_path),
                 "progress_interval_seconds": cli.progress_interval_seconds,
                 "run_name": run_name,
                 "training_scheme": "Monolithic",
@@ -632,7 +754,10 @@ def main() -> None:
             "update": update,
             "completed_updates": update,
             "completed_rollouts": training_rollout_idx,
-            "completed_episodes": update * cli.episodes_per_update,
+            "completed_episodes": (
+                resume_episode_offset + local_update * cli.episodes_per_update
+            ),
+            "deterministic_initialization": True,
             "best_checkpoint_score": (
                 checkpoint_score if should_replace_best else best_checkpoint_score
             ),
@@ -672,10 +797,10 @@ def main() -> None:
         (run_dir / "training_log.json").write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
         score = float(stats.get("avg_latency_s", float("inf")))
         _print_training_progress(
-            completed_episodes=update * cli.episodes_per_update,
-            total_episodes=total_episodes,
+            completed_episodes=local_update * cli.episodes_per_update,
+            total_episodes=run_episodes,
             update=update,
-            updates=cli.updates,
+            updates=target_update,
             episode=cli.episodes_per_update,
             episodes_per_update=cli.episodes_per_update,
             avg_latency_s=score,
@@ -693,6 +818,9 @@ def main() -> None:
                     "episode_minutes": effective_episode_minutes,
                     "episodes_per_update": cli.episodes_per_update,
                     "sampled_seconds_per_window": effective_sampled_seconds,
+                    "updates": target_update,
+                    "additional_updates": cli.updates,
+                    "load_checkpoint": None if resume_path is None else str(resume_path),
                     "progress_interval_seconds": cli.progress_interval_seconds,
                     "run_name": run_name,
                     "training_scheme": "Monolithic",
@@ -705,6 +833,12 @@ def main() -> None:
                 "checkpoint_reference_load": reference_checkpoint_load,
                 "checkpoint_selection_window": best_checkpoint_window,
                 "slow_lr_controller_state": slow_lr_controller.state_dict(),
+                "completed_updates": target_update,
+                "completed_episodes": (
+                    resume_episode_offset + run_episodes
+                ),
+                "completed_rollouts": training_rollout_idx,
+                "deterministic_initialization": True,
             },
             ensure_ascii=False,
             indent=2,
@@ -723,18 +857,26 @@ def main() -> None:
                     "episode_minutes": effective_episode_minutes,
                     "episodes_per_update": cli.episodes_per_update,
                     "sampled_seconds_per_window": effective_sampled_seconds,
+                    "updates": target_update,
+                    "additional_updates": cli.updates,
+                    "load_checkpoint": None if resume_path is None else str(resume_path),
                     "run_name": run_name,
                     "training_scheme": "Monolithic",
                     "comparison_scenario_family": cli.scenario_family,
                     "comparison_scenario_value": cli.scenario_value,
                 },
                 "synchronization": synchronization,
-                "update": cli.updates,
-                "completed_updates": cli.updates,
+                "update": target_update,
+                "completed_updates": target_update,
                 "completed_rollouts": training_rollout_idx,
-                "completed_episodes": total_episodes,
+                "completed_episodes": resume_episode_offset + run_episodes,
+                "deterministic_initialization": True,
                 "best_checkpoint_score": best_checkpoint_score,
                 "best_checkpoint_ready": best_checkpoint_ready,
+                "checkpoint_score": checkpoint_score,
+                "checkpoint_score_load_slope": checkpoint_load_slope,
+                "checkpoint_reference_load": reference_checkpoint_load,
+                "checkpoint_selection_window": best_checkpoint_window,
                 "checkpoint_selection_history": checkpoint_selection_history,
                 "slow_lr_controller_state": slow_lr_controller.state_dict(),
                 "history": history[-1],

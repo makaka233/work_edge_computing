@@ -69,13 +69,39 @@ python .\train_monolithic.py `
 ```
 
 The omitted seed, episode length, and sampled-seconds options are copied from
-the Proposed checkpoint (the reference run uses 30 representative settlement
+the Proposed checkpoint (the frozen reference uses 6 representative settlement
 seconds per window).  Monolithic collects all six ten-minute windows of a
 60-minute episode and uses the same per-window load assignments and random
 streams before collapsing the generated trace.  Evaluation remains unsampled.
 The run writes `training_manifest.json`, including the physical seed, demand
 seed, environment/request seed, load assignments, and trace hash for every
 episode so parity can be audited.
+
+Monolithic fixes NumPy and PyTorch initialization from the same master seed
+before constructing the policy.  Every update-boundary checkpoint also stores
+the model, optimizers, adaptive entropy state, Slow critic replay, Slow learning
+rate controller, load/demand/environment random streams, and global counters.
+If a run is interrupted after update 66 and 254 updates remain, resume into a
+new run directory as follows (`--updates` always means additional updates when
+`--load-checkpoint` is present):
+
+```powershell
+$runName = "monolithic_resume_u66_r254_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+python .\train_monolithic.py `
+  --base-checkpoint ".\runs\joint_1to1_stability_large_s30_u320_20260831_121230\checkpoints\best.pt" `
+  --load-checkpoint ".\runs\monolithic_checkpoints\<interrupted-run>\checkpoints\latest.pt" `
+  --updates 254 `
+  --episode-minutes 60 `
+  --episodes-per-update 2 `
+  --sampled-seconds-per-window 6 `
+  --scenario-family request_load `
+  --scenario-value 1.0 `
+  --run-root ".\runs\monolithic_checkpoints" `
+  --run-name $runName `
+  --device cuda `
+  --progress-interval-seconds 10
+```
 
 For the formal Phase 2/3 protocol, freeze one Proposed checkpoint and one
 Monolithic checkpoint trained on the same nominal training distribution and
