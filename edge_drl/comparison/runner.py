@@ -30,6 +30,13 @@ from edge_drl.env.environment import EdgeComputingEnv
 
 
 FORMAL_SCHEMES = ("Proposed", "Monolithic", "DMDR", "SICP")
+FORMAL_SCENARIO_FAMILIES = (
+    "request_load",
+    "compute_capacity",
+    "wired_bandwidth",
+    "intermediate_data",
+    "stage_heterogeneity",
+)
 
 
 def phase_design(phase: int) -> tuple[int, list[int], list[ExperimentPoint], int]:
@@ -40,6 +47,30 @@ def phase_design(phase: int) -> tuple[int, list[int], list[ExperimentPoint], int
     if phase == 3:
         return 60, list(range(2026, 2046)), formal_experiment_points(), 3
     raise ValueError("phase must be 1, 2, or 3")
+
+
+def configured_phase_design(
+    phase: int,
+    *,
+    eval_seeds_override: tuple[int, ...] | None = None,
+    scenario_families: tuple[str, ...] | None = None,
+) -> tuple[int, list[int], list[ExperimentPoint], int, bool]:
+    """Apply explicit evaluation-only filters without changing the formal defaults."""
+    episode_minutes, eval_seeds, points, dmdr_repeats = phase_design(phase)
+    is_standard_design = eval_seeds_override is None and scenario_families is None
+    if eval_seeds_override is not None:
+        eval_seeds = list(dict.fromkeys(int(seed) for seed in eval_seeds_override))
+        if not eval_seeds:
+            raise ValueError("eval_seeds_override must contain at least one seed")
+    if scenario_families is not None:
+        selected = tuple(dict.fromkeys(scenario_families))
+        unknown = sorted(set(selected) - set(FORMAL_SCENARIO_FAMILIES))
+        if unknown:
+            raise ValueError(f"unknown scenario families: {unknown}")
+        if not selected:
+            raise ValueError("scenario_families must contain at least one family")
+        points = [point for point in points if point.family in selected]
+    return episode_minutes, eval_seeds, points, dmdr_repeats, is_standard_design
 
 
 def run_comparison(
@@ -53,6 +84,9 @@ def run_comparison(
     phase2_validation_run: str | Path | None = None,
     monolithic_checkpoint: str | Path | None = None,
     monolithic_checkpoint_mode: str = "fixed",
+    eval_seeds_override: tuple[int, ...] | None = None,
+    scenario_families: tuple[str, ...] | None = None,
+    sampled_seconds_per_window: int = 0,
 ) -> Path:
     if phase == 3:
         _require_phase2_validation(phase2_validation_run)
@@ -63,6 +97,8 @@ def run_comparison(
         )
     if monolithic_checkpoint_mode not in {"fixed", "per-point"}:
         raise ValueError("monolithic_checkpoint_mode must be 'fixed' or 'per-point'")
+    if sampled_seconds_per_window < 0:
+        raise ValueError("sampled_seconds_per_window must be >= 0")
     if (
         "Monolithic" in schemes
         and monolithic_checkpoint_mode == "fixed"
@@ -76,7 +112,21 @@ def run_comparison(
     unknown = sorted(set(schemes) - set(FORMAL_SCHEMES))
     if unknown:
         raise ValueError(f"formal comparison does not include schemes: {unknown}")
-    episode_minutes, eval_seeds, points, dmdr_repeats = phase_design(phase)
+    episode_minutes, eval_seeds, points, dmdr_repeats, is_standard_design = configured_phase_design(
+        phase,
+        eval_seeds_override=eval_seeds_override,
+        scenario_families=scenario_families,
+    )
+    is_standard_design = is_standard_design and sampled_seconds_per_window == 0
+    deployment_window_seconds = float(
+        checkpoint_args.get("deployment_interval_minutes", 10) * 60
+    )
+    effective_sampled_seconds = (
+        deployment_window_seconds
+        if sampled_seconds_per_window == 0
+        else min(float(sampled_seconds_per_window), deployment_window_seconds)
+    )
+    represented_seconds = deployment_window_seconds / max(effective_sampled_seconds, 1.0)
     selected_run_id = run_id or f"phase{phase}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output = Path(output_root) / selected_run_id
     output.mkdir(parents=True, exist_ok=False)
@@ -94,9 +144,21 @@ def run_comparison(
         "formal_schemes": list(schemes),
         "greedy_in_main_results": False,
         "episode_minutes": episode_minutes,
-        "represented_seconds": 1,
+        "sampled_seconds_per_window": sampled_seconds_per_window,
+        "represented_seconds_per_settlement": represented_seconds,
+        "expected_settlement_steps_per_episode": int(
+            round(episode_minutes * 60 / represented_seconds)
+        ),
+        "temporal_sampling_protocol": (
+            "full_second_by_second"
+            if sampled_seconds_per_window == 0
+            else "training_equivalent_weighted_settlement"
+        ),
         "logical_steps_per_episode": episode_minutes * 60,
         "eval_seeds": eval_seeds,
+        "scenario_families": list(dict.fromkeys(point.family for point in points)),
+        "scenario_point_count": len(points),
+        "standard_phase_design": is_standard_design,
         "dmdr_routing_repeats": dmdr_repeats,
         "checkpoint": str(checkpoint_path),
         "monolithic_checkpoint": None if monolithic_checkpoint is None else str(monolithic_checkpoint),
@@ -191,6 +253,7 @@ def run_comparison(
                             point=point,
                             eval_seed=eval_seed,
                             routing_repeat=repeat,
+                            sampled_seconds_per_window=sampled_seconds_per_window,
                         )
                         row = result.to_dict()
                         row.update(
@@ -250,7 +313,12 @@ def run_comparison(
                     )
 
     _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
-    if phase == 2 and not failure_rows and len(raw_rows) == len(points) * len(eval_seeds) * len(schemes):
+    if (
+        phase == 2
+        and is_standard_design
+        and not failure_rows
+        and len(raw_rows) == len(points) * len(eval_seeds) * len(schemes)
+    ):
         write_json(
             output / "diagnostics" / "phase2_validated.json",
             {

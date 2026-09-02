@@ -15,7 +15,10 @@ def evaluate_scheme_episode(
     point: ExperimentPoint,
     eval_seed: int,
     routing_repeat: int,
+    sampled_seconds_per_window: int = 0,
 ) -> EpisodeResult:
+    if sampled_seconds_per_window < 0:
+        raise ValueError("sampled_seconds_per_window must be >= 0")
     env.reset()
     latencies: list[float] = []
     request_weights: list[float] = []
@@ -40,7 +43,19 @@ def evaluate_scheme_episode(
     settlement_time = 0.0
     wall_start = time.perf_counter()
 
-    for _ in range(env._comparison_trace.logical_steps):
+    window_seconds = float(env.config.deployment_interval_minutes * 60)
+    represented_seconds = 1.0
+    if 0 < sampled_seconds_per_window < window_seconds:
+        represented_seconds = window_seconds / float(sampled_seconds_per_window)
+
+    while not env.done:
+        remaining_seconds = max(
+            float(env._comparison_trace.logical_steps) - env.current_time_minute * 60.0,
+            0.0,
+        )
+        step_represented_seconds = min(represented_seconds, remaining_seconds)
+        if step_represented_seconds < 1.0 - 1e-9:
+            break
         planning_start = time.perf_counter()
         scheme.maybe_plan(env)
         planning_time += time.perf_counter() - planning_start
@@ -52,13 +67,18 @@ def evaluate_scheme_episode(
         schedules = scheme.schedule_batch(env, requests)
         scheduling_time += time.perf_counter() - scheduling_start
         settlement_start = time.perf_counter()
-        _, _, _, info = env.step(schedules, represented_seconds=1.0)
+        _, _, _, info = env.step(
+            schedules,
+            represented_seconds=step_represented_seconds,
+        )
         settlement_time += time.perf_counter() - settlement_start
 
         slot_used_nodes: set[int] = set()
         slot_used_replicas: set[tuple[int, int, int]] = set()
         for request, schedule, group_info in zip(requests, schedules, info["group_infos"]):
-            weight = float(request.request_count)
+            # The environment scales a sampled second's request multiplicity by
+            # represented_seconds, exactly as the training rollout does.
+            weight = float(group_info["request_count"])
             latency = float(group_info["latency_s"])
             latencies.append(latency)
             request_weights.append(weight)
@@ -79,9 +99,11 @@ def evaluate_scheme_episode(
                 transition_total += weight
                 cross_node_total += float(left != right) * weight
         current_replicas = deployment_replica_count(env)
-        replica_sum += current_replicas
-        used_node_sum += len(slot_used_nodes)
-        used_replica_rate_sum += len(slot_used_replicas) / max(current_replicas, 1)
+        replica_sum += current_replicas * step_represented_seconds
+        used_node_sum += len(slot_used_nodes) * step_represented_seconds
+        used_replica_rate_sum += (
+            len(slot_used_replicas) / max(current_replicas, 1) * step_represented_seconds
+        )
         memory_used = np.zeros(env.config.num_edge_nodes, dtype=np.float64)
         storage_used = np.zeros(env.config.num_edge_nodes, dtype=np.float64)
         assert env.scenario is not None and env.deployment is not None
@@ -92,14 +114,18 @@ def evaluate_scheme_episode(
                 storage_used += placed * stage.storage_gb
         memory_utilization_sum += float(
             np.mean(memory_used / np.maximum(env.service_memory_capacities(), 1e-12))
-        )
+        ) * step_represented_seconds
         storage_utilization_sum += float(
             np.mean(storage_used / np.maximum(env.service_storage_capacities(), 1e-12))
-        )
-        node_load_sum += float(np.mean(env.node_compute_load))
+        ) * step_represented_seconds
+        node_load_sum += float(np.mean(env.node_compute_load)) * step_represented_seconds
         node_load_max = max(node_load_max, float(np.max(env.node_compute_load)))
         finite_links = env.link_load[np.isfinite(env.link_load)]
-        link_load_sum += float(np.mean(finite_links)) if finite_links.size else 0.0
+        link_load_sum += (
+            float(np.mean(finite_links)) * step_represented_seconds
+            if finite_links.size
+            else 0.0
+        )
         link_load_max = max(link_load_max, float(np.max(finite_links))) if finite_links.size else link_load_max
 
     logical_steps = env._comparison_trace.logical_steps

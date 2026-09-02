@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from edge_drl.comparison.runner import FORMAL_SCHEMES, run_comparison
+from edge_drl.comparison.runner import FORMAL_SCENARIO_FAMILIES, FORMAL_SCHEMES, run_comparison
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +32,29 @@ def parse_args() -> argparse.Namespace:
         help="Required for Phase 3; path to a successfully completed Phase 2 result directory",
     )
     parser.add_argument("--schemes", nargs="+", choices=FORMAL_SCHEMES, default=list(FORMAL_SCHEMES))
+    parser.add_argument(
+        "--eval-seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional evaluation-only seed override; does not alter formal phase defaults",
+    )
+    parser.add_argument(
+        "--scenario-families",
+        nargs="+",
+        choices=FORMAL_SCENARIO_FAMILIES,
+        default=None,
+        help="Optional subset of the five scenario families",
+    )
+    parser.add_argument(
+        "--sampled-seconds-per-window",
+        type=int,
+        default=0,
+        help=(
+            "Evaluation temporal sampling budget per deployment window; 0 preserves "
+            "the formal second-by-second default"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -47,6 +70,9 @@ def main() -> None:
         phase2_validation_run=args.phase2_validation_run,
         monolithic_checkpoint=args.monolithic_checkpoint,
         monolithic_checkpoint_mode=args.monolithic_checkpoint_mode,
+        eval_seeds_override=None if args.eval_seeds is None else tuple(args.eval_seeds),
+        scenario_families=None if args.scenario_families is None else tuple(args.scenario_families),
+        sampled_seconds_per_window=args.sampled_seconds_per_window,
     )
     print(f"comparison results: {output.resolve()}")
 

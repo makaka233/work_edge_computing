@@ -40,18 +40,23 @@ def load_checkpoint_configuration(checkpoint_path: str | Path) -> tuple[Path, di
     path = Path(checkpoint_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(path)
+    checkpoint = torch.load(path, map_location="cpu")
+    internal = dict(checkpoint.get("metadata", {}))
+    embedded_args = internal.get("args")
+    if isinstance(embedded_args, dict) and embedded_args:
+        return path, dict(embedded_args), internal
+
     sidecar_path = path.parent.parent / "metadata.json"
     if not sidecar_path.is_file():
         raise FileNotFoundError(
-            f"legacy checkpoint requires sibling run metadata: {sidecar_path}"
+            "checkpoint has no embedded args and requires sibling run metadata: "
+            f"{sidecar_path}"
         )
     with sidecar_path.open("r", encoding="utf-8") as handle:
         sidecar = json.load(handle)
     args = dict(sidecar.get("args", {}))
     if not args:
         raise ValueError(f"checkpoint sidecar has no args: {sidecar_path}")
-    checkpoint = torch.load(path, map_location="cpu")
-    internal = dict(checkpoint.get("metadata", {}))
     return path, args, internal
 
 
