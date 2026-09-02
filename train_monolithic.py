@@ -592,6 +592,22 @@ def main() -> None:
                         link_imbalance_coef=0.0,
                         idle_deployed_node_coef=0.0,
                         fast_congestion_credit_coef=1.0,
+                        fast_counterfactual_credit_coef=float(
+                            base_args.get("fast_counterfactual_credit_coef", 0.0)
+                        ),
+                        fast_controllable_latency_credit=bool(
+                            base_args.get("fast_controllable_latency_credit", False)
+                        ),
+                        # Oracle search is a Proposed diagnostic, not a training
+                        # reward term. Keep it disabled here so Monolithic pays
+                        # no avoidable rollout-time overhead.
+                        fast_oracle_diagnostic_requests=0,
+                        fast_oracle_beam_width=int(
+                            base_args.get("fast_oracle_beam_width", 32)
+                        ),
+                        fast_oracle_candidates_per_stage=int(
+                            base_args.get("fast_oracle_candidates_per_stage", 8)
+                        ),
                         sampled_seconds_per_window=effective_sampled_seconds,
                     ),
                     reward_scale=float(base_args.get("reward_scale", 1.0)),

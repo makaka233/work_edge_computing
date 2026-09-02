@@ -361,6 +361,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--link-imbalance-coef", type=float, default=0.0)
     parser.add_argument("--idle-deployed-node-coef", type=float, default=0.0)
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
+    parser.add_argument(
+        "--fast-chain-context",
+        choices=["auto", "legacy", "chain-v2"],
+        default="auto",
+        help=(
+            "chain-v2 adds routed incoming-data cost, previous-node colocation, "
+            "remaining-chain demand, and next-stage overlap to Fast observations"
+        ),
+    )
     parser.add_argument("--slow-lr", type=float, default=3e-4)
     parser.add_argument(
         "--slow-count-lr",
@@ -471,6 +480,26 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Newest complete 60-minute episodes reserved from Slow critic optimization.",
     )
+    parser.add_argument(
+        "--fast-counterfactual-credit-coef",
+        type=float,
+        default=0.50,
+        help="Penalty weight for Fast chain-aware regret relative to feasible candidate nodes.",
+    )
+    parser.add_argument(
+        "--fast-controllable-latency-credit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude policy-invariant radio access delay from Fast and factorized Slow credit.",
+    )
+    parser.add_argument(
+        "--fast-oracle-diagnostic-requests",
+        type=int,
+        default=1,
+        help="Requests per rollout compared with the bounded chain beam oracle; 0 disables it.",
+    )
+    parser.add_argument("--fast-oracle-beam-width", type=int, default=32)
+    parser.add_argument("--fast-oracle-candidates-per-stage", type=int, default=8)
     parser.add_argument("--slow-critic-gradient-clip", type=float, default=5.0)
     parser.add_argument(
         "--slow-window-gamma",
@@ -507,6 +536,15 @@ def parse_args() -> argparse.Namespace:
         help="Dense stage tail-latency weight in the Slow Count return.",
     )
     parser.add_argument("--slow-deadline-violation-coef", type=float, default=0.10)
+    parser.add_argument(
+        "--slow-shared-return-coef",
+        type=float,
+        default=0.25,
+        help=(
+            "Direct window-level end-to-end return mixed into Count and Placement action returns, "
+            "independent of Slow critic reliability."
+        ),
+    )
     parser.add_argument(
         "--slow-deterministic-count-mode",
         choices=["expected", "mode"],
@@ -686,6 +724,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--deadline-scale must be positive")
     if args.fast_congestion_credit_coef < 0.0:
         parser.error("--fast-congestion-credit-coef must be >= 0")
+    if args.fast_counterfactual_credit_coef < 0.0:
+        parser.error("--fast-counterfactual-credit-coef must be >= 0")
+    if args.fast_oracle_diagnostic_requests < 0:
+        parser.error("--fast-oracle-diagnostic-requests must be >= 0")
+    if args.fast_oracle_beam_width < 1 or args.fast_oracle_candidates_per_stage < 1:
+        parser.error("Fast oracle beam width and candidates per stage must be >= 1")
     if args.fast_reservation_microbatch_size < 1:
         parser.error("--fast-reservation-microbatch-size must be >= 1")
     if (
@@ -695,6 +739,7 @@ def parse_args() -> argparse.Namespace:
         or args.slow_count_shortage_coef < 0.0
         or args.slow_count_latency_coef < 0.0
         or args.slow_deadline_violation_coef < 0.0
+        or args.slow_shared_return_coef < 0.0
     ):
         parser.error("Slow shaping coefficients must be >= 0")
     if args.fast_updates_per_cycle < 1:
@@ -1467,6 +1512,10 @@ def rollout(
     link_imbalance_penalties: list[float] = []
     idle_deployed_node_penalties: list[float] = []
     fast_externality_costs: list[float] = []
+    fast_counterfactual_regret_costs: list[float] = []
+    fast_oracle_latency_gaps: list[float] = []
+    fast_oracle_relative_gaps: list[float] = []
+    fast_oracle_weights: list[float] = []
     latencies: list[float] = []
     compute_latencies: list[float] = []
     link_latencies: list[float] = []
@@ -1518,6 +1567,11 @@ def rollout(
         start_requests=float(start_metrics.get("requests", 0.0)),
         start_request_events=float(start_metrics.get("request_events", 0.0)),
     )
+    oracle_requests_remaining = (
+        int(getattr(args, "fast_oracle_diagnostic_requests", 0))
+        if record
+        else 0
+    )
     while _rollout_active(env, max_requests=max_requests, rollout_unit=rollout_unit, stop_time_minute=stop_time_minute):
         step_represented_seconds = represented_seconds
         if stop_time_minute is not None:
@@ -1544,6 +1598,35 @@ def rollout(
                 deterministic=deterministic_fast,
                 record=record_fast,
             )
+        batch_counterfactual_regrets = (
+            [
+                agent.fast_agent.stage_counterfactual_regrets(env, request, schedule)
+                for request, schedule in zip(requests, actions)
+            ]
+            if record_fast and float(getattr(args, "fast_counterfactual_credit_coef", 0.0)) > 0.0
+            else [[] for _ in requests]
+        )
+        if oracle_requests_remaining > 0:
+            for request, schedule in zip(requests, actions):
+                if oracle_requests_remaining <= 0:
+                    break
+                oracle_schedule = agent.fast_agent.chain_oracle_schedule(
+                    env,
+                    request,
+                    beam_width=int(getattr(args, "fast_oracle_beam_width", 32)),
+                    candidates_per_stage=int(
+                        getattr(args, "fast_oracle_candidates_per_stage", 8)
+                    ),
+                )
+                policy_isolated = env.evaluate_schedule(request, schedule)
+                oracle_isolated = env.evaluate_schedule(request, oracle_schedule)
+                policy_latency = float(policy_isolated["latency_s"])
+                oracle_latency = float(oracle_isolated["latency_s"])
+                gap = max(policy_latency - oracle_latency, 0.0)
+                fast_oracle_latency_gaps.append(gap)
+                fast_oracle_relative_gaps.append(gap / max(policy_latency, 1e-9))
+                fast_oracle_weights.append(float(request.request_count))
+                oracle_requests_remaining -= 1
         deployment_window = int(env.metrics["deployment_updates"])
         _, _, done, batch_info = env.step(actions, represented_seconds=step_represented_seconds)
         group_infos = batch_info["group_infos"]
@@ -1551,12 +1634,33 @@ def rollout(
             request_count = float(info.get("request_count", request.request_count))
             train_reward_info = _training_reward_components(info, env, args)
             train_reward = train_reward_info["train_reward"]
-            stage_latency_costs = _stage_latency_costs(info, env, request)
+            stage_latency_costs = _stage_latency_costs(
+                info,
+                env,
+                request,
+                include_access=not bool(
+                    getattr(args, "fast_controllable_latency_credit", False)
+                ),
+            )
             stage_externality_costs = _stage_congestion_externality_costs(info, env, request)
             fast_externality_costs.append(float(sum(stage_externality_costs)))
+            stage_counterfactual_regrets = batch_counterfactual_regrets[group_idx]
+            fast_counterfactual_regret_costs.append(
+                float(sum(stage_counterfactual_regrets))
+            )
             fast_stage_rewards = [
-                -float(latency_cost + args.fast_congestion_credit_coef * externality_cost) * reward_scale
-                for latency_cost, externality_cost in zip(stage_latency_costs, stage_externality_costs)
+                -float(
+                    latency_cost
+                    + args.fast_congestion_credit_coef * externality_cost
+                    + float(getattr(args, "fast_counterfactual_credit_coef", 0.0))
+                    * counterfactual_regret
+                )
+                * reward_scale
+                for latency_cost, externality_cost, counterfactual_regret in zip(
+                    stage_latency_costs,
+                    stage_externality_costs,
+                    stage_counterfactual_regrets or [0.0] * len(stage_latency_costs),
+                )
             ]
             stage_transitions = float(max(len(info["stage_nodes"]) - 1, 0) * request_count)
             cross_stage_transitions = float(
@@ -1584,6 +1688,9 @@ def rollout(
                     else 0.0,
                     cross_stage_transitions=cross_stage_transitions,
                     stage_transitions=stage_transitions,
+                    stage_transition_data_mb=list(
+                        request.stage_output_mb[: max(len(request.stage_compute_gcycles) - 1, 0)]
+                    ),
                     service_id=int(request.service_id),
                     stage_nodes=[int(node_id) for node_id in info["stage_nodes"]],
                     slow_stage_costs=stage_latency_costs,
@@ -1660,6 +1767,8 @@ def rollout(
         "slow_colocation_cost": float("nan"),
         "slow_cross_stage_transition_rate": float("nan"),
         "slow_colocation_rate": float("nan"),
+        "slow_data_weighted_cross_stage_rate": float("nan"),
+        "slow_shared_return_credit": float("nan"),
         "slow_deployment_memory_cost": float("nan"),
         "slow_deployment_storage_cost": float("nan"),
         "slow_migration_cost": float("nan"),
@@ -1709,6 +1818,19 @@ def rollout(
         "avg_train_reward": _weighted_mean(train_rewards, weights),
         "avg_train_latency_cost_s": _weighted_mean(train_latency_costs, weights),
         "avg_fast_externality_cost_s": _weighted_mean(fast_externality_costs, weights),
+        "avg_fast_counterfactual_regret_s": _weighted_mean(
+            fast_counterfactual_regret_costs,
+            weights,
+        ),
+        "fast_oracle_samples": float(len(fast_oracle_latency_gaps)),
+        "avg_fast_oracle_latency_gap_s": _weighted_mean(
+            fast_oracle_latency_gaps,
+            fast_oracle_weights,
+        ),
+        "avg_fast_oracle_relative_gap": _weighted_mean(
+            fast_oracle_relative_gaps,
+            fast_oracle_weights,
+        ),
         "avg_train_resource_penalty": _weighted_mean(train_resource_penalties, weights),
         "avg_diagnostic_resource_penalty": _weighted_mean(diagnostic_resource_penalties, weights),
         "avg_compute_hotspot_penalty": _weighted_mean(compute_hotspot_penalties, weights),
@@ -1999,6 +2121,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "avg_train_reward",
         "avg_train_latency_cost_s",
         "avg_fast_externality_cost_s",
+        "avg_fast_counterfactual_regret_s",
         "avg_train_resource_penalty",
         "avg_diagnostic_resource_penalty",
         "avg_compute_hotspot_penalty",
@@ -2073,6 +2196,8 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_colocation_cost",
         "slow_cross_stage_transition_rate",
         "slow_colocation_rate",
+        "slow_data_weighted_cross_stage_rate",
+        "slow_shared_return_credit",
         "slow_deployment_memory_cost",
         "slow_deployment_storage_cost",
         "slow_migration_cost",
@@ -2088,6 +2213,8 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_deployment_memory_fraction",
         "slow_deployment_storage_fraction",
         "slow_migration_fraction",
+        "avg_fast_oracle_latency_gap_s",
+        "avg_fast_oracle_relative_gap",
     ]
 
     aggregated: dict[str, float] = {
@@ -2100,6 +2227,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "valid_requests": float(valid_requests.sum()),
         "invalid_actions": float(sum(r["invalid_actions"] for r in rollouts)),
         "deployment_updates": float(deployment_updates.sum()),
+        "fast_oracle_samples": float(sum(r["fast_oracle_samples"] for r in rollouts)),
     }
     aggregated["temporal_sampling_fraction"] = float(
         aggregated["settlement_steps"] / max(aggregated["logical_steps"], 1.0)
@@ -2257,14 +2385,15 @@ def _stage_latency_costs(
     policy_info: dict[str, object],
     env: EdgeComputingEnv,
     request,
+    *,
+    include_access: bool = True,
 ) -> list[float]:
     """Decompose one request's end-to-end latency into additive stage costs.
 
     Each stage owns its compute delay and the communication needed to reach
-    that stage.  Radio access belongs to stage zero and any invalid-action
-    penalty belongs to the terminal stage.  The resulting costs sum exactly to
-    ``latency_s``, allowing Fast PPO to use proper per-stage credit instead of
-    repeating the full request latency at every stage.
+    that stage. Radio access can be excluded because it is invariant to every
+    scheduling and placement action. Any invalid-action penalty belongs to the
+    terminal stage.
     """
 
     assert env.scenario is not None
@@ -2276,7 +2405,8 @@ def _stage_latency_costs(
     for stage_id, node_id in enumerate(stage_nodes):
         cost = float(compute_delays.get(f"stage-{stage_id}", 0.0))
         if stage_id == 0:
-            cost += float(policy_info["access_delay_s"])
+            if include_access:
+                cost += float(policy_info["access_delay_s"])
             previous_node = int(request.home_node)
             link_key = "ingress"
         else:
@@ -2292,7 +2422,10 @@ def _stage_latency_costs(
     costs[-1] += float(policy_info["penalty_latency_s"])
     # Keep the decomposition robust to future latency components and floating
     # point drift by assigning any residual to the terminal transition.
-    costs[-1] += float(policy_info["latency_s"]) - float(sum(costs))
+    target_latency = float(policy_info["latency_s"])
+    if not include_access:
+        target_latency -= float(policy_info["access_delay_s"])
+    costs[-1] += target_latency - float(sum(costs))
     return costs
 
 
@@ -3197,8 +3330,30 @@ def resolve_eval_rollout_unit(args: argparse.Namespace) -> str:
     return args.eval_rollout_unit
 
 
+def resolve_fast_chain_context(args: argparse.Namespace) -> str:
+    """Use chain-v2 for new runs and preserve legacy checkpoint dimensions."""
+
+    requested = str(getattr(args, "fast_chain_context", "auto"))
+    if requested != "auto":
+        return requested
+    checkpoint_raw = getattr(args, "load_checkpoint", None)
+    if not checkpoint_raw:
+        return "chain-v2"
+    checkpoint_path = Path(checkpoint_raw)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    embedded_args = checkpoint.get("metadata", {}).get("args", {})
+    checkpoint_args = embedded_args if isinstance(embedded_args, dict) else {}
+    if not checkpoint_args:
+        sidecar_path = checkpoint_path.parent.parent / "metadata.json"
+        if sidecar_path.is_file():
+            with sidecar_path.open("r", encoding="utf-8") as handle:
+                checkpoint_args = dict(json.load(handle).get("args", {}))
+    return str(checkpoint_args.get("fast_chain_context", "legacy"))
+
+
 def main() -> None:
     args = parse_args()
+    args.fast_chain_context = resolve_fast_chain_context(args)
     eval_rollout_unit = resolve_eval_rollout_unit(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -3253,6 +3408,7 @@ def main() -> None:
         slow_minibatch_size=args.slow_minibatch_size,
         fast_minibatch_size=args.fast_minibatch_size,
         fast_policy_kind=args.fast_policy_kind,
+        fast_chain_context=args.fast_chain_context,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
         fast_load_balanced_updates=args.fast_load_balanced_updates,
         fast_load_group_weights=_load_probabilities_for_args(
@@ -3272,6 +3428,7 @@ def main() -> None:
         slow_count_shortage_coef=args.slow_count_shortage_coef,
         slow_count_latency_coef=args.slow_count_latency_coef,
         slow_deadline_violation_coef=args.slow_deadline_violation_coef,
+        slow_shared_return_coef=args.slow_shared_return_coef,
         slow_deterministic_count_mode=args.slow_deterministic_count_mode,
     )
     loaded_metadata: dict[str, object] = {}
@@ -3303,6 +3460,11 @@ def main() -> None:
     print(f"  train_mode={args.train_mode}")
     print(f"  training_design={args.training_design}")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
+    print(
+        f"  fast_chain_context={args.fast_chain_context} "
+        f"counterfactual_credit={args.fast_counterfactual_credit_coef:.3f} "
+        f"controllable_latency_credit={args.fast_controllable_latency_credit}"
+    )
     print(f"  rollout_unit={args.rollout_unit}")
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
@@ -3330,6 +3492,10 @@ def main() -> None:
     print(f"  synchronized_window_block={args.synchronized_window_block or 'disabled'}")
     print(f"  slow_tail_latency_coef={args.slow_tail_latency_coef:.2f} (P95 weight)")
     print(f"  slow_colocation_coef={args.slow_colocation_coef:.3f} (cross-stage transition penalty)")
+    print(
+        f"  slow_shared_return_coef={args.slow_shared_return_coef:.3f} "
+        "colocation_credit=data-volume-weighted"
+    )
     print(
         f"  slow_count_value_coef={args.slow_count_value_coef:.3f} "
         "(0 isolates Count actor from failed critic gradients)"
@@ -3594,6 +3760,10 @@ def main() -> None:
             "avg_train_reward": np.nan,
             "avg_train_latency_cost_s": np.nan,
             "avg_fast_externality_cost_s": np.nan,
+            "avg_fast_counterfactual_regret_s": np.nan,
+            "fast_oracle_samples": 0,
+            "avg_fast_oracle_latency_gap_s": np.nan,
+            "avg_fast_oracle_relative_gap": np.nan,
             "avg_train_resource_penalty": np.nan,
             "avg_diagnostic_resource_penalty": np.nan,
             "avg_compute_hotspot_penalty": np.nan,
@@ -3665,6 +3835,8 @@ def main() -> None:
             "slow_colocation_cost": np.nan,
             "slow_cross_stage_transition_rate": np.nan,
             "slow_colocation_rate": np.nan,
+            "slow_data_weighted_cross_stage_rate": np.nan,
+            "slow_shared_return_credit": np.nan,
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
@@ -4250,6 +4422,16 @@ def main() -> None:
             "avg_train_reward": stats["avg_train_reward"],
             "avg_train_latency_cost_s": stats["avg_train_latency_cost_s"],
             "avg_fast_externality_cost_s": stats["avg_fast_externality_cost_s"],
+            "avg_fast_counterfactual_regret_s": stats[
+                "avg_fast_counterfactual_regret_s"
+            ],
+            "fast_oracle_samples": int(stats["fast_oracle_samples"]),
+            "avg_fast_oracle_latency_gap_s": stats[
+                "avg_fast_oracle_latency_gap_s"
+            ],
+            "avg_fast_oracle_relative_gap": stats[
+                "avg_fast_oracle_relative_gap"
+            ],
             "avg_train_resource_penalty": stats["avg_train_resource_penalty"],
             "avg_diagnostic_resource_penalty": stats["avg_diagnostic_resource_penalty"],
             "avg_compute_hotspot_penalty": stats["avg_compute_hotspot_penalty"],
@@ -4321,6 +4503,10 @@ def main() -> None:
             "slow_colocation_cost": stats["slow_colocation_cost"],
             "slow_cross_stage_transition_rate": stats["slow_cross_stage_transition_rate"],
             "slow_colocation_rate": stats["slow_colocation_rate"],
+            "slow_data_weighted_cross_stage_rate": stats[
+                "slow_data_weighted_cross_stage_rate"
+            ],
+            "slow_shared_return_credit": stats["slow_shared_return_credit"],
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],

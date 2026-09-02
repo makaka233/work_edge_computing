@@ -21,6 +21,55 @@ from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_c
 def test_observation_dimensions():
     assert slow_obs_dim(16, 3) == 17 + 16 * (6 + 3) + 16 * 16 * 4
     assert fast_obs_dim(16) == 12 + 16 * 9 + 16 * 16 * 3
+    assert fast_obs_dim(16, chain_context="chain-v2") == 16 + 16 * 13 + 16 * 16 * 3
+
+
+def test_fast_chain_v2_state_and_bounded_oracle_are_valid():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=102,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=10,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=6,
+        fast_chain_context="chain-v2",
+    )
+    agent.maybe_update_deployment(env, deterministic=True, record=False)
+    request = env.current_requests[0]
+    state = agent.fast_agent._build_state(env, request, 0, [])
+    assert state.shape == (fast_obs_dim(16, chain_context="chain-v2"),)
+
+    partial: list[int] = []
+    deliberately_bad: list[int] = []
+    for stage_id in range(len(request.stage_compute_gcycles)):
+        candidates = np.flatnonzero(agent.fast_agent._build_mask(env, request, stage_id, partial))
+        selected = max(
+            candidates.tolist(),
+            key=lambda node_id: agent.fast_agent._stage_candidate_proxy_cost(
+                env, request, stage_id, int(node_id), partial
+            ),
+        )
+        deliberately_bad.append(int(selected))
+        partial.append(int(selected))
+    regrets = agent.fast_agent.stage_counterfactual_regrets(env, request, deliberately_bad)
+    oracle = agent.fast_agent.chain_oracle_schedule(
+        env,
+        request,
+        beam_width=8,
+        candidates_per_stage=4,
+    )
+
+    assert len(regrets) == len(request.stage_compute_gcycles)
+    assert all(regret >= 0.0 for regret in regrets)
+    assert any(regret > 0.0 for regret in regrets)
+    assert env.evaluate_schedule(request, oracle)["valid"]
 
 
 def test_slow_discounted_returns_stop_at_episode_boundaries():
@@ -535,6 +584,17 @@ def test_fast_stage_costs_sum_to_request_latency():
     assert all(cost >= 0.0 for cost in stage_costs)
     assert np.isclose(sum(stage_costs), info["latency_s"])
 
+    controllable_costs = _stage_latency_costs(
+        info,
+        env,
+        request,
+        include_access=False,
+    )
+    assert np.isclose(
+        sum(controllable_costs),
+        info["latency_s"] - info["access_delay_s"],
+    )
+
 
 def test_fast_stage_externality_is_positive_under_shared_kkt_resources():
     env = EdgeComputingEnv(
@@ -994,6 +1054,97 @@ def test_slow_reward_tracks_cross_stage_colocation():
     assert np.isclose(agent.last_slow_window_metrics["slow_colocation_rate"], 0.5)
     assert np.isclose(agent.last_slow_window_metrics["slow_colocation_cost"], 0.025)
     assert np.isclose(agent.slow_agent.window_returns[0], -0.1 - 0.025)
+
+
+def test_slow_colocation_credit_is_weighted_by_transition_data():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=381,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_colocation_coef=0.11,
+    )
+    service = next(service for service in env.scenario.services if len(service.stages) >= 2)
+    agent.slow_agent.pending_window_id = 0
+    common = {
+        "stage_count": 2,
+        "done": False,
+        "record_fast": False,
+        "weight": 1.0,
+        "latency_s": 0.1,
+        "deadline_s": 1.0,
+        "stage_transitions": 1.0,
+        "service_id": service.service_id,
+        "slow_stage_costs": [0.05, 0.05],
+    }
+    agent.observe_step_reward(
+        reward=-0.1,
+        cross_stage_transitions=1.0,
+        stage_nodes=[0, 1],
+        stage_transition_data_mb=[10.0],
+        **common,
+    )
+    agent.observe_step_reward(
+        reward=-0.1,
+        cross_stage_transitions=0.0,
+        stage_nodes=[0, 0],
+        stage_transition_data_mb=[1.0],
+        **common,
+    )
+    agent.flush_slow_window_reward(done=True, env=env)
+
+    assert np.isclose(agent.last_slow_window_metrics["slow_cross_stage_transition_rate"], 0.5)
+    assert np.isclose(agent.last_slow_window_metrics["slow_data_weighted_cross_stage_rate"], 10.0 / 11.0)
+    assert np.isclose(agent.last_slow_window_metrics["slow_colocation_cost"], 0.1)
+
+
+def test_slow_shared_return_reaches_factorized_actions_without_critic_gate():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=382,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=60.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_shared_return_coef=0.25,
+        slow_tail_latency_coef=0.0,
+        slow_colocation_coef=0.0,
+        slow_deadline_violation_coef=0.0,
+    )
+    service = next(service for service in env.scenario.services if len(service.stages) >= 2)
+    agent.slow_agent.pending_window_id = 0
+    agent.observe_step_reward(
+        reward=-0.4,
+        stage_count=2,
+        done=False,
+        record_fast=False,
+        weight=1.0,
+        latency_s=0.4,
+        deadline_s=1.0,
+        service_id=service.service_id,
+        stage_nodes=[0, 0],
+        slow_stage_costs=[0.2, 0.2],
+    )
+    agent.flush_slow_window_reward(done=True, env=env)
+
+    assert np.isclose(agent.last_slow_window_metrics["slow_window_return"], -0.4)
+    assert np.isclose(agent.last_slow_window_metrics["slow_shared_return_credit"], -0.1)
 
 
 def test_factorized_placement_return_receives_local_colocation_credit():

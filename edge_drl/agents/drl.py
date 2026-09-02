@@ -51,8 +51,21 @@ def slow_obs_dim(num_nodes: int, num_service_types: int) -> int:
     )
 
 
-def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
-    dim = FAST_GLOBAL_DIM + num_nodes * FAST_NODE_FEATURE_DIM
+def fast_feature_dims(chain_context: str = "legacy") -> tuple[int, int]:
+    if chain_context == "legacy":
+        return FAST_GLOBAL_DIM, FAST_NODE_FEATURE_DIM
+    if chain_context == "chain-v2":
+        return FAST_CHAIN_GLOBAL_DIM, FAST_CHAIN_NODE_FEATURE_DIM
+    raise ValueError("fast chain context must be 'legacy' or 'chain-v2'")
+
+
+def fast_obs_dim(
+    num_nodes: int,
+    policy_kind: str = "gat_node_scorer",
+    chain_context: str = "legacy",
+) -> int:
+    global_dim, node_feature_dim = fast_feature_dims(chain_context)
+    dim = global_dim + num_nodes * node_feature_dim
     if policy_kind == "gat_node_scorer":
         dim += num_nodes * num_nodes * FAST_EDGE_FEATURE_DIM
     return dim
@@ -61,6 +74,8 @@ def fast_obs_dim(num_nodes: int, policy_kind: str = "gat_node_scorer") -> int:
 FAST_GLOBAL_DIM = 12
 FAST_NODE_FEATURE_DIM = 9
 FAST_EDGE_FEATURE_DIM = 3
+FAST_CHAIN_GLOBAL_DIM = 16
+FAST_CHAIN_NODE_FEATURE_DIM = 13
 
 
 class SlowWindowCritic(nn.Module):
@@ -1143,6 +1158,7 @@ class FastSchedulingPPOAgent:
     num_nodes: int
     max_service_stages: int
     policy_kind: str = "gat_node_scorer"
+    chain_context: str = "legacy"
     lr: float = 2e-4
     k_epochs: int = 4
     entropy_coef: float = 0.001
@@ -1177,9 +1193,10 @@ class FastSchedulingPPOAgent:
             raise ValueError("entropy_max_coef must be at least entropy_coef")
         if self.entropy_adaptation_rate < 0.0:
             raise ValueError("entropy_adaptation_rate must be non-negative")
+        global_dim, node_feature_dim = fast_feature_dims(self.chain_context)
         self.entropy_current_coef = float(self.entropy_coef)
         self.ppo = PPOAgent(
-            obs_dim=fast_obs_dim(self.num_nodes, self.policy_kind),
+            obs_dim=fast_obs_dim(self.num_nodes, self.policy_kind, self.chain_context),
             action_dim=self.num_nodes,
             hidden_dim=128,
             lr=self.lr,
@@ -1190,8 +1207,8 @@ class FastSchedulingPPOAgent:
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
             policy_kind=self.policy_kind,
-            global_dim=FAST_GLOBAL_DIM,
-            node_feature_dim=FAST_NODE_FEATURE_DIM,
+            global_dim=global_dim,
+            node_feature_dim=node_feature_dim,
             edge_feature_dim=FAST_EDGE_FEATURE_DIM,
             num_nodes=self.num_nodes,
             group_balanced_updates=self.load_balanced_updates,
@@ -1409,14 +1426,21 @@ class FastSchedulingPPOAgent:
             expected_node_work,
         )
         node_features = []
+        incoming_data_mb = (
+            float(request.input_mb)
+            if stage_id == 0
+            else float(request.stage_output_mb[stage_id - 1])
+        )
+        current_output_mb = float(request.stage_output_mb[stage_id])
+        next_stage_id = stage_id + 1
+        has_next_stage = next_stage_id < len(request.stage_compute_gcycles)
         deployed = env.deployment[request.service_id, stage_id] if env.deployment is not None else np.zeros(self.num_nodes, dtype=bool)
         for node in nodes:
             bandwidth = env.scenario.bandwidth_mb_s[prev_node, node.node_id]
             if not np.isfinite(bandwidth):
                 bandwidth = 0.0
             reachable = env.shortest_path(prev_node, node.node_id) is not None
-            node_features.extend(
-                [
+            features = [
                     float(deployed[node.node_id]),
                     float(reachable),
                     node.compute_gcycles_per_s / max_compute,
@@ -1430,7 +1454,27 @@ class FastSchedulingPPOAgent:
                         node.compute_gcycles_per_s * max(1.0 - 0.75 * env.node_compute_load[node.node_id], 0.10),
                     ),
                 ]
-            )
+            if self.chain_context == "chain-v2":
+                transfer_s, propagation_s = self._route_proxy_delay(
+                    env,
+                    prev_node,
+                    node.node_id,
+                    incoming_data_mb,
+                )
+                next_stage_overlap = float(
+                    has_next_stage
+                    and env.deployment is not None
+                    and env.deployment[request.service_id, next_stage_id, node.node_id]
+                )
+                features.extend(
+                    [
+                        float(node.node_id == prev_node),
+                        float(np.tanh(transfer_s / 0.25)) if np.isfinite(transfer_s) else 1.0,
+                        float(np.tanh(propagation_s / 0.05)) if np.isfinite(propagation_s) else 1.0,
+                        next_stage_overlap,
+                    ]
+                )
+            node_features.extend(features)
         scalars = [
             request.service_id / max(env.config.num_service_types - 1, 1),
             stage_id / max(self.max_service_stages - 1, 1),
@@ -1445,9 +1489,187 @@ class FastSchedulingPPOAgent:
             tick_request_event_count / max(env.config.num_edge_nodes * env.config.num_service_types, 1),
             tick_service_count / max(tick_request_count, 1.0),
         ]
+        if self.chain_context == "chain-v2":
+            total_compute = max(float(sum(request.stage_compute_gcycles)), 1e-9)
+            remaining_compute = float(sum(request.stage_compute_gcycles[stage_id:]))
+            remaining_output = float(sum(request.stage_output_mb[stage_id:]))
+            scalars.extend(
+                [
+                    incoming_data_mb / 2.0,
+                    current_output_mb / 2.0,
+                    remaining_compute / total_compute,
+                    float(np.tanh(remaining_output / 4.0)),
+                ]
+            )
         if self.policy_kind == "gat_node_scorer":
             node_features += self._build_edge_features(env)
         return np.asarray(scalars + node_features, dtype=np.float32)
+
+    def stage_counterfactual_regrets(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_nodes: list[int] | tuple[int, ...],
+    ) -> list[float]:
+        """Approximate action regret against feasible chain-aware alternatives.
+
+        The proxy uses effective compute capacity, routed incoming data, and a
+        one-stage downstream lookahead.  It is deliberately independent of the
+        actor logits so it remains a useful difference-reward signal.
+        """
+
+        regrets: list[float] = []
+        partial: list[int] = []
+        for stage_id, selected_node in enumerate(stage_nodes):
+            mask = self._build_mask(env, request, stage_id, partial)
+            candidates = np.flatnonzero(mask)
+            if candidates.size == 0:
+                regrets.append(0.0)
+            else:
+                costs = [
+                    self._stage_candidate_proxy_cost(
+                        env,
+                        request,
+                        stage_id,
+                        int(candidate),
+                        partial,
+                    )
+                    for candidate in candidates
+                ]
+                selected_cost = self._stage_candidate_proxy_cost(
+                    env,
+                    request,
+                    stage_id,
+                    int(selected_node),
+                    partial,
+                )
+                best_cost = min(costs)
+                regrets.append(max(float(selected_cost - best_cost), 0.0))
+            partial.append(int(selected_node))
+        return regrets
+
+    def chain_oracle_schedule(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        *,
+        beam_width: int = 32,
+        candidates_per_stage: int = 8,
+    ) -> list[int]:
+        """Return a bounded beam-search oracle under the active deployment."""
+
+        beam_width = max(int(beam_width), 1)
+        candidates_per_stage = max(int(candidates_per_stage), 1)
+        paths: list[tuple[list[int], float]] = [([], 0.0)]
+        for stage_id in range(len(request.stage_compute_gcycles)):
+            expanded: list[tuple[list[int], float]] = []
+            for partial, prefix_cost in paths:
+                mask = self._build_mask(env, request, stage_id, partial)
+                ranked = sorted(
+                    np.flatnonzero(mask).tolist(),
+                    key=lambda node_id: self._stage_candidate_proxy_cost(
+                        env, request, stage_id, int(node_id), partial
+                    ),
+                )[:candidates_per_stage]
+                for node_id in ranked:
+                    incremental = self._stage_candidate_proxy_cost(
+                        env, request, stage_id, int(node_id), partial
+                    )
+                    expanded.append((partial + [int(node_id)], prefix_cost + incremental))
+            if not expanded:
+                return [request.home_node] * len(request.stage_compute_gcycles)
+            expanded.sort(key=lambda item: item[1])
+            paths = expanded[:beam_width]
+        valid = [
+            (path, env.evaluate_schedule(request, path))
+            for path, _ in paths
+        ]
+        valid.sort(
+            key=lambda item: (
+                not bool(item[1]["valid"]),
+                float(item[1]["latency_s"]),
+            )
+        )
+        return valid[0][0]
+
+    def _stage_candidate_proxy_cost(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        node_id: int,
+        partial_nodes: list[int],
+    ) -> float:
+        assert env.scenario is not None
+        prev_node = request.home_node if not partial_nodes else partial_nodes[-1]
+        incoming_data_mb = (
+            float(request.input_mb)
+            if stage_id == 0
+            else float(request.stage_output_mb[stage_id - 1])
+        )
+        transfer_s, propagation_s = self._route_proxy_delay(
+            env,
+            prev_node,
+            node_id,
+            incoming_data_mb,
+        )
+        if not np.isfinite(transfer_s):
+            return float("inf")
+        node = env.scenario.nodes[node_id]
+        effective_capacity = float(node.compute_gcycles_per_s) * max(
+            1.0 - 0.75 * float(env.node_compute_load[node_id]),
+            0.10,
+        )
+        compute_s = float(request.stage_compute_gcycles[stage_id]) / max(effective_capacity, 1e-9)
+        downstream_s = 0.0
+        next_stage_id = stage_id + 1
+        if next_stage_id < len(request.stage_compute_gcycles) and env.deployment is not None:
+            next_candidates = np.flatnonzero(env.deployment[request.service_id, next_stage_id])
+            lookahead: list[float] = []
+            for next_node_id in next_candidates:
+                next_transfer, next_propagation = self._route_proxy_delay(
+                    env,
+                    node_id,
+                    int(next_node_id),
+                    float(request.stage_output_mb[stage_id]),
+                )
+                if not np.isfinite(next_transfer):
+                    continue
+                next_node = env.scenario.nodes[int(next_node_id)]
+                next_capacity = float(next_node.compute_gcycles_per_s) * max(
+                    1.0 - 0.75 * float(env.node_compute_load[int(next_node_id)]),
+                    0.10,
+                )
+                next_compute = float(request.stage_compute_gcycles[next_stage_id]) / max(
+                    next_capacity,
+                    1e-9,
+                )
+                lookahead.append(next_transfer + next_propagation + next_compute)
+            if lookahead:
+                downstream_s = 0.5 * min(lookahead)
+        return compute_s + transfer_s + propagation_s + downstream_s
+
+    @staticmethod
+    def _route_proxy_delay(
+        env: EdgeComputingEnv,
+        src_node: int,
+        dst_node: int,
+        data_mb: float,
+    ) -> tuple[float, float]:
+        if int(src_node) == int(dst_node):
+            return 0.0, 0.0
+        assert env.scenario is not None
+        path = env.shortest_path(int(src_node), int(dst_node))
+        if path is None:
+            return float("inf"), float("inf")
+        transfer_s = 0.0
+        propagation_s = 0.0
+        for left, right in zip(path, path[1:]):
+            raw_bandwidth = float(env.scenario.bandwidth_mb_s[left, right])
+            residual = max(1.0 - 0.75 * float(env.link_load[left, right]), 0.10)
+            transfer_s += float(data_mb) / max(raw_bandwidth * residual, 1e-9)
+            propagation_s += float(env.scenario.propagation_ms[left, right]) / 1000.0
+        return transfer_s, propagation_s
 
     def _reserve_compute_work(
         self,
@@ -1654,11 +1876,15 @@ class HierarchicalPPOAgent:
     window_max_link_load: float = 0.0
     window_cross_stage_transitions: float = 0.0
     window_stage_transitions: float = 0.0
+    window_cross_stage_data_mb: float = 0.0
+    window_total_transition_data_mb: float = 0.0
     window_stage_latency_samples: dict[tuple[int, int], list[tuple[float, float]]] = field(default_factory=dict)
     window_stage_deadline_violations: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_weights: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_cross_transitions: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_transition_weights: dict[tuple[int, int], float] = field(default_factory=dict)
+    window_stage_cross_data_mb: dict[tuple[int, int], float] = field(default_factory=dict)
+    window_stage_transition_data_mb: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_used_nodes: dict[tuple[int, int], set[int]] = field(default_factory=dict)
     window_stage_node_weights: dict[tuple[int, int], dict[int, float]] = field(default_factory=dict)
     window_stage_node_latency_samples: dict[
@@ -1666,6 +1892,8 @@ class HierarchicalPPOAgent:
     ] = field(default_factory=dict)
     window_stage_node_cross_transitions: dict[tuple[int, int, int], float] = field(default_factory=dict)
     window_stage_node_transition_weights: dict[tuple[int, int, int], float] = field(default_factory=dict)
+    window_stage_node_cross_data_mb: dict[tuple[int, int, int], float] = field(default_factory=dict)
+    window_stage_node_transition_data_mb: dict[tuple[int, int, int], float] = field(default_factory=dict)
     slow_reward_scale: float = 1.0
     slow_tail_latency_coef: float = 0.35
     slow_colocation_coef: float = 0.05
@@ -1678,6 +1906,7 @@ class HierarchicalPPOAgent:
     slow_count_shortage_coef: float = 0.25
     slow_count_latency_coef: float = 1.0
     slow_deadline_violation_coef: float = 0.10
+    slow_shared_return_coef: float = 0.0
     window_deployment_memory_fraction: float = 0.0
     window_deployment_storage_fraction: float = 0.0
     window_migration_fraction: float = 0.0
@@ -1730,6 +1959,7 @@ class HierarchicalPPOAgent:
         slow_minibatch_size: int = 2048,
         fast_minibatch_size: int = 512,
         fast_policy_kind: str = "gat_node_scorer",
+        fast_chain_context: str = "legacy",
         fast_reservation_microbatch_size: int = 16,
         fast_load_balanced_updates: bool = True,
         fast_load_group_weights: tuple[float, ...] | None = None,
@@ -1746,6 +1976,7 @@ class HierarchicalPPOAgent:
         slow_count_shortage_coef: float = 0.25,
         slow_count_latency_coef: float = 1.0,
         slow_deadline_violation_coef: float = 0.10,
+        slow_shared_return_coef: float = 0.0,
         slow_deterministic_count_mode: str = "expected",
     ) -> "HierarchicalPPOAgent":
         return cls(
@@ -1793,6 +2024,7 @@ class HierarchicalPPOAgent:
                 num_nodes=env.config.num_edge_nodes,
                 max_service_stages=env.config.max_service_stages,
                 policy_kind=fast_policy_kind,
+                chain_context=fast_chain_context,
                 lr=fast_lr,
                 k_epochs=fast_k_epochs,
                 entropy_coef=fast_entropy_coef,
@@ -1820,6 +2052,7 @@ class HierarchicalPPOAgent:
             slow_count_shortage_coef=slow_count_shortage_coef,
             slow_count_latency_coef=slow_count_latency_coef,
             slow_deadline_violation_coef=slow_deadline_violation_coef,
+            slow_shared_return_coef=slow_shared_return_coef,
         )
 
     def maybe_update_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> None:
@@ -1882,6 +2115,7 @@ class HierarchicalPPOAgent:
         max_link_load: float | None = None,
         cross_stage_transitions: float = 0.0,
         stage_transitions: float = 0.0,
+        stage_transition_data_mb: list[float] | tuple[float, ...] | None = None,
         service_id: int | None = None,
         stage_nodes: list[int] | tuple[int, ...] | None = None,
         slow_stage_costs: list[float] | None = None,
@@ -1933,8 +2167,15 @@ class HierarchicalPPOAgent:
             # cross-node credit.  The previous global window penalty never
             # reached factorized Placement returns, so the actor could not
             # learn colocation even though the diagnostic reported it.
+            transition_data = list(stage_transition_data_mb or [])
+            if transition_data and len(transition_data) != max(len(stage_nodes) - 1, 0):
+                raise ValueError("stage_transition_data_mb must match adjacent stage transitions")
             for transition_id in range(1, len(stage_nodes)):
                 crossed = float(int(stage_nodes[transition_id - 1]) != int(stage_nodes[transition_id]))
+                data_mb = float(transition_data[transition_id - 1]) if transition_data else 1.0
+                weighted_data = max(data_mb, 0.0) * float(weight)
+                self.window_cross_stage_data_mb += crossed * weighted_data
+                self.window_total_transition_data_mb += weighted_data
                 for endpoint_stage_id in (transition_id - 1, transition_id):
                     stage_key = (int(service_id), int(endpoint_stage_id))
                     endpoint_node_id = int(stage_nodes[endpoint_stage_id])
@@ -1944,6 +2185,14 @@ class HierarchicalPPOAgent:
                     self.window_stage_transition_weights[stage_key] = (
                         self.window_stage_transition_weights.get(stage_key, 0.0) + float(weight)
                     )
+                    self.window_stage_cross_data_mb[stage_key] = (
+                        self.window_stage_cross_data_mb.get(stage_key, 0.0)
+                        + crossed * weighted_data
+                    )
+                    self.window_stage_transition_data_mb[stage_key] = (
+                        self.window_stage_transition_data_mb.get(stage_key, 0.0)
+                        + weighted_data
+                    )
                     node_key = (stage_key[0], stage_key[1], endpoint_node_id)
                     self.window_stage_node_cross_transitions[node_key] = (
                         self.window_stage_node_cross_transitions.get(node_key, 0.0)
@@ -1952,6 +2201,14 @@ class HierarchicalPPOAgent:
                     self.window_stage_node_transition_weights[node_key] = (
                         self.window_stage_node_transition_weights.get(node_key, 0.0)
                         + float(weight)
+                    )
+                    self.window_stage_node_cross_data_mb[node_key] = (
+                        self.window_stage_node_cross_data_mb.get(node_key, 0.0)
+                        + crossed * weighted_data
+                    )
+                    self.window_stage_node_transition_data_mb[node_key] = (
+                        self.window_stage_node_transition_data_mb.get(node_key, 0.0)
+                        + weighted_data
                     )
         if done:
             self.flush_slow_window_reward(done=True, env=env)
@@ -1983,12 +2240,22 @@ class HierarchicalPPOAgent:
             latency_return = self.window_reward / float(self.window_steps) if self.window_steps > 0 else 0.0
             feedback = {}
         cross_stage_rate = self.window_cross_stage_transitions / max(self.window_stage_transitions, 1e-9)
-        colocation_cost = self.slow_colocation_coef * cross_stage_rate
+        data_weighted_cross_stage_rate = self.window_cross_stage_data_mb / max(
+            self.window_total_transition_data_mb,
+            1e-9,
+        )
+        colocation_rate_for_credit = (
+            data_weighted_cross_stage_rate
+            if self.window_total_transition_data_mb > 0.0
+            else cross_stage_rate
+        )
+        colocation_cost = self.slow_colocation_coef * colocation_rate_for_credit
         if total_weight > 0.0:
             feedback.update(
                 {
                     "cross_stage_transition_rate": cross_stage_rate,
                     "colocation_rate": 1.0 - cross_stage_rate,
+                    "data_weighted_cross_stage_rate": data_weighted_cross_stage_rate,
                 }
             )
         deployment_memory_cost = self.slow_deployment_memory_coef * self.window_deployment_memory_fraction
@@ -2000,6 +2267,16 @@ class HierarchicalPPOAgent:
         )
         window_return = latency_return - operating_cost
         count_stage_returns, placement_stage_returns, count_credit_metrics = self._factorized_stage_returns(env)
+        shared_return_credit = self.slow_shared_return_coef * window_return
+        if shared_return_credit != 0.0:
+            count_stage_returns = {
+                key: value + shared_return_credit
+                for key, value in count_stage_returns.items()
+            }
+            placement_stage_returns = {
+                key: value + shared_return_credit
+                for key, value in placement_stage_returns.items()
+            }
         self.slow_agent.assign_pending_reward(
             window_return,
             done=done,
@@ -2020,6 +2297,8 @@ class HierarchicalPPOAgent:
             "slow_colocation_cost": float(self.slow_reward_scale * colocation_cost),
             "slow_cross_stage_transition_rate": float(cross_stage_rate),
             "slow_colocation_rate": float(1.0 - cross_stage_rate),
+            "slow_data_weighted_cross_stage_rate": float(data_weighted_cross_stage_rate),
+            "slow_shared_return_credit": float(shared_return_credit),
             "slow_deployment_memory_cost": float(self.slow_reward_scale * deployment_memory_cost),
             "slow_deployment_storage_cost": float(self.slow_reward_scale * deployment_storage_cost),
             "slow_migration_cost": float(self.slow_reward_scale * migration_cost),
@@ -2055,16 +2334,22 @@ class HierarchicalPPOAgent:
         self.window_max_link_load = 0.0
         self.window_cross_stage_transitions = 0.0
         self.window_stage_transitions = 0.0
+        self.window_cross_stage_data_mb = 0.0
+        self.window_total_transition_data_mb = 0.0
         self.window_stage_latency_samples.clear()
         self.window_stage_deadline_violations.clear()
         self.window_stage_weights.clear()
         self.window_stage_cross_transitions.clear()
         self.window_stage_transition_weights.clear()
+        self.window_stage_cross_data_mb.clear()
+        self.window_stage_transition_data_mb.clear()
         self.window_stage_used_nodes.clear()
         self.window_stage_node_weights.clear()
         self.window_stage_node_latency_samples.clear()
         self.window_stage_node_cross_transitions.clear()
         self.window_stage_node_transition_weights.clear()
+        self.window_stage_node_cross_data_mb.clear()
+        self.window_stage_node_transition_data_mb.clear()
         self.window_deployment_memory_fraction = 0.0
         self.window_deployment_storage_fraction = 0.0
         self.window_migration_fraction = 0.0
@@ -2127,6 +2412,12 @@ class HierarchicalPPOAgent:
                 stage_cross_transition_rate = self.window_stage_cross_transitions.get(stage_key, 0.0) / max(
                     self.window_stage_transition_weights.get(stage_key, 0.0), 1e-9
                 )
+                stage_transition_data = self.window_stage_transition_data_mb.get(stage_key, 0.0)
+                if stage_transition_data > 0.0:
+                    stage_cross_transition_rate = self.window_stage_cross_data_mb.get(
+                        stage_key,
+                        0.0,
+                    ) / stage_transition_data
                 count_cost = (
                     self.slow_count_latency_coef * tail_cost
                     + self.slow_deployment_memory_coef * memory_fraction
@@ -2189,6 +2480,12 @@ class HierarchicalPPOAgent:
                             if adjacent_stage_ids
                             else 0.0
                         )
+                    node_transition_data = self.window_stage_node_transition_data_mb.get(node_key, 0.0)
+                    if node_transition_data > 0.0:
+                        node_cross_rate = self.window_stage_node_cross_data_mb.get(
+                            node_key,
+                            0.0,
+                        ) / node_transition_data
                     node_cost = (
                         node_tail_cost
                         + self.slow_deadline_violation_coef * violation_rate
