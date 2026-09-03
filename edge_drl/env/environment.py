@@ -149,6 +149,8 @@ class EdgeEnvConfig:
     demand_load_group: int | None = None
     task_compute_scale: float = 1.0
     task_data_scale: float = 1.0
+    edge_node_profile: str = "synthetic-tiered"
+    service_workload_profile: str = "legacy-random"
     node_compute_capacity_scale: float = 1.0
     wired_link_bandwidth_scale: float = 1.0
     topology_k_nearest: int = 6
@@ -193,6 +195,14 @@ class EdgeEnvConfig:
             raise ValueError("task_compute_scale must be positive.")
         if self.task_data_scale <= 0:
             raise ValueError("task_data_scale must be positive.")
+        if self.edge_node_profile not in {"synthetic-tiered", "hardware-constrained"}:
+            raise ValueError(
+                "edge_node_profile must be 'synthetic-tiered' or 'hardware-constrained'."
+            )
+        if self.service_workload_profile not in {"legacy-random", "edge-ai-pipelines"}:
+            raise ValueError(
+                "service_workload_profile must be 'legacy-random' or 'edge-ai-pipelines'."
+            )
         if self.node_compute_capacity_scale <= 0:
             raise ValueError("node_compute_capacity_scale must be positive.")
         if self.wired_link_bandwidth_scale <= 0:
@@ -253,6 +263,8 @@ class EdgeComputingEnv:
             num_edge_nodes=self.config.num_edge_nodes,
             num_service_types=self.config.num_service_types,
             max_service_stages=self.config.max_service_stages,
+            edge_node_profile=self.config.edge_node_profile,
+            service_workload_profile=self.config.service_workload_profile,
             node_compute_capacity_scale=self.config.node_compute_capacity_scale,
             wired_link_bandwidth_scale=self.config.wired_link_bandwidth_scale,
             topology_k_nearest=self.config.topology_k_nearest,

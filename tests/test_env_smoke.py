@@ -588,6 +588,109 @@ def test_physical_capacity_scales_node_compute_and_wired_links():
     )
 
 
+def test_hardware_constrained_profile_uses_grounded_node_classes_and_nic_caps():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=148,
+            physical_seed=148,
+            scenario_seed=199,
+            num_users=10_000,
+            num_edge_nodes=32,
+            num_service_types=3,
+            edge_node_profile="hardware-constrained",
+            wired_link_bandwidth_scale=0.75,
+        )
+    )
+    env.reset()
+    assert env.scenario is not None
+
+    expected_types = {
+        "raspberry-pi-5",
+        "jetson-orin-nano",
+        "poweredge-xr4000",
+    }
+    actual_types = {node.hardware_type for node in env.scenario.nodes}
+    assert actual_types == expected_types
+    assert max(node.compute_gcycles_per_s for node in env.scenario.nodes) < 200.0
+    assert min(node.memory_gb for node in env.scenario.nodes) < 9.0
+
+    for left in range(env.config.num_edge_nodes):
+        for right in range(left + 1, env.config.num_edge_nodes):
+            if not env.scenario.adjacency[left, right]:
+                continue
+            endpoint_cap = min(
+                env.scenario.nodes[left].network_uplink_mb_s,
+                env.scenario.nodes[right].network_uplink_mb_s,
+            )
+            assert env.scenario.bandwidth_mb_s[left, right] <= endpoint_cap * 0.75 + 1e-9
+
+
+def test_legacy_node_profile_remains_the_default():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=149,
+            physical_seed=149,
+            scenario_seed=200,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+        )
+    )
+    env.reset()
+    assert env.scenario is not None
+    assert {node.hardware_type for node in env.scenario.nodes} == {"synthetic-tier"}
+    assert all(np.isinf(node.network_uplink_mb_s) for node in env.scenario.nodes)
+
+
+def test_edge_ai_pipeline_profile_increases_stage_resource_demand_but_remains_feasible():
+    common = dict(
+        seed=150,
+        physical_seed=150,
+        scenario_seed=201,
+        num_users=10_000,
+        num_edge_nodes=32,
+        num_service_types=10,
+        edge_node_profile="hardware-constrained",
+        service_resource_fraction=0.60,
+    )
+    legacy = EdgeComputingEnv(EdgeEnvConfig(**common, service_workload_profile="legacy-random"))
+    enhanced = EdgeComputingEnv(EdgeEnvConfig(**common, service_workload_profile="edge-ai-pipelines"))
+    legacy.reset()
+    enhanced.reset()
+    assert legacy.scenario is not None
+    assert enhanced.scenario is not None
+
+    def totals(env):
+        stages = [stage for service in env.scenario.services for stage in service.stages]
+        return (
+            sum(stage.compute_gcycles_mean for stage in stages),
+            sum(stage.memory_gb for stage in stages),
+            sum(stage.storage_gb for stage in stages),
+        )
+
+    legacy_compute, legacy_memory, legacy_storage = totals(legacy)
+    enhanced_compute, enhanced_memory, enhanced_storage = totals(enhanced)
+    assert enhanced_compute > legacy_compute * 1.5
+    assert enhanced_memory > legacy_memory
+    assert enhanced_storage > legacy_storage
+    assert len([stage for service in enhanced.scenario.services for stage in service.stages]) > len(
+        [stage for service in legacy.scenario.services for stage in service.stages]
+    )
+
+    max_service_memory = max(enhanced.service_memory_capacities())
+    assert all(
+        stage.memory_gb <= max_service_memory
+        for service in enhanced.scenario.services
+        for stage in service.stages
+    )
+    device_capacity = min(enhanced.service_memory_capacities())
+    assert any(
+        sum(stage.memory_gb for stage in service.stages) > device_capacity
+        for service in enhanced.scenario.services
+    )
+    assert enhanced_memory > 0.0
+
+
 def test_service_resource_fraction_preserves_physical_nodes_but_limits_placement_capacity():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

@@ -25,6 +25,8 @@ CRITICAL_ENV_KEYS = (
     "traffic_scale",
     "task_compute_scale",
     "task_data_scale",
+    "edge_node_profile",
+    "service_workload_profile",
     "node_compute_capacity_scale",
     "wired_link_bandwidth_scale",
     "topology_k_nearest",

@@ -1165,6 +1165,7 @@ class FastSchedulingPPOAgent:
     entropy_target: float | None = 0.7
     entropy_max_coef: float = 0.03
     entropy_adaptation_rate: float = 2e-3
+    entropy_normalized_control: bool = False
     value_coef: float = 0.5
     target_kl: float | None = 0.015
     minibatch_size: int = 512
@@ -1365,13 +1366,18 @@ class FastSchedulingPPOAgent:
             progress_interval_seconds=progress_interval_seconds,
         )
         observed_entropy = float(metrics.get("entropy", 0.0))
+        observed_control_entropy = float(
+            metrics.get("normalized_entropy", observed_entropy)
+            if self.entropy_normalized_control
+            else observed_entropy
+        )
         if not has_samples:
             next_coef = entropy_coef
-        elif self.entropy_target is None or not np.isfinite(observed_entropy):
+        elif self.entropy_target is None or not np.isfinite(observed_control_entropy):
             next_coef = self.entropy_coef
         else:
             next_coef = entropy_coef + self.entropy_adaptation_rate * (
-                float(self.entropy_target) - observed_entropy
+                float(self.entropy_target) - observed_control_entropy
             )
             next_coef = float(np.clip(next_coef, self.entropy_coef, self.entropy_max_coef))
         self.entropy_current_coef = float(next_coef)
@@ -1379,8 +1385,10 @@ class FastSchedulingPPOAgent:
         metrics["entropy_coef"] = float(entropy_coef)
         metrics["entropy_next_coef"] = self.entropy_current_coef
         metrics["entropy_target"] = float(self.entropy_target) if self.entropy_target is not None else 0.0
+        metrics["entropy_control_value"] = observed_control_entropy
+        metrics["entropy_normalized_control"] = float(self.entropy_normalized_control)
         metrics["entropy_shortfall"] = (
-            max(float(self.entropy_target or 0.0) - observed_entropy, 0.0)
+            max(float(self.entropy_target or 0.0) - observed_control_entropy, 0.0)
             if has_samples
             else 0.0
         )
@@ -1901,6 +1909,7 @@ class HierarchicalPPOAgent:
     slow_deployment_storage_coef: float = 0.01
     slow_migration_coef: float = 0.0
     slow_idle_replica_coef: float = 0.05
+    slow_count_unused_replica_coef: float = 0.0
     slow_placement_idle_coef: float = 0.02
     slow_placement_compute_coef: float = 0.20
     slow_count_shortage_coef: float = 0.25
@@ -1941,6 +1950,7 @@ class HierarchicalPPOAgent:
         fast_entropy_target: float | None = 0.7,
         fast_entropy_max_coef: float = 0.03,
         fast_entropy_adaptation_rate: float = 2e-3,
+        fast_entropy_normalized_control: bool = False,
         slow_value_coef: float = 0.5,
         slow_count_value_coef: float = 0.0,
         slow_critic_lr: float | None = 5e-4,
@@ -1971,6 +1981,7 @@ class HierarchicalPPOAgent:
         slow_deployment_storage_coef: float = 0.01,
         slow_migration_coef: float = 0.0,
         slow_idle_replica_coef: float = 0.05,
+        slow_count_unused_replica_coef: float = 0.0,
         slow_placement_idle_coef: float = 0.02,
         slow_placement_compute_coef: float = 0.20,
         slow_count_shortage_coef: float = 0.25,
@@ -2031,6 +2042,7 @@ class HierarchicalPPOAgent:
                 entropy_target=fast_entropy_target,
                 entropy_max_coef=fast_entropy_max_coef,
                 entropy_adaptation_rate=fast_entropy_adaptation_rate,
+                entropy_normalized_control=fast_entropy_normalized_control,
                 value_coef=fast_value_coef,
                 target_kl=fast_target_kl,
                 minibatch_size=fast_minibatch_size,
@@ -2047,6 +2059,7 @@ class HierarchicalPPOAgent:
             slow_deployment_storage_coef=slow_deployment_storage_coef,
             slow_migration_coef=slow_migration_coef,
             slow_idle_replica_coef=slow_idle_replica_coef,
+            slow_count_unused_replica_coef=slow_count_unused_replica_coef,
             slow_placement_idle_coef=slow_placement_idle_coef,
             slow_placement_compute_coef=slow_placement_compute_coef,
             slow_count_shortage_coef=slow_count_shortage_coef,
@@ -2364,6 +2377,10 @@ class HierarchicalPPOAgent:
             return {}, {}, {
                 "slow_count_effective_replicas_per_stage": 0.0,
                 "slow_count_redundant_replica_fraction": 0.0,
+                "slow_count_unused_replica_fraction": 0.0,
+                "slow_count_unused_replica_cost": 0.0,
+                "slow_count_replica_imbalance_fraction": 0.0,
+                "slow_count_replica_efficiency_cost": 0.0,
                 "slow_placement_node_compute_load": 0.0,
                 "slow_placement_node_compute_cost": 0.0,
             }
@@ -2373,6 +2390,8 @@ class HierarchicalPPOAgent:
         placement_returns: dict[tuple[int, ...], float] = {}
         effective_replica_counts: list[float] = []
         redundant_replica_fractions: list[float] = []
+        unused_replica_fractions: list[float] = []
+        replica_imbalance_fractions: list[float] = []
         placement_node_compute_loads: list[float] = []
         for service in env.scenario.services:
             for stage in service.stages:
@@ -2402,8 +2421,38 @@ class HierarchicalPPOAgent:
                 else:
                     effective_replicas = 0.0
                 redundant_replica_fraction = 1.0 - effective_replicas / max(float(replica_count), 1.0)
+                used_replica_count = sum(
+                    float(node_weights.get(node_id, 0.0)) > 0.0
+                    for node_id in placed_nodes
+                )
+                unused_replica_fraction = 1.0 - used_replica_count / max(
+                    float(replica_count),
+                    1.0,
+                )
+                # Total redundancy contains two disjoint causes:
+                #   unused: deployed nodes that served no sampled traffic;
+                #   imbalance: concentration among nodes that did serve it.
+                # When the explicit unused coefficient is enabled, charge the
+                # disjoint components instead of adding unused on top of total
+                # redundancy.  The zero-coefficient branch preserves legacy
+                # checkpoint/configuration semantics.
+                replica_imbalance_fraction = max(
+                    redundant_replica_fraction - unused_replica_fraction,
+                    0.0,
+                )
+                if self.slow_count_unused_replica_coef > 0.0:
+                    replica_efficiency_cost = (
+                        self.slow_idle_replica_coef * replica_imbalance_fraction
+                        + self.slow_count_unused_replica_coef * unused_replica_fraction
+                    )
+                else:
+                    replica_efficiency_cost = (
+                        self.slow_idle_replica_coef * redundant_replica_fraction
+                    )
                 effective_replica_counts.append(effective_replicas)
                 redundant_replica_fractions.append(redundant_replica_fraction)
+                unused_replica_fractions.append(unused_replica_fraction)
+                replica_imbalance_fractions.append(replica_imbalance_fraction)
                 memory_fraction = replica_count * float(stage.memory_gb) / memory_capacity
                 storage_fraction = replica_count * float(stage.storage_gb) / storage_capacity
                 violation_rate = self.window_stage_deadline_violations.get(stage_key, 0.0) / max(
@@ -2422,7 +2471,7 @@ class HierarchicalPPOAgent:
                     self.slow_count_latency_coef * tail_cost
                     + self.slow_deployment_memory_coef * memory_fraction
                     + self.slow_deployment_storage_coef * storage_fraction
-                    + self.slow_idle_replica_coef * redundant_replica_fraction
+                    + replica_efficiency_cost
                     + self.slow_count_shortage_coef * violation_rate
                 )
                 placement_cost = (
@@ -2508,6 +2557,44 @@ class HierarchicalPPOAgent:
             ),
             "slow_count_redundant_replica_fraction": (
                 float(np.mean(redundant_replica_fractions)) if redundant_replica_fractions else 0.0
+            ),
+            "slow_count_unused_replica_fraction": (
+                float(np.mean(unused_replica_fractions)) if unused_replica_fractions else 0.0
+            ),
+            "slow_count_unused_replica_cost": (
+                self.slow_reward_scale
+                * self.slow_count_unused_replica_coef
+                * (float(np.mean(unused_replica_fractions)) if unused_replica_fractions else 0.0)
+            ),
+            "slow_count_replica_imbalance_fraction": (
+                float(np.mean(replica_imbalance_fractions))
+                if replica_imbalance_fractions
+                else 0.0
+            ),
+            "slow_count_replica_efficiency_cost": (
+                self.slow_reward_scale
+                * (
+                    self.slow_idle_replica_coef
+                    * (
+                        float(np.mean(replica_imbalance_fractions))
+                        if replica_imbalance_fractions
+                        else 0.0
+                    )
+                    + self.slow_count_unused_replica_coef
+                    * (
+                        float(np.mean(unused_replica_fractions))
+                        if unused_replica_fractions
+                        else 0.0
+                    )
+                )
+                if self.slow_count_unused_replica_coef > 0.0
+                else self.slow_reward_scale
+                * self.slow_idle_replica_coef
+                * (
+                    float(np.mean(redundant_replica_fractions))
+                    if redundant_replica_fractions
+                    else 0.0
+                )
             ),
             "slow_placement_node_compute_load": (
                 float(np.mean(placement_node_compute_loads)) if placement_node_compute_loads else 0.0

@@ -28,6 +28,7 @@ from train_dual_ppo import (
     build_episode_metrics_row,
     build_rollout_metrics_row,
     checkpoint_reference_load,
+    fast_counterfactual_credit_coefficient,
     load_assignments_for_update,
     load_adjusted_rolling_latency,
     load_checkpoint,
@@ -440,8 +441,31 @@ def main() -> None:
         factor=float(base_args.get("slow_lr_decay_factor", 0.5)),
         min_delta=float(base_args.get("slow_lr_decay_min_delta", 5e-4)),
         min_lr=float(base_args.get("slow_min_lr", 1e-5)),
+        count_min_lr=float(
+            base_args.get(
+                "slow_count_min_lr",
+                base_args.get("slow_min_lr", 1e-5),
+            )
+        ),
+        placement_min_lr=float(
+            base_args.get(
+                "slow_placement_min_lr",
+                base_args.get("slow_min_lr", 1e-5),
+            )
+        ),
+        kl_floor_fraction=float(base_args.get("slow_lr_kl_floor_fraction", 0.10)),
+        max_reductions=int(base_args.get("slow_lr_max_reductions", 1)),
+        cooldown_updates=int(base_args.get("slow_lr_cooldown_updates", 20)),
         state=resume_internal.get("slow_lr_controller_state"),
     )
+    slow_lr_floor_restored = slow_lr_controller.enforce_minimum_lrs(agent)
+    if slow_lr_floor_restored:
+        print(
+            "[monolithic] restored Slow LR floors "
+            f"count={SlowLearningRateController.optimizer_lr(agent.slow_agent.count_ppo.optimizer):.3g} "
+            f"placement={SlowLearningRateController.optimizer_lr(agent.slow_agent.placement_ppo.optimizer):.3g}",
+            flush=True,
+        )
     run_name = cli.run_name or f"monolithic_ppo_{cli.scenario_family}_{cli.scenario_value:g}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(cli.run_root) / run_name
     checkpoint_dir = run_dir / "checkpoints"
@@ -513,6 +537,10 @@ def main() -> None:
     # The generated trace is then collapsed only for the Monolithic view.
     for local_update in range(1, cli.updates + 1):
         update = resume_update_offset + local_update
+        fast_counterfactual_coef = fast_counterfactual_credit_coefficient(
+            synchronized_args,
+            update - 1,
+        )
         update_started_at = time.monotonic()
         episode_stats_for_update: list[dict[str, float]] = []
         update_episode_manifest: list[dict[str, object]] = []
@@ -592,9 +620,7 @@ def main() -> None:
                         link_imbalance_coef=0.0,
                         idle_deployed_node_coef=0.0,
                         fast_congestion_credit_coef=1.0,
-                        fast_counterfactual_credit_coef=float(
-                            base_args.get("fast_counterfactual_credit_coef", 0.0)
-                        ),
+                        fast_counterfactual_credit_coef=fast_counterfactual_coef,
                         fast_controllable_latency_credit=bool(
                             base_args.get("fast_controllable_latency_credit", False)
                         ),
@@ -716,6 +742,12 @@ def main() -> None:
             ready=checkpoint_ready,
             slow_updated=slow_updated,
             agent=agent,
+            count_approx_kl=slow_metrics.get("count_approx_kl"),
+            placement_approx_kl=slow_metrics.get("placement_approx_kl"),
+            count_target_kl=float(base_args.get("slow_count_target_kl", 0.01)),
+            placement_target_kl=float(
+                base_args.get("slow_placement_target_kl", 0.012)
+            ),
         )
         slow_count_lr = SlowLearningRateController.optimizer_lr(
             agent.slow_agent.count_ppo.optimizer
@@ -744,6 +776,19 @@ def main() -> None:
             "slow_lr_bad_updates": float(slow_lr_controller.bad_updates),
             "slow_lr_reductions": float(slow_lr_controller.reductions),
             "slow_lr_decayed": float(slow_lr_decayed),
+            "slow_count_lr_bad_updates": float(
+                slow_lr_controller.actor_metric("count", "bad_updates")
+            ),
+            "slow_placement_lr_bad_updates": float(
+                slow_lr_controller.actor_metric("placement", "bad_updates")
+            ),
+            "slow_count_lr_reductions": float(
+                slow_lr_controller.actor_metric("count", "reductions")
+            ),
+            "slow_placement_lr_reductions": float(
+                slow_lr_controller.actor_metric("placement", "reductions")
+            ),
+            "fast_counterfactual_credit_coef": fast_counterfactual_coef,
             **{f"fast_{key}": float(value) for key, value in update_metrics.get("fast", {}).items() if isinstance(value, (int, float))},
             **{f"slow_{key}": float(value) for key, value in update_metrics.get("slow", {}).items() if isinstance(value, (int, float))},
         }

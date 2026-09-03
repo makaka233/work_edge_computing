@@ -14,6 +14,10 @@ class EdgeNode:
     memory_gb: float
     storage_gb: float
     compute_gcycles_per_s: float
+    # Optional hardware provenance for reproducible, hardware-grounded MEC
+    # profiles.  Defaults preserve archived synthetic scenarios and callers.
+    hardware_type: str = "synthetic-tier"
+    network_uplink_mb_s: float = float("inf")
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,8 @@ def generate_realistic_scenario(
     num_edge_nodes: int,
     num_service_types: int,
     max_service_stages: int,
+    edge_node_profile: str = "synthetic-tiered",
+    service_workload_profile: str = "legacy-random",
     node_compute_capacity_scale: float = 1.0,
     wired_link_bandwidth_scale: float = 1.0,
     topology_k_nearest: int = 6,
@@ -96,6 +102,14 @@ def generate_realistic_scenario(
         raise ValueError("topology_k_nearest must be in [1, num_edge_nodes).")
     if deadline_scale <= 0.0:
         raise ValueError("deadline_scale must be positive.")
+    if edge_node_profile not in {"synthetic-tiered", "hardware-constrained"}:
+        raise ValueError(
+            "edge_node_profile must be 'synthetic-tiered' or 'hardware-constrained'."
+        )
+    if service_workload_profile not in {"legacy-random", "edge-ai-pipelines"}:
+        raise ValueError(
+            "service_workload_profile must be 'legacy-random' or 'edge-ai-pipelines'."
+        )
 
     city_width_km = 36.0
     city_height_km = 28.0
@@ -120,10 +134,37 @@ def generate_realistic_scenario(
 
     nodes: list[EdgeNode] = []
     for node_id, (x_km, y_km) in enumerate(node_xy):
-        tier = rng.choice([0, 1, 2], p=[0.50, 0.35, 0.15])
-        memory_gb = [64, 128, 256][tier] * rng.uniform(0.85, 1.20)
-        storage_gb = [512, 1024, 2048][tier] * rng.uniform(0.85, 1.25)
-        compute = [96, 192, 384][tier] * rng.uniform(0.80, 1.25) * node_compute_capacity_scale
+        if edge_node_profile == "synthetic-tiered":
+            tier = rng.choice([0, 1, 2], p=[0.50, 0.35, 0.15])
+            memory_gb = [64, 128, 256][tier] * rng.uniform(0.85, 1.20)
+            storage_gb = [512, 1024, 2048][tier] * rng.uniform(0.85, 1.25)
+            compute = [96, 192, 384][tier] * rng.uniform(0.80, 1.25)
+            hardware_type = "synthetic-tier"
+            network_uplink_mb_s = float("inf")
+        else:
+            # Hardware anchors:
+            # - Raspberry Pi 5: 4 x 2.4 GHz CPU, 8 GB deployment;
+            # - Jetson Orin Nano: 6-core Arm CPU, 8 GB, AI acceleration;
+            # - Dell PowerEdge XR4000: Xeon D edge server, 20-core class.
+            #
+            # compute_gcycles_per_s is an effective service-throughput model,
+            # not a claim that CPU GHz, CUDA TOPS, and application throughput
+            # are interchangeable.  A conservative four-way instruction/
+            # accelerator calibration preserves the hardware class ordering
+            # and avoids turning the constrained scenario into saturation.
+            tier = int(rng.choice([0, 1, 2], p=[0.45, 0.40, 0.15]))
+            hardware_type = [
+                "raspberry-pi-5",
+                "jetson-orin-nano",
+                "poweredge-xr4000",
+            ][tier]
+            memory_gb = [8.0, 8.0, 128.0][tier] * rng.uniform(0.95, 1.05)
+            # Pi/Jetson storage represents a provisioned local SSD/NVMe, not
+            # soldered capacity. XR4000 uses a conservative two-drive setup.
+            storage_gb = [128.0, 256.0, 1920.0][tier] * rng.uniform(0.90, 1.10)
+            compute = [38.4, 72.0, 168.0][tier] * rng.uniform(0.90, 1.10)
+            # 1 GbE device edge and a conservative 10 GbE regional uplink.
+            network_uplink_mb_s = [125.0, 125.0, 1250.0][tier]
         nodes.append(
             EdgeNode(
                 node_id=node_id,
@@ -131,7 +172,9 @@ def generate_realistic_scenario(
                 y_km=float(y_km),
                 memory_gb=float(memory_gb),
                 storage_gb=float(storage_gb),
-                compute_gcycles_per_s=float(compute),
+                compute_gcycles_per_s=float(compute * node_compute_capacity_scale),
+                hardware_type=hardware_type,
+                network_uplink_mb_s=float(network_uplink_mb_s),
             )
         )
 
@@ -147,6 +190,7 @@ def generate_realistic_scenario(
         num_service_types=num_service_types,
         max_service_stages=max_service_stages,
         deadline_scale=deadline_scale,
+        service_workload_profile=service_workload_profile,
     )
 
     base_service_popularity = demand_rng.dirichlet(np.linspace(2.2, 0.8, num_service_types))
@@ -184,7 +228,13 @@ def generate_realistic_scenario(
                 raw_bandwidth = rng.uniform(120.0, 650.0)
             else:
                 raw_bandwidth = rng.uniform(750.0, 1800.0)
-            link_bandwidth = raw_bandwidth / (1.0 + 0.06 * distance) * wired_link_bandwidth_scale
+            link_bandwidth = raw_bandwidth / (1.0 + 0.06 * distance)
+            link_bandwidth = min(
+                link_bandwidth,
+                nodes[i].network_uplink_mb_s,
+                nodes[j].network_uplink_mb_s,
+            )
+            link_bandwidth *= wired_link_bandwidth_scale
             link_propagation = 0.35 * distance + rng.uniform(0.2, 1.5)
             bandwidth[i, j] = link_bandwidth
             bandwidth[j, i] = link_bandwidth
@@ -359,9 +409,10 @@ def _generate_services(
     num_service_types: int,
     max_service_stages: int,
     deadline_scale: float = 1.0,
+    service_workload_profile: str = "legacy-random",
 ) -> list[Service]:
     services: list[Service] = []
-    profiles = [
+    legacy_profiles = [
         {
             "name": "speech-recognition",
             "stage_compute": [0.65, 0.95],
@@ -433,17 +484,135 @@ def _generate_services(
             "deadline_s": 0.13,
         },
     ]
+    # The pipeline catalogue is calibrated from representative MLPerf Edge,
+    # Whisper, and DeepStream workloads. Values describe a bounded request or
+    # frame batch, not an entire continuous media stream. Memory includes the
+    # model runtime/working set; storage includes model engines and container
+    # layers. Small random variation represents implementation differences.
+    edge_ai_profiles = [
+        {
+            "name": "speech-recognition",
+            "stage_compute": [0.90, 3.20],
+            "stage_memory": [0.65, 2.40],
+            "stage_storage": [2.0, 5.0],
+            "stage_output": [0.10, 0.012],
+            "input_mb": 0.45,
+            "deadline_s": 0.20,
+        },
+        {
+            "name": "ar-overlay",
+            "stage_compute": [1.60, 5.20, 1.40],
+            "stage_memory": [1.10, 3.60, 1.20],
+            "stage_storage": [3.0, 9.0, 3.0],
+            "stage_output": [0.70, 0.10, 0.025],
+            "input_mb": 1.80,
+            "deadline_s": 0.24,
+        },
+        {
+            "name": "video-object-detection",
+            "stage_compute": [1.80, 6.50, 1.20],
+            "stage_memory": [1.20, 4.20, 1.10],
+            "stage_storage": [4.0, 12.0, 3.0],
+            "stage_output": [0.85, 0.075, 0.018],
+            "input_mb": 2.80,
+            "deadline_s": 0.38,
+        },
+        {
+            "name": "industrial-inspection",
+            "stage_compute": [2.10, 6.20, 1.80],
+            "stage_memory": [1.40, 4.10, 1.30],
+            "stage_storage": [4.0, 14.0, 4.0],
+            "stage_output": [0.65, 0.065, 0.015],
+            "input_mb": 2.40,
+            "deadline_s": 0.34,
+        },
+        {
+            "name": "traffic-perception",
+            "stage_compute": [1.70, 4.70, 1.10],
+            "stage_memory": [1.00, 3.40, 1.00],
+            "stage_storage": [3.0, 10.0, 3.0],
+            "stage_output": [0.55, 0.055, 0.014],
+            "input_mb": 1.70,
+            "deadline_s": 0.30,
+        },
+        {
+            "name": "smart-retail-event",
+            "stage_compute": [1.10, 3.40, 0.80],
+            "stage_memory": [0.80, 2.80, 0.80],
+            "stage_storage": [2.5, 8.0, 2.5],
+            "stage_output": [0.40, 0.045, 0.012],
+            "input_mb": 1.20,
+            "deadline_s": 0.26,
+        },
+        {
+            "name": "robot-control",
+            "stage_compute": [0.65, 1.75, 0.55],
+            "stage_memory": [0.50, 1.60, 0.50],
+            "stage_storage": [1.5, 4.0, 1.5],
+            "stage_output": [0.12, 0.020, 0.008],
+            "input_mb": 0.22,
+            "deadline_s": 0.14,
+        },
+        {
+            "name": "medical-vital-anomaly",
+            "stage_compute": [0.85, 2.70, 0.65],
+            "stage_memory": [0.60, 2.30, 0.60],
+            "stage_storage": [2.0, 6.0, 2.0],
+            "stage_output": [0.16, 0.025, 0.008],
+            "input_mb": 0.35,
+            "deadline_s": 0.18,
+        },
+        {
+            "name": "drone-inspection",
+            "stage_compute": [2.00, 5.80, 1.60],
+            "stage_memory": [1.30, 3.90, 1.20],
+            "stage_storage": [4.0, 12.0, 3.5],
+            "stage_output": [0.75, 0.070, 0.016],
+            "input_mb": 2.60,
+            "deadline_s": 0.36,
+        },
+        {
+            "name": "connected-vehicle-planning",
+            "stage_compute": [1.45, 4.30, 1.25],
+            "stage_memory": [0.95, 3.20, 1.00],
+            "stage_storage": [3.0, 9.0, 3.0],
+            "stage_output": [0.45, 0.050, 0.014],
+            "input_mb": 1.30,
+            "deadline_s": 0.24,
+        },
+    ]
+    if service_workload_profile == "legacy-random":
+        profiles = legacy_profiles
+    elif service_workload_profile == "edge-ai-pipelines":
+        profiles = edge_ai_profiles
+    else:
+        raise ValueError("unknown service_workload_profile")
+
     for service_id in range(num_service_types):
         profile = profiles[service_id % len(profiles)]
         stage_count = min(len(profile["stage_compute"]), max_service_stages)
         stages = []
         for stage_id in range(stage_count):
+            if service_workload_profile == "edge-ai-pipelines":
+                # Include serving-runtime/orchestration memory and retained
+                # TensorRT/model/container versions in addition to bare model
+                # weights. These bounded overheads make the catalogue heavier
+                # than the legacy independent random stage resources.
+                memory_gb = float(
+                    1.15 * profile["stage_memory"][stage_id] * rng.uniform(0.92, 1.08)
+                )
+                storage_gb = float(
+                    1.50 * profile["stage_storage"][stage_id] * rng.uniform(0.90, 1.10)
+                )
+            else:
+                memory_gb = float(rng.uniform(0.5, 4.0))
+                storage_gb = float(rng.uniform(1.5, 12.0))
             stages.append(
                 ServiceStage(
                     service_id=service_id,
                     stage_id=stage_id,
-                    memory_gb=float(rng.uniform(0.5, 4.0)),
-                    storage_gb=float(rng.uniform(1.5, 12.0)),
+                    memory_gb=memory_gb,
+                    storage_gb=storage_gb,
                     compute_gcycles_mean=float(profile["stage_compute"][stage_id] * rng.uniform(0.85, 1.15)),
                     output_mb_mean=float(profile["stage_output"][stage_id] * rng.uniform(0.80, 1.20)),
                 )

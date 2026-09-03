@@ -309,6 +309,7 @@ def test_fast_ppo_reports_full_batch_diagnostics_and_strict_kl_stop():
     metrics = ppo.update()
 
     assert metrics["entropy"] >= 0.0
+    assert 0.0 <= metrics["normalized_entropy"] <= 1.0
     assert metrics["approx_kl"] >= 0.0
     assert 0.0 <= metrics["clip_fraction"] <= 1.0
     assert metrics["advantage_std"] > 0.0
@@ -950,6 +951,7 @@ def test_slow_count_return_uses_dense_latency_and_continuous_replica_credit():
         slow_reward_scale=1.0,
         slow_count_latency_coef=1.0,
         slow_idle_replica_coef=1.0,
+        slow_count_unused_replica_coef=0.5,
         slow_count_shortage_coef=0.0,
         slow_deployment_memory_coef=0.0,
         slow_deployment_storage_coef=0.0,
@@ -967,13 +969,35 @@ def test_slow_count_return_uses_dense_latency_and_continuous_replica_credit():
     balanced_returns, _, balanced_metrics = agent._factorized_stage_returns(env)
     assert np.isclose(balanced_metrics["slow_count_effective_replicas_per_stage"], 4.0)
     assert np.isclose(balanced_metrics["slow_count_redundant_replica_fraction"], 0.0)
+    assert np.isclose(balanced_metrics["slow_count_unused_replica_fraction"], 0.0)
     assert np.isclose(balanced_returns[stage_key], -0.2)
 
     agent.window_stage_node_weights[stage_key] = {0: 100.0}
     concentrated_returns, _, concentrated_metrics = agent._factorized_stage_returns(env)
     assert np.isclose(concentrated_metrics["slow_count_effective_replicas_per_stage"], 1.0)
     assert np.isclose(concentrated_metrics["slow_count_redundant_replica_fraction"], 0.75)
-    assert np.isclose(concentrated_returns[stage_key], -0.95)
+    assert np.isclose(concentrated_metrics["slow_count_unused_replica_fraction"], 0.75)
+    assert np.isclose(concentrated_metrics["slow_count_unused_replica_cost"], 0.375)
+    assert np.isclose(concentrated_metrics["slow_count_replica_imbalance_fraction"], 0.0)
+    assert np.isclose(concentrated_metrics["slow_count_replica_efficiency_cost"], 0.375)
+    assert np.isclose(concentrated_returns[stage_key], -0.575)
+
+    agent.window_stage_node_weights[stage_key] = {0: 75.0, 1: 25.0}
+    imbalanced_returns, _, imbalanced_metrics = agent._factorized_stage_returns(env)
+    assert np.isclose(imbalanced_metrics["slow_count_effective_replicas_per_stage"], 1.6)
+    assert np.isclose(imbalanced_metrics["slow_count_redundant_replica_fraction"], 0.6)
+    assert np.isclose(imbalanced_metrics["slow_count_unused_replica_fraction"], 0.5)
+    assert np.isclose(imbalanced_metrics["slow_count_replica_imbalance_fraction"], 0.1)
+    assert np.isclose(imbalanced_metrics["slow_count_replica_efficiency_cost"], 0.35)
+    assert np.isclose(imbalanced_returns[stage_key], -0.55)
+
+    # Legacy configurations without explicit unused-replica credit retain the
+    # former total-redundancy cost exactly.
+    agent.slow_count_unused_replica_coef = 0.0
+    agent.window_stage_node_weights[stage_key] = {0: 100.0}
+    legacy_returns, _, legacy_metrics = agent._factorized_stage_returns(env)
+    assert np.isclose(legacy_metrics["slow_count_replica_efficiency_cost"], 0.75)
+    assert np.isclose(legacy_returns[stage_key], -0.95)
 
 
 def test_slow_window_return_includes_tail_latency_feedback():

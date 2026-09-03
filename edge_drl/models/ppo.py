@@ -717,6 +717,7 @@ class PPOAgent:
         """Measure the final policy against the complete behavior-policy batch."""
 
         weighted_entropy = 0.0
+        weighted_normalized_entropy = 0.0
         weighted_kl = 0.0
         weighted_clip = 0.0
         total_weight = 0.0
@@ -744,7 +745,18 @@ class PPOAgent:
                 ratios = torch.exp(log_ratios)
                 kl_values = (ratios - 1.0) - log_ratios
                 clip_values = (torch.abs(ratios - 1.0) > self.eps_clip).float()
-                weighted_entropy += float((dist.entropy() * batch_weights).sum().item())
+                entropy_values = dist.entropy()
+                feasible_counts = masks.sum(dim=1).to(dtype=entropy_values.dtype)
+                maximum_entropy = torch.log(feasible_counts.clamp_min(1.0))
+                normalized_entropy_values = torch.where(
+                    feasible_counts > 1.0,
+                    entropy_values / maximum_entropy.clamp_min(1e-8),
+                    torch.zeros_like(entropy_values),
+                ).clamp(0.0, 1.0)
+                weighted_entropy += float((entropy_values * batch_weights).sum().item())
+                weighted_normalized_entropy += float(
+                    (normalized_entropy_values * batch_weights).sum().item()
+                )
                 weighted_kl += float((kl_values * batch_weights).sum().item())
                 weighted_clip += float((clip_values * batch_weights).sum().item())
                 total_weight += float(batch_weights.sum().item())
@@ -759,7 +771,13 @@ class PPOAgent:
                         group_weight = float(batch_weights[group_mask].sum().item())
                         sums = group_sums.setdefault(
                             float(group_id),
-                            {"weight": 0.0, "kl": 0.0, "clip": 0.0, "entropy": 0.0},
+                            {
+                                "weight": 0.0,
+                                "kl": 0.0,
+                                "clip": 0.0,
+                                "entropy": 0.0,
+                                "normalized_entropy": 0.0,
+                            },
                         )
                         sums["weight"] += group_weight
                         sums["kl"] += float(
@@ -769,7 +787,13 @@ class PPOAgent:
                             (clip_values[group_mask] * batch_weights[group_mask]).sum().item()
                         )
                         sums["entropy"] += float(
-                            (dist.entropy()[group_mask] * batch_weights[group_mask]).sum().item()
+                            (entropy_values[group_mask] * batch_weights[group_mask]).sum().item()
+                        )
+                        sums["normalized_entropy"] += float(
+                            (
+                                normalized_entropy_values[group_mask]
+                                * batch_weights[group_mask]
+                            ).sum().item()
                         )
         denominator = max(total_weight, 1e-8)
         self.last_group_diagnostics = {
@@ -777,12 +801,15 @@ class PPOAgent:
                 "approx_kl": sums["kl"] / max(sums["weight"], 1e-8),
                 "clip_fraction": sums["clip"] / max(sums["weight"], 1e-8),
                 "entropy": sums["entropy"] / max(sums["weight"], 1e-8),
+                "normalized_entropy": sums["normalized_entropy"]
+                / max(sums["weight"], 1e-8),
             }
             for group_id, sums in sorted(group_sums.items())
         }
         group_kls = [metrics["approx_kl"] for metrics in self.last_group_diagnostics.values()]
         return {
             "entropy": weighted_entropy / denominator,
+            "normalized_entropy": weighted_normalized_entropy / denominator,
             "approx_kl": weighted_kl / denominator,
             "clip_fraction": weighted_clip / denominator,
             "group_count": float(len(group_kls)),
@@ -799,6 +826,7 @@ class PPOAgent:
                 "policy_loss": 0.0,
                 "value_loss": 0.0,
                 "entropy": 0.0,
+                "normalized_entropy": 0.0,
                 "approx_kl": 0.0,
                 "clip_fraction": 0.0,
                 "advantage_mean": 0.0,

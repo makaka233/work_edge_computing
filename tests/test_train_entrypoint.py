@@ -18,6 +18,7 @@ from train_dual_ppo import (
     demand_seed_for_training_rollout,
     demand_profile_summary,
     effective_replicas_per_stage,
+    fast_counterfactual_credit_coefficient,
     finite_weighted_mean,
     load_assignments_for_update,
     load_multiplier_for_rollout,
@@ -141,6 +142,9 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.fast_entropy_target == 0.7
     assert args.fast_entropy_max_coef == 0.03
     assert args.fast_entropy_adaptation_rate == 0.002
+    assert args.fast_entropy_normalized_control is False
+    assert args.fast_counterfactual_credit_final_coef == 0.5
+    assert args.slow_count_unused_replica_coef == 0.0
     assert args.slow_count_lr == 2e-4
     assert args.slow_placement_entropy_coef == 0.005
     assert args.slow_placement_entropy_final_coef == 0.0035
@@ -225,6 +229,59 @@ def test_mec_pressure_profile_scales_demand_and_fixed_capacity():
     assert args.training_design == "trajectory-simultaneous"
 
 
+def test_realistic_constrained_profile_selects_hardware_nodes_and_compute_pressure():
+    args = Namespace(
+        pressure_profile="mec-realistic-constrained",
+        training_design="legacy-alternating",
+        edge_node_profile="synthetic-tiered",
+        service_workload_profile="legacy-random",
+        active_user_ratio=0.15,
+        active_user_request_rate_per_minute=1.5,
+        traffic_scale=1.0,
+        load_multipliers="1.0",
+        load_sampling_mode="cyclic",
+        load_strata="",
+        load_stratum_probabilities="",
+        task_compute_scale=1.0,
+        task_data_scale=1.0,
+        node_compute_capacity_scale=1.0,
+        wired_link_bandwidth_scale=1.0,
+        service_resource_fraction=0.5,
+        deadline_scale=1.0,
+    )
+
+    apply_pressure_profile(args, argv=["--pressure-profile", "mec-realistic-constrained"])
+
+    assert args.edge_node_profile == "hardware-constrained"
+    assert args.service_workload_profile == "edge-ai-pipelines"
+    assert args.training_design == "trajectory-simultaneous"
+    assert args.node_compute_capacity_scale == 1.0
+    assert args.wired_link_bandwidth_scale == 0.75
+    assert args.service_resource_fraction == 0.60
+    assert args.task_compute_scale == 1.0
+    assert args.task_data_scale == 1.0
+    assert args.load_strata == "0.65:0.80,0.80:1.00,1.00:1.20,1.20:1.45"
+
+
+def test_realistic_constrained_profile_respects_explicit_node_profile_override():
+    args = Namespace(
+        pressure_profile="mec-realistic-constrained",
+        edge_node_profile="synthetic-tiered",
+    )
+
+    apply_pressure_profile(
+        args,
+        argv=[
+            "--pressure-profile",
+            "mec-realistic-constrained",
+            "--edge-node-profile",
+            "synthetic-tiered",
+        ],
+    )
+
+    assert args.edge_node_profile == "synthetic-tiered"
+
+
 def test_trajectory_training_design_builds_complete_multi_window_batches():
     args = Namespace(
         training_design="trajectory-simultaneous",
@@ -234,6 +291,7 @@ def test_trajectory_training_design_builds_complete_multi_window_batches():
         slow_windows_per_update=16,
         fast_warmup_updates=4,
         slow_warmup_updates=4,
+        fast_counterfactual_credit_coef=0.5,
     )
 
     apply_training_design(args, argv=[])
@@ -247,12 +305,38 @@ def test_trajectory_training_design_builds_complete_multi_window_batches():
     assert args.slow_count_lr == 1e-4
     assert args.slow_placement_lr == 7.5e-5
     assert args.slow_k_epochs == 2
-    assert args.fast_entropy_target == 0.45
-    assert args.fast_entropy_max_coef == 0.01
+    assert args.fast_entropy_target == 0.18
+    assert args.fast_entropy_max_coef == 0.02
+    assert args.fast_entropy_normalized_control is True
+    assert args.fast_counterfactual_credit_final_coef == 0.40
+    assert args.fast_counterfactual_credit_hold_updates == 80
+    assert args.fast_counterfactual_credit_decay_updates == 120
+    assert args.slow_count_unused_replica_coef == 0.015
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 80), 0.5)
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 140), 0.45)
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 200), 0.4)
     assert args.slow_placement_entropy_target == 1.10
     assert args.slow_placement_entropy_max_coef == 0.015
     assert args.slow_lr_decay is True
-    assert args.slow_lr_decay_patience == 20
+    assert args.slow_lr_decay_patience == 40
+    assert args.slow_count_min_lr == 5e-5
+    assert args.slow_placement_min_lr == 3.75e-5
+    assert args.slow_lr_max_reductions == 1
+
+
+def test_fast_counterfactual_credit_anneals_after_hold_period():
+    args = Namespace(
+        fast_counterfactual_credit_coef=0.5,
+        fast_counterfactual_credit_final_coef=0.2,
+        fast_counterfactual_credit_hold_updates=40,
+        fast_counterfactual_credit_decay_updates=60,
+    )
+
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 0), 0.5)
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 40), 0.5)
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 70), 0.35)
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 100), 0.2)
+    assert np.isclose(fast_counterfactual_credit_coefficient(args, 200), 0.2)
 
 
 def test_slow_lr_controller_counts_only_completed_slow_updates():
@@ -282,6 +366,79 @@ def test_slow_lr_controller_counts_only_completed_slow_updates():
     assert np.isclose(controller.optimizer_lr(agent.slow_agent.count_ppo.optimizer), 5e-5)
     assert np.isclose(controller.optimizer_lr(agent.slow_agent.placement_ppo.optimizer), 4e-5)
     assert controller.reductions == 1
+
+
+def test_slow_lr_controller_gates_each_actor_by_its_own_kl():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(seed=92, num_users=10_000, num_edge_nodes=8, num_service_types=2)
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=3,
+        slow_count_lr=1e-4,
+        slow_placement_lr=8e-5,
+    )
+    controller = SlowLearningRateController(
+        enabled=True,
+        patience=2,
+        factor=0.5,
+        min_delta=1e-3,
+        min_lr=1e-5,
+        count_min_lr=5e-5,
+        placement_min_lr=4e-5,
+        kl_floor_fraction=0.1,
+        max_reductions=1,
+    )
+    observations = dict(
+        ready=True,
+        slow_updated=True,
+        agent=agent,
+        count_approx_kl=1e-6,
+        placement_approx_kl=0.005,
+        count_target_kl=0.01,
+        placement_target_kl=0.01,
+    )
+
+    assert controller.observe(0.20, **observations) is False
+    assert controller.observe(0.21, **observations) is False
+    assert controller.observe(0.22, **observations) is True
+
+    assert np.isclose(controller.optimizer_lr(agent.slow_agent.count_ppo.optimizer), 1e-4)
+    assert np.isclose(controller.optimizer_lr(agent.slow_agent.placement_ppo.optimizer), 4e-5)
+    assert controller.actor_metric("count", "reductions") == 0
+    assert controller.actor_metric("placement", "reductions") == 1
+    assert controller.actor_metric("count", "low_kl_blocks") == 2
+
+
+def test_slow_lr_controller_restores_floors_from_older_checkpoint_optimizer():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(seed=93, num_users=10_000, num_edge_nodes=8, num_service_types=2)
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=3,
+        slow_count_lr=2e-5,
+        slow_placement_lr=1e-5,
+    )
+    controller = SlowLearningRateController(
+        enabled=True,
+        patience=40,
+        factor=0.7,
+        min_delta=1e-3,
+        min_lr=1e-5,
+        count_min_lr=5e-5,
+        placement_min_lr=3.75e-5,
+    )
+
+    assert controller.enforce_minimum_lrs(agent) is True
+    assert np.isclose(controller.optimizer_lr(agent.slow_agent.count_ppo.optimizer), 5e-5)
+    assert np.isclose(
+        controller.optimizer_lr(agent.slow_agent.placement_ppo.optimizer),
+        3.75e-5,
+    )
+    assert controller.enforce_minimum_lrs(agent) is False
 
 
 def test_explicit_episode_horizon_survives_training_design_expansion():
@@ -627,6 +784,9 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "slow_count_lr" in rows[0]
     assert "slow_placement_lr" in rows[0]
     assert "slow_lr_reductions" in rows[0]
+    assert "slow_count_replica_imbalance_fraction" in rows[0]
+    assert "slow_count_replica_efficiency_cost" in rows[0]
+    assert "fast_counterfactual_credit_coef" in rows[0]
 
     with (log_dir / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
         episode_rows = list(csv.DictReader(handle))
@@ -650,6 +810,9 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "total_reward" in rollout_rows[0]
     assert "avg_latency_s" in rollout_rows[0]
     assert "p95_latency_s" in rollout_rows[0]
+    assert "slow_count_replica_imbalance_fraction" in rollout_rows[0]
+    assert "slow_count_replica_efficiency_cost" in rollout_rows[0]
+    assert "fast_counterfactual_credit_coef" in rollout_rows[0]
 
 
 def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):
