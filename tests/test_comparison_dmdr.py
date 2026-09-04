@@ -6,6 +6,7 @@ from edge_drl.comparison.dmdr import (
     adaptive_scaled_probabilities,
     algorithm1_rounding,
     build_virtual_core_model,
+    project_resource_feasible_deployment,
 )
 from tests.comparison_helpers import tiny_replay_env
 
@@ -66,3 +67,61 @@ def test_dmdr_sampler_empirical_frequency_tracks_probability() -> None:
     schedules = scheme.schedule_batch(env, repeated)
     first_stage_nodes = np.asarray([schedule[0] for schedule in schedules])
     assert np.mean(first_stage_nodes == 1) == pytest.approx(0.75, abs=0.02)
+
+
+def test_resource_projection_removes_overcommit_without_adding_native_support() -> None:
+    env = tiny_replay_env()
+    env.reset()
+    stage_keys = [
+        (service.service_id, stage.stage_id)
+        for service in env.scenario.services
+        for stage in service.stages
+    ]
+    native = np.ones((len(stage_keys), env.config.num_edge_nodes), dtype=np.int64)
+    weights = np.full_like(native, 1.0 / env.config.num_edge_nodes, dtype=np.float64)
+    env.config.service_resource_fraction = 0.04
+
+    deployment, projected, diagnostics = project_resource_feasible_deployment(
+        env, stage_keys, native, native.astype(np.float64), weights, weights
+    )
+
+    feasible, reason = env.check_deployment_feasible(deployment)
+    assert feasible, reason
+    assert diagnostics["resource_projection_repaired"] is True
+    assert diagnostics["resource_projection_removed_pairs"] > 0
+    assert np.all(projected <= native)
+    assert np.all(projected.sum(axis=1) >= 1)
+
+
+def test_resource_projection_can_restore_relaxed_support_after_rounding() -> None:
+    env = tiny_replay_env()
+    env.reset()
+    stage_keys = [
+        (service.service_id, stage.stage_id)
+        for service in env.scenario.services
+        for stage in service.stages
+    ]
+    stage_count = len(stage_keys)
+    node_count = env.config.num_edge_nodes
+    native = np.zeros((stage_count, node_count), dtype=np.int64)
+    native[:, 0] = 1
+    relaxed = np.full((stage_count, node_count), 0.1, dtype=np.float64)
+    probabilities = np.full((stage_count, node_count), 1.0 / node_count, dtype=np.float64)
+    native_routing = np.zeros_like(probabilities)
+    native_routing[:, 0] = 1.0
+    env.config.service_resource_fraction = 0.04
+
+    deployment, projected, diagnostics = project_resource_feasible_deployment(
+        env,
+        stage_keys,
+        native,
+        relaxed,
+        probabilities,
+        native_routing,
+    )
+
+    feasible, reason = env.check_deployment_feasible(deployment)
+    assert feasible, reason
+    assert diagnostics["resource_projection_used_relaxed_fallback"] is True
+    assert diagnostics["resource_projection_restored_pairs"] > 0
+    assert np.all(projected.sum(axis=1) >= 1)

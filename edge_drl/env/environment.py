@@ -158,6 +158,7 @@ class EdgeEnvConfig:
     service_resource_fraction: float = 0.5
     request_aggregation_window_seconds: float = 1.0
     load_ewma_tau_minutes: float = 1.0
+    sampled_load_update_mode: str = "legacy-repeat"
     wireless_uplink_mbps: float = 150.0
     radio_rtt_ms: float = 10.0
     load_penalty_weight: float = 0.08
@@ -217,6 +218,10 @@ class EdgeEnvConfig:
             raise ValueError("request_aggregation_window_seconds must be exactly 1.0 so one env.step equals one second.")
         if self.load_ewma_tau_minutes <= 0:
             raise ValueError("load_ewma_tau_minutes must be positive.")
+        if self.sampled_load_update_mode not in {"legacy-repeat", "interval-average"}:
+            raise ValueError(
+                "sampled_load_update_mode must be 'legacy-repeat' or 'interval-average'."
+            )
         if self.wireless_uplink_mbps <= 0:
             raise ValueError("wireless_uplink_mbps must be positive.")
         if self.radio_rtt_ms < 0:
@@ -857,9 +862,44 @@ class EdgeComputingEnv:
     ) -> None:
         elapsed_minutes = represented_seconds / 60.0
         decay = float(np.exp(-elapsed_minutes / self.config.load_ewma_tau_minutes))
+        self.last_load_update_minute = self.current_time_minute + elapsed_minutes
+        if self.config.sampled_load_update_mode == "interval-average":
+            node_utilization = np.zeros_like(self.node_compute_load)
+            link_utilization = np.zeros_like(self.link_load)
+            for info, request in zip(group_infos, requests):
+                request_count = float(request.request_count)
+                for demand in info["compute_demands"]:
+                    node_capacity = (
+                        self.scenario.nodes[demand.node_id].compute_gcycles_per_s
+                        if self.scenario
+                        else 1.0
+                    )
+                    node_utilization[demand.node_id] += (
+                        demand.compute_gcycles * request_count / max(node_capacity, 1e-9)
+                    )
+                for demand in info["link_demands"]:
+                    if self.scenario is None or not self.scenario.adjacency[
+                        demand.src_node,
+                        demand.dst_node,
+                    ]:
+                        continue
+                    capacity = self.scenario.bandwidth_mb_s[demand.src_node, demand.dst_node]
+                    link_utilization[demand.src_node, demand.dst_node] += (
+                        demand.data_mb * request_count / max(capacity, 1e-9)
+                    )
+            self.node_compute_load = (
+                decay * self.node_compute_load
+                + (1.0 - decay) * np.clip(node_utilization, 0.0, 1.0)
+            )
+            finite_links = np.isfinite(self.link_load)
+            self.link_load[finite_links] = (
+                decay * self.link_load[finite_links]
+                + (1.0 - decay) * np.clip(link_utilization[finite_links], 0.0, 1.0)
+            )
+            return
+
         self.node_compute_load *= decay
         self.link_load *= decay
-        self.last_load_update_minute = self.current_time_minute + elapsed_minutes
         ewma_window_s = self.config.load_ewma_tau_minutes * 60.0
         one_second_decay = float(np.exp(-1.0 / ewma_window_s))
         repeat_factor = (1.0 - decay) / max(1.0 - one_second_decay, 1e-12)

@@ -5,6 +5,7 @@ from edge_drl.agents.drl import (
     HierarchicalPPOAgent,
     _discounted_window_returns,
     fast_obs_dim,
+    slow_incremental_obs_dim,
     slow_obs_dim,
 )
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
@@ -22,6 +23,88 @@ def test_observation_dimensions():
     assert slow_obs_dim(16, 3) == 17 + 16 * (6 + 3) + 16 * 16 * 4
     assert fast_obs_dim(16) == 12 + 16 * 9 + 16 * 16 * 3
     assert fast_obs_dim(16, chain_context="chain-v2") == 16 + 16 * 13 + 16 * 16 * 3
+    assert slow_incremental_obs_dim(16, 3, 3) == slow_obs_dim(16, 3) + 9 * 10
+
+
+def test_global_incremental_slow_establishes_coverage_before_stop():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=103,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=10,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="global-incremental",
+    )
+    slow = agent.slow_agent
+    stop_action = slow.num_service_types * slow.max_service_stages
+
+    slow.count_ppo.act = lambda state, mask, deterministic=False: (stop_action, 0.0, 0.0)
+    slow.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    deployment = slow.plan_deployment(env, deterministic=False, record=True)
+
+    for service in env.scenario.services:
+        for stage in service.stages:
+            assert deployment[service.service_id, stage.stage_id].sum() == 1
+    feasible, reason = env.check_deployment_feasible(deployment)
+    assert feasible, reason
+    assert slow.count_ppo.buffer.actions == [stop_action]
+    assert slow.pending_count_stage_keys == [(-1, -1)]
+    assert slow.pending_count_node_ids == [None]
+    assert slow.count_ppo.buffer.states[0].shape == (
+        slow_incremental_obs_dim(16, 3, 3),
+    )
+
+
+def test_global_incremental_slow_adds_one_replica_to_selected_stage():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=104,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=10,
+            mean_requests_per_minute=600.0,
+        )
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="global-incremental",
+    )
+    slow = agent.slow_agent
+    selected_action = 0
+    stop_action = slow.num_service_types * slow.max_service_stages
+    actions = iter([selected_action, stop_action])
+
+    slow.count_ppo.act = lambda state, mask, deterministic=False: (next(actions), 0.0, 0.0)
+    slow.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    deployment = slow.plan_deployment(env, deterministic=False, record=True)
+
+    assert deployment[0, 0].sum() == 2
+    for service in env.scenario.services:
+        for stage in service.stages:
+            if (service.service_id, stage.stage_id) != (0, 0):
+                assert deployment[service.service_id, stage.stage_id].sum() == 1
+    assert slow.pending_count_stage_keys == [(0, 0), (-1, -1)]
+    assert slow.pending_count_node_ids[0] is not None
+    assert slow.pending_count_node_ids[1] is None
 
 
 def test_fast_chain_v2_state_and_bounded_oracle_are_valid():
@@ -59,6 +142,11 @@ def test_fast_chain_v2_state_and_bounded_oracle_are_valid():
         deliberately_bad.append(int(selected))
         partial.append(int(selected))
     regrets = agent.fast_agent.stage_counterfactual_regrets(env, request, deliberately_bad)
+    marginal_values = agent.fast_agent.stage_selected_node_marginal_values(
+        env,
+        request,
+        deliberately_bad,
+    )
     oracle = agent.fast_agent.chain_oracle_schedule(
         env,
         request,
@@ -69,6 +157,8 @@ def test_fast_chain_v2_state_and_bounded_oracle_are_valid():
     assert len(regrets) == len(request.stage_compute_gcycles)
     assert all(regret >= 0.0 for regret in regrets)
     assert any(regret > 0.0 for regret in regrets)
+    assert len(marginal_values) == len(request.stage_compute_gcycles)
+    assert any(value < 0.0 for value in marginal_values)
     assert env.evaluate_schedule(request, oracle)["valid"]
 
 
@@ -1076,6 +1166,7 @@ def test_slow_reward_tracks_cross_stage_colocation():
 
     assert np.isclose(agent.last_slow_window_metrics["slow_cross_stage_transition_rate"], 0.5)
     assert np.isclose(agent.last_slow_window_metrics["slow_colocation_rate"], 0.5)
+    assert np.isclose(agent.last_slow_window_metrics["slow_colocation_credit_coef"], 0.05)
     assert np.isclose(agent.last_slow_window_metrics["slow_colocation_cost"], 0.025)
     assert np.isclose(agent.slow_agent.window_returns[0], -0.1 - 0.025)
 

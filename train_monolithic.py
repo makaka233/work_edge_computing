@@ -203,6 +203,49 @@ def _synchronized_training_args(
     return argparse.Namespace(**values)
 
 
+def _monolithic_rollout_args(
+    base_args: dict[str, object],
+    *,
+    sampled_seconds_per_window: int,
+    fast_counterfactual_credit_coef: float,
+) -> argparse.Namespace:
+    """Build rollout controls shared with the source Proposed experiment.
+
+    Monolithic differs from Proposed only through stage collapse. Reward-side
+    controls introduced after this trainer was first written must therefore be
+    forwarded explicitly instead of silently falling back to rollout defaults.
+    """
+
+    slow_counterfactual_coef = base_args.get("slow_counterfactual_credit_coef", 0.0)
+    return argparse.Namespace(
+        reward_mode="latency",
+        compute_hotspot_threshold=0.60,
+        link_hotspot_threshold=0.60,
+        resource_active_load_threshold=0.01,
+        compute_hotspot_coef=0.0,
+        link_hotspot_coef=0.0,
+        compute_imbalance_coef=0.0,
+        link_imbalance_coef=0.0,
+        idle_deployed_node_coef=0.0,
+        fast_congestion_credit_coef=1.0,
+        fast_counterfactual_credit_coef=float(fast_counterfactual_credit_coef),
+        slow_counterfactual_credit_coef=float(
+            0.0 if slow_counterfactual_coef is None else slow_counterfactual_coef
+        ),
+        fast_controllable_latency_credit=bool(
+            base_args.get("fast_controllable_latency_credit", False)
+        ),
+        # Oracle search is a Proposed diagnostic, not a training reward term.
+        # Keep it disabled here so Monolithic pays no avoidable rollout cost.
+        fast_oracle_diagnostic_requests=0,
+        fast_oracle_beam_width=int(base_args.get("fast_oracle_beam_width", 32)),
+        fast_oracle_candidates_per_stage=int(
+            base_args.get("fast_oracle_candidates_per_stage", 8)
+        ),
+        sampled_seconds_per_window=int(sampled_seconds_per_window),
+    )
+
+
 def _arrival_rate_trace_schedule(
     config,
     load_multipliers: list[float] | tuple[float, ...],
@@ -529,6 +572,7 @@ def main() -> None:
         f"episodes_per_update={cli.episodes_per_update} episode_minutes={effective_episode_minutes} "
         f"windows_per_episode={total_windows_per_episode} "
         f"sampled_seconds_per_window={effective_sampled_seconds}/{window_seconds} "
+        f"slow_counterfactual_credit={float(base_args.get('slow_counterfactual_credit_coef', 0.0) or 0.0):g} "
         f"run_episodes={run_episodes} device={cli.device}",
         flush=True,
     )
@@ -609,32 +653,10 @@ def main() -> None:
                     env,
                     agent,
                     max_requests=0,
-                    args=argparse.Namespace(
-                        reward_mode="latency",
-                        compute_hotspot_threshold=0.60,
-                        link_hotspot_threshold=0.60,
-                        resource_active_load_threshold=0.01,
-                        compute_hotspot_coef=0.0,
-                        link_hotspot_coef=0.0,
-                        compute_imbalance_coef=0.0,
-                        link_imbalance_coef=0.0,
-                        idle_deployed_node_coef=0.0,
-                        fast_congestion_credit_coef=1.0,
-                        fast_counterfactual_credit_coef=fast_counterfactual_coef,
-                        fast_controllable_latency_credit=bool(
-                            base_args.get("fast_controllable_latency_credit", False)
-                        ),
-                        # Oracle search is a Proposed diagnostic, not a training
-                        # reward term. Keep it disabled here so Monolithic pays
-                        # no avoidable rollout-time overhead.
-                        fast_oracle_diagnostic_requests=0,
-                        fast_oracle_beam_width=int(
-                            base_args.get("fast_oracle_beam_width", 32)
-                        ),
-                        fast_oracle_candidates_per_stage=int(
-                            base_args.get("fast_oracle_candidates_per_stage", 8)
-                        ),
+                    args=_monolithic_rollout_args(
+                        base_args,
                         sampled_seconds_per_window=effective_sampled_seconds,
+                        fast_counterfactual_credit_coef=fast_counterfactual_coef,
                     ),
                     reward_scale=float(base_args.get("reward_scale", 1.0)),
                     train_mode="joint",

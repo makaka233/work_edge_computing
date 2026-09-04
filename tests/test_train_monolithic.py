@@ -6,6 +6,7 @@ import pytest
 
 from train_monolithic import (
     _format_duration,
+    _monolithic_rollout_args,
     _resume_offsets,
     _synchronized_training_args,
     build_parser,
@@ -46,6 +47,35 @@ def test_monolithic_inherits_proposed_stability_and_sampling_settings() -> None:
     assert synchronized.slow_lr_decay is True
     assert synchronized.slow_lr_decay_patience == 20
     assert synchronized.load_multipliers == "0.8,1.0,1.2,1.4"
+
+
+def test_monolithic_rollout_inherits_slow_counterfactual_credit() -> None:
+    args = _monolithic_rollout_args(
+        {
+            "slow_counterfactual_credit_coef": 1.0,
+            "fast_controllable_latency_credit": True,
+            "fast_oracle_beam_width": 16,
+            "fast_oracle_candidates_per_stage": 4,
+        },
+        sampled_seconds_per_window=6,
+        fast_counterfactual_credit_coef=0.45,
+    )
+
+    assert args.slow_counterfactual_credit_coef == 1.0
+    assert args.fast_counterfactual_credit_coef == 0.45
+    assert args.fast_controllable_latency_credit is True
+    assert args.sampled_seconds_per_window == 6
+    assert args.fast_oracle_diagnostic_requests == 0
+
+
+def test_monolithic_rollout_defaults_missing_slow_credit_to_zero() -> None:
+    args = _monolithic_rollout_args(
+        {},
+        sampled_seconds_per_window=3,
+        fast_counterfactual_credit_coef=0.5,
+    )
+
+    assert args.slow_counterfactual_credit_coef == 0.0
 
 
 def test_monolithic_resume_offsets_require_an_update_boundary() -> None:

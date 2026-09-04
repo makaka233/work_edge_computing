@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import time
 
 import numpy as np
@@ -21,12 +22,22 @@ class SICPScheme(BaseComparisonScheme):
         self.solver_time_limit_s = float(solver_time_limit_s)
         self.workers = int(workers)
         self.chains: dict[int, tuple[int, ...]] = {}
+        self._cached_plan: tuple[
+            np.ndarray, dict[int, tuple[int, ...]], float, str
+        ] | None = None
 
     def maybe_plan(self, env: EdgeComputingEnv) -> None:
         if not env.needs_deployment_update:
             return
         started = time.perf_counter()
-        deployment, chains, objective, status = self._solve_cp_sat(env)
+        cache_hit = self._cached_plan is not None
+        if self._cached_plan is None:
+            deployment, chains, objective, status = self._solve_cp_sat(env)
+            self._cached_plan = (deployment.copy(), deepcopy(chains), objective, status)
+        else:
+            cached_deployment, cached_chains, objective, status = self._cached_plan
+            deployment = cached_deployment.copy()
+            chains = deepcopy(cached_chains)
         env.apply_deployment(deployment)
         self.chains = chains
         self.diagnostics.planning.append(
@@ -36,6 +47,7 @@ class SICPScheme(BaseComparisonScheme):
                 "solver_status": status,
                 "planning_time_s": time.perf_counter() - started,
                 "replicas": int(deployment.sum()),
+                "plan_cache_hit": cache_hit,
             }
         )
 

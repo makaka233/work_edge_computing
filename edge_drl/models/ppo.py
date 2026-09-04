@@ -393,7 +393,7 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
 
 
 class GraphAttentionActorCritic(nn.Module):
-    """Graph actor-critic for either node placement or ordered count actions.
+    """Graph actor-critic for node, ordered-count, or stage-budget actions.
 
     Slow deployment has two action heads: placement scores every node, while
     replica count is represented by a discretized Gaussian over the ordered
@@ -411,22 +411,28 @@ class GraphAttentionActorCritic(nn.Module):
         num_nodes: int,
         action_dim: int,
         action_mode: str,
+        stage_feature_dim: int | None = None,
         hidden_dim: int = 128,
         detach_critic_backbone: bool = False,
     ):
         super().__init__()
-        if action_mode not in {"node", "count"}:
-            raise ValueError("action_mode must be 'node' or 'count'")
+        if action_mode not in {"node", "count", "stage"}:
+            raise ValueError("action_mode must be 'node', 'count', or 'stage'")
+        if action_mode == "stage" and (stage_feature_dim is None or stage_feature_dim < 1):
+            raise ValueError("stage action mode requires a positive stage_feature_dim")
         self.global_dim = global_dim
         self.node_feature_dim = node_feature_dim
         self.edge_feature_dim = edge_feature_dim
         self.num_nodes = num_nodes
         self.action_dim = action_dim
         self.action_mode = action_mode
+        self.stage_feature_dim = int(stage_feature_dim or 0)
+        self.stage_action_count = action_dim - 1 if action_mode == "stage" else 0
         self.detach_critic_backbone = detach_critic_backbone
         self.count_min_scale = max(float(action_dim) / 12.0, 1.0)
         self.node_offset = global_dim
-        self.edge_offset = global_dim + num_nodes * node_feature_dim
+        self.stage_offset = global_dim + num_nodes * node_feature_dim
+        self.edge_offset = self.stage_offset + self.stage_action_count * self.stage_feature_dim
 
         self.global_encoder = nn.Sequential(
             nn.Linear(global_dim, hidden_dim),
@@ -454,7 +460,7 @@ class GraphAttentionActorCritic(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, 1),
             )
-        else:
+        elif action_mode == "count":
             self.actor = nn.Sequential(
                 nn.Linear(hidden_dim * 2, hidden_dim),
                 nn.ReLU(),
@@ -469,6 +475,26 @@ class GraphAttentionActorCritic(nn.Module):
                 # range.  The previous action_dim / 3 scale kept 32-count
                 # policies close to uniform and diluted the ordinal signal.
                 self.actor[-1].bias[1] = math.log(max(float(action_dim) / 6.0, 1.0))
+        else:
+            self.stage_encoder = nn.Sequential(
+                nn.Linear(self.stage_feature_dim, hidden_dim),
+                nn.ReLU(),
+            )
+            self.actor = nn.Sequential(
+                nn.Linear(hidden_dim * 3, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.stop_actor = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            # Coverage is established before this policy runs.  Start with a
+            # conservative preference for adding replicas so an untrained STOP
+            # logit does not terminate a deployment after one replica/stage.
+            with torch.no_grad():
+                self.stop_actor[-1].bias.fill_(-2.5)
         self.critic = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
@@ -477,7 +503,7 @@ class GraphAttentionActorCritic(nn.Module):
 
     def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[Categorical, torch.Tensor]:
         global_features = states[:, : self.global_dim]
-        node_features = states[:, self.node_offset : self.edge_offset].reshape(
+        node_features = states[:, self.node_offset : self.stage_offset].reshape(
             -1,
             self.num_nodes,
             self.node_feature_dim,
@@ -500,7 +526,7 @@ class GraphAttentionActorCritic(nn.Module):
                 [global_emb.unsqueeze(1).expand(-1, self.num_nodes, -1), graph_emb],
                 dim=-1,
             )).squeeze(-1)
-        else:
+        elif self.action_mode == "count":
             count_parameters = self.actor(graph_context)
             center = torch.sigmoid(count_parameters[:, 0]) * max(float(self.action_dim - 1), 0.0)
             log_scale = torch.clamp(
@@ -515,6 +541,20 @@ class GraphAttentionActorCritic(nn.Module):
                 device=graph_context.device,
             ).unsqueeze(0)
             logits = -0.5 * torch.square((count_indices - center.unsqueeze(1)) / scale.unsqueeze(1))
+        else:
+            stage_features = states[:, self.stage_offset : self.edge_offset].reshape(
+                -1,
+                self.stage_action_count,
+                self.stage_feature_dim,
+            )
+            stage_emb = self.stage_encoder(stage_features)
+            expanded_global = global_emb.unsqueeze(1).expand(-1, self.stage_action_count, -1)
+            expanded_graph = pooled_nodes.unsqueeze(1).expand(-1, self.stage_action_count, -1)
+            stage_logits = self.actor(
+                torch.cat([expanded_global, expanded_graph, stage_emb], dim=-1)
+            ).squeeze(-1)
+            stop_logit = self.stop_actor(graph_context)
+            logits = torch.cat([stage_logits, stop_logit], dim=-1)
 
         safe_masks = masks.bool()
         fallback = torch.zeros_like(safe_masks)
@@ -560,6 +600,7 @@ class PPOAgent:
         global_dim: int | None = None,
         node_feature_dim: int | None = None,
         edge_feature_dim: int | None = None,
+        stage_feature_dim: int | None = None,
         num_nodes: int | None = None,
         detach_critic_backbone: bool = False,
         group_balanced_updates: bool = False,
@@ -611,7 +652,7 @@ class PPOAgent:
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
             ).to(self.device)
-        elif policy_kind in {"slow_gat_node", "slow_gat_count"}:
+        elif policy_kind in {"slow_gat_node", "slow_gat_count", "slow_gat_stage"}:
             if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:
                 raise ValueError(f"{policy_kind} requires global_dim, node_feature_dim, edge_feature_dim, and num_nodes")
             self.policy = GraphAttentionActorCritic(
@@ -620,7 +661,14 @@ class PPOAgent:
                 edge_feature_dim=edge_feature_dim,
                 num_nodes=num_nodes,
                 action_dim=action_dim,
-                action_mode="node" if policy_kind == "slow_gat_node" else "count",
+                action_mode=(
+                    "node"
+                    if policy_kind == "slow_gat_node"
+                    else "stage"
+                    if policy_kind == "slow_gat_stage"
+                    else "count"
+                ),
+                stage_feature_dim=stage_feature_dim,
                 hidden_dim=hidden_dim,
                 detach_critic_backbone=detach_critic_backbone,
             ).to(self.device)

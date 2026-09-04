@@ -19,5 +19,9 @@ def test_sicp_has_one_replica_per_stage_and_fixed_window_chain() -> None:
     env.current_time_minute = 5.0
     scheme.maybe_plan(env)
     assert scheme.chains == before
+    env.current_time_minute = 10.0
+    env.next_deployment_update_minute = 10.0
+    scheme.maybe_plan(env)
+    assert scheme.diagnostics.planning[-1]["plan_cache_hit"] is True
     feasible, reason = env.check_deployment_feasible(env.deployment)
     assert feasible, reason

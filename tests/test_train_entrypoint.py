@@ -23,6 +23,7 @@ from train_dual_ppo import (
     load_assignments_for_update,
     load_multiplier_for_rollout,
     load_adjusted_rolling_latency,
+    slow_colocation_credit_coefficient,
     SlowLearningRateController,
     parse_args,
     load_checkpoint,
@@ -131,6 +132,60 @@ def test_checkpoint_atomically_restores_episode_replay_and_resume_metadata(tmp_p
     assert np.allclose(restored.slow_agent.window_states[0], 0.0)
 
 
+def test_global_incremental_checkpoint_restores_matching_architecture(tmp_path):
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=78,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=60,
+        )
+    )
+    env.reset()
+    source = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="global-incremental",
+        slow_counterfactual_credit_coef=1.0,
+    )
+    with torch.no_grad():
+        first_parameter = next(source.slow_agent.count_ppo.policy.parameters())
+        first_parameter.fill_(0.123)
+    checkpoint_path = tmp_path / "incremental.pt"
+
+    save_checkpoint(source, checkpoint_path, {"update": 3})
+    restored = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="global-incremental",
+        slow_counterfactual_credit_coef=1.0,
+    )
+    metadata = load_checkpoint(restored, checkpoint_path)
+
+    assert metadata == {"update": 3}
+    restored_parameter = next(restored.slow_agent.count_ppo.policy.parameters())
+    assert torch.allclose(restored_parameter, torch.full_like(restored_parameter, 0.123))
+
+
+def test_checkpoint_rejects_mismatched_slow_allocation_architecture(tmp_path):
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(seed=79, num_users=10_000, num_edge_nodes=16, num_service_types=3)
+    )
+    env.reset()
+    legacy = HierarchicalPPOAgent.from_env(env, replicas_per_stage=4)
+    checkpoint_path = tmp_path / "legacy.pt"
+    save_checkpoint(legacy, checkpoint_path, {})
+    incremental = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="global-incremental",
+    )
+
+    with pytest.raises(ValueError, match="same --slow-allocation-mode"):
+        load_checkpoint(incremental, checkpoint_path)
+
+
 def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["train_dual_ppo.py"])
     args = parse_args()
@@ -144,6 +199,9 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.fast_entropy_adaptation_rate == 0.002
     assert args.fast_entropy_normalized_control is False
     assert args.fast_counterfactual_credit_final_coef == 0.5
+    assert args.slow_colocation_final_coef is None
+    assert args.slow_colocation_hold_updates == 0
+    assert args.slow_colocation_decay_updates == 1
     assert args.slow_count_unused_replica_coef == 0.0
     assert args.slow_count_lr == 2e-4
     assert args.slow_placement_entropy_coef == 0.005
@@ -176,7 +234,11 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.best_checkpoint_window == 10
     assert args.checkpoint_interval == 20
     assert args.slow_lr_decay is False
+    assert args.slow_lr_low_entropy_override is False
     assert args.slow_lr_decay_patience == 10
+    assert args.slow_allocation_mode == "legacy-factorized"
+    assert args.slow_counterfactual_credit_coef == 0.0
+    assert args.sampled_load_update_mode == "legacy-repeat"
 
 
 def test_checkpoint_score_uses_rolling_load_adjusted_latency():
@@ -316,7 +378,12 @@ def test_trajectory_training_design_builds_complete_multi_window_batches():
     assert np.isclose(fast_counterfactual_credit_coefficient(args, 140), 0.45)
     assert np.isclose(fast_counterfactual_credit_coefficient(args, 200), 0.4)
     assert args.slow_placement_entropy_target == 1.10
-    assert args.slow_placement_entropy_max_coef == 0.015
+    assert args.slow_placement_entropy_max_coef == 0.030
+    assert args.slow_placement_entropy_adaptation_rate == 0.004
+    assert args.slow_colocation_final_coef == 0.0
+    assert args.slow_colocation_hold_updates == 64
+    assert args.slow_colocation_decay_updates == 96
+    assert args.slow_lr_low_entropy_override is True
     assert args.slow_lr_decay is True
     assert args.slow_lr_decay_patience == 40
     assert args.slow_count_min_lr == 5e-5
@@ -337,6 +404,24 @@ def test_fast_counterfactual_credit_anneals_after_hold_period():
     assert np.isclose(fast_counterfactual_credit_coefficient(args, 70), 0.35)
     assert np.isclose(fast_counterfactual_credit_coefficient(args, 100), 0.2)
     assert np.isclose(fast_counterfactual_credit_coefficient(args, 200), 0.2)
+
+
+def test_slow_colocation_credit_is_early_guidance_only_when_configured():
+    args = Namespace(
+        slow_colocation_coef=0.05,
+        slow_colocation_final_coef=0.0,
+        slow_colocation_hold_updates=64,
+        slow_colocation_decay_updates=96,
+    )
+
+    assert np.isclose(slow_colocation_credit_coefficient(args, 0), 0.05)
+    assert np.isclose(slow_colocation_credit_coefficient(args, 64), 0.05)
+    assert np.isclose(slow_colocation_credit_coefficient(args, 112), 0.025)
+    assert np.isclose(slow_colocation_credit_coefficient(args, 160), 0.0)
+    assert np.isclose(slow_colocation_credit_coefficient(args, 300), 0.0)
+
+    args.slow_colocation_final_coef = None
+    assert np.isclose(slow_colocation_credit_coefficient(args, 300), 0.05)
 
 
 def test_slow_lr_controller_counts_only_completed_slow_updates():
@@ -409,6 +494,52 @@ def test_slow_lr_controller_gates_each_actor_by_its_own_kl():
     assert controller.actor_metric("count", "reductions") == 0
     assert controller.actor_metric("placement", "reductions") == 1
     assert controller.actor_metric("count", "low_kl_blocks") == 2
+
+
+def test_slow_lr_controller_allows_low_entropy_placement_stability_override():
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(seed=921, num_users=10_000, num_edge_nodes=8, num_service_types=2)
+    )
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=3,
+        slow_count_lr=1e-4,
+        slow_placement_lr=8e-5,
+    )
+    controller = SlowLearningRateController(
+        enabled=True,
+        patience=2,
+        factor=0.5,
+        min_delta=1e-3,
+        min_lr=1e-5,
+        count_min_lr=5e-5,
+        placement_min_lr=4e-5,
+        kl_floor_fraction=0.1,
+        max_reductions=1,
+    )
+    observations = dict(
+        ready=True,
+        slow_updated=True,
+        agent=agent,
+        count_approx_kl=1e-6,
+        placement_approx_kl=1e-6,
+        count_target_kl=0.01,
+        placement_target_kl=0.01,
+        placement_entropy=0.8,
+        placement_entropy_target=1.1,
+        low_entropy_override=True,
+    )
+
+    assert controller.observe(0.20, **observations) is False
+    assert controller.observe(0.21, **observations) is False
+    assert controller.observe(0.22, **observations) is True
+
+    assert np.isclose(controller.optimizer_lr(agent.slow_agent.count_ppo.optimizer), 1e-4)
+    assert np.isclose(controller.optimizer_lr(agent.slow_agent.placement_ppo.optimizer), 4e-5)
+    assert controller.actor_metric("count", "low_kl_blocks") == 2
+    assert controller.actor_metric("placement", "low_kl_blocks") == 0
+    assert controller.actor_metric("placement", "low_entropy_overrides") == 2
 
 
 def test_slow_lr_controller_restores_floors_from_older_checkpoint_optimizer():
@@ -787,6 +918,10 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "slow_count_replica_imbalance_fraction" in rows[0]
     assert "slow_count_replica_efficiency_cost" in rows[0]
     assert "fast_counterfactual_credit_coef" in rows[0]
+    assert "slow_incremental_add_actions" in rows[0]
+    assert "slow_incremental_stop_actions" in rows[0]
+    assert "slow_counterfactual_marginal_value" in rows[0]
+    assert "slow_counterfactual_samples" in rows[0]
 
     with (log_dir / "episode_metrics.csv").open(newline="", encoding="utf-8") as handle:
         episode_rows = list(csv.DictReader(handle))
@@ -813,6 +948,10 @@ def test_dual_ppo_entrypoint_writes_log_and_checkpoint(tmp_path):
     assert "slow_count_replica_imbalance_fraction" in rollout_rows[0]
     assert "slow_count_replica_efficiency_cost" in rollout_rows[0]
     assert "fast_counterfactual_credit_coef" in rollout_rows[0]
+    assert "slow_incremental_add_actions" in rollout_rows[0]
+    assert "slow_incremental_stop_actions" in rollout_rows[0]
+    assert "slow_counterfactual_marginal_value" in rollout_rows[0]
+    assert "slow_counterfactual_samples" in rollout_rows[0]
 
 
 def test_fast_only_entrypoint_writes_mode_tagged_log(tmp_path):

@@ -452,6 +452,42 @@ def test_representative_step_advances_weighted_time_without_changing_instantaneo
     assert np.isclose(env.current_time_minute - start_time, 10.0 / 60.0)
 
 
+def test_interval_average_sampling_updates_ewma_from_bounded_utilization():
+    represented_seconds = 100.0
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=144,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_hours=1,
+            mean_requests_per_minute=1_800.0,
+            sampled_load_update_mode="interval-average",
+        )
+    )
+    agent = build_baseline_agent()
+    env.reset()
+    agent.maybe_update_deployment(env)
+    requests = list(env.current_requests)
+    actions = agent.act_batch(env)
+    group_infos = env.evaluate_batch_schedules(requests, actions)
+    utilization = np.zeros(env.config.num_edge_nodes, dtype=np.float64)
+    for info, request in zip(group_infos, requests):
+        for demand in info["compute_demands"]:
+            capacity = env.scenario.nodes[demand.node_id].compute_gcycles_per_s
+            utilization[demand.node_id] += (
+                demand.compute_gcycles * request.request_count / capacity
+            )
+    decay = np.exp(-(represented_seconds / 60.0) / env.config.load_ewma_tau_minutes)
+    expected = (1.0 - decay) * np.clip(utilization, 0.0, 1.0)
+
+    env.step(actions, represented_seconds=represented_seconds)
+
+    np.testing.assert_allclose(env.node_compute_load, expected, rtol=1e-10, atol=1e-12)
+    assert np.all(env.node_compute_load >= 0.0)
+    assert np.all(env.node_compute_load <= 1.0)
+
+
 def test_joint_settlement_is_independent_of_group_order():
     env = EdgeComputingEnv(
         EdgeEnvConfig(

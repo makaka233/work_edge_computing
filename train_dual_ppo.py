@@ -149,7 +149,16 @@ def apply_training_design(
         "slow_placement_lr": 7.5e-5,
         "slow_k_epochs": 2,
         "slow_placement_entropy_target": 1.10,
-        "slow_placement_entropy_max_coef": 0.015,
+        # Once Placement has collapsed, the old 0.015 ceiling cannot reopen
+        # exploration even though the controller is fully saturated.
+        "slow_placement_entropy_max_coef": 0.030,
+        "slow_placement_entropy_adaptation_rate": 0.004,
+        # Cross-stage latency is already present in the end-to-end return.
+        # Retain explicit locality credit only as early guidance, then remove
+        # the duplicate incentive before it creates compute hot spots.
+        "slow_colocation_final_coef": 0.0,
+        "slow_colocation_hold_updates": 64,
+        "slow_colocation_decay_updates": 96,
         "slow_lr_decay": True,
         # Slow actors see only twelve window decisions per update.  A longer,
         # KL-gated horizon prevents a Fast-dominated plateau from freezing
@@ -160,6 +169,9 @@ def apply_training_design(
         "slow_placement_min_lr": 3.75e-5,
         "slow_lr_max_reductions": 1,
         "slow_lr_kl_floor_fraction": 0.10,
+        # Tiny per-update KL does not make cumulative low-entropy drift safe.
+        # Permit the Placement LR guard to act after sustained degradation.
+        "slow_lr_low_entropy_override": True,
         "fast_entropy_normalized_control": True,
         "fast_entropy_target": 0.18,
         "fast_entropy_max_coef": 0.02,
@@ -387,6 +399,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--load-ewma-tau-minutes", type=float, default=1.0)
+    parser.add_argument(
+        "--sampled-load-update-mode",
+        choices=["legacy-repeat", "interval-average"],
+        default="legacy-repeat",
+        help=(
+            "Advance sparse-rollout EWMA loads by the legacy repeated sampled second or by a "
+            "bounded interval-average utilization estimate."
+        ),
+    )
     parser.add_argument("--wireless-uplink-mbps", type=float, default=150.0)
     parser.add_argument("--radio-rtt-ms", type=float, default=10.0)
     parser.add_argument("--updates", type=int, default=20)
@@ -503,6 +524,28 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="Penalty in seconds-equivalent for cross-node transitions between adjacent stages in the Slow return.",
+    )
+    parser.add_argument(
+        "--slow-colocation-final-coef",
+        type=float,
+        default=None,
+        help=(
+            "Final explicit cross-stage transition coefficient. None preserves the initial coefficient; "
+            "trajectory-simultaneous training anneals it to zero because measured link latency already "
+            "provides the long-run communication signal."
+        ),
+    )
+    parser.add_argument(
+        "--slow-colocation-hold-updates",
+        type=int,
+        default=0,
+        help="Completed updates that retain the initial explicit Slow colocation coefficient.",
+    )
+    parser.add_argument(
+        "--slow-colocation-decay-updates",
+        type=int,
+        default=1,
+        help="Updates over which explicit Slow colocation credit reaches its final coefficient.",
     )
     parser.add_argument("--fast-entropy-coef", type=float, default=0.001)
     parser.add_argument("--fast-entropy-target", type=float, default=0.7)
@@ -652,6 +695,24 @@ def parse_args() -> argparse.Namespace:
         default="expected",
         help="Decode ordered Count actions by conservative posterior mean or categorical mode.",
     )
+    parser.add_argument(
+        "--slow-allocation-mode",
+        choices=["legacy-factorized", "global-incremental"],
+        default="legacy-factorized",
+        help=(
+            "Keep per-stage target counts for checkpoint compatibility, or allocate mandatory "
+            "coverage followed by globally competing add-replica/STOP actions."
+        ),
+    )
+    parser.add_argument(
+        "--slow-counterfactual-credit-coef",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of same-trace selected-node versus best-alternative marginal value in Slow "
+            "Count and Placement returns."
+        ),
+    )
     parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-target-kl", type=float, default=0.03)
     parser.add_argument("--slow-count-target-kl", type=float, default=0.015)
@@ -799,6 +860,15 @@ def parse_args() -> argparse.Namespace:
         default=0.10,
         help="Block an actor LR reduction while its KL is below this fraction of target KL.",
     )
+    parser.add_argument(
+        "--slow-lr-low-entropy-override",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow sustained performance degradation to reduce Placement LR even at low KL when "
+            "Placement entropy is below target."
+        ),
+    )
     parser.add_argument("--slow-lr-max-reductions", type=int, default=1)
     parser.add_argument("--slow-lr-cooldown-updates", type=int, default=20)
     parser.add_argument("--append-log", action="store_true")
@@ -858,6 +928,7 @@ def parse_args() -> argparse.Namespace:
         or args.slow_count_latency_coef < 0.0
         or args.slow_deadline_violation_coef < 0.0
         or args.slow_shared_return_coef < 0.0
+        or args.slow_counterfactual_credit_coef < 0.0
     ):
         parser.error("Slow shaping coefficients must be >= 0")
     if args.fast_updates_per_cycle < 1:
@@ -886,6 +957,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-tail-latency-coef must be in [0, 1]")
     if args.slow_colocation_coef < 0.0:
         parser.error("--slow-colocation-coef must be >= 0")
+    if args.slow_colocation_final_coef is not None:
+        if args.slow_colocation_final_coef < 0.0:
+            parser.error("--slow-colocation-final-coef must be >= 0")
+        if args.slow_colocation_final_coef > args.slow_colocation_coef:
+            parser.error("--slow-colocation-final-coef must not exceed --slow-colocation-coef")
+    if args.slow_colocation_hold_updates < 0:
+        parser.error("--slow-colocation-hold-updates must be >= 0")
+    if args.slow_colocation_decay_updates < 1:
+        parser.error("--slow-colocation-decay-updates must be >= 1")
     if args.slow_count_value_coef < 0.0:
         parser.error("--slow-count-value-coef must be >= 0")
     if args.slow_count_lr <= 0.0 or args.slow_count_target_kl <= 0.0:
@@ -1256,6 +1336,7 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             service_resource_fraction=args.service_resource_fraction,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
+            sampled_load_update_mode=getattr(args, "sampled_load_update_mode", "legacy-repeat"),
             wireless_uplink_mbps=args.wireless_uplink_mbps,
             radio_rtt_ms=args.radio_rtt_ms,
         )
@@ -1315,6 +1396,7 @@ def build_training_env(
             service_resource_fraction=args.service_resource_fraction,
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
+            sampled_load_update_mode=getattr(args, "sampled_load_update_mode", "legacy-repeat"),
             wireless_uplink_mbps=args.wireless_uplink_mbps,
             radio_rtt_ms=args.radio_rtt_ms,
         )
@@ -1745,6 +1827,19 @@ def rollout(
             if record_fast and fast_counterfactual_coef > 0.0
             else [[] for _ in requests]
         )
+        batch_slow_marginal_values = (
+            [
+                agent.fast_agent.stage_selected_node_marginal_values(
+                    env,
+                    request,
+                    schedule,
+                )
+                for request, schedule in zip(requests, actions)
+            ]
+            if record_slow
+            and float(getattr(args, "slow_counterfactual_credit_coef", 0.0)) > 0.0
+            else [None for _ in requests]
+        )
         if oracle_requests_remaining > 0:
             for request, schedule in zip(requests, actions):
                 if oracle_requests_remaining <= 0:
@@ -1832,6 +1927,7 @@ def rollout(
                     service_id=int(request.service_id),
                     stage_nodes=[int(node_id) for node_id in info["stage_nodes"]],
                     slow_stage_costs=stage_latency_costs,
+                    slow_stage_marginal_values=batch_slow_marginal_values[group_idx],
                     env=env,
                     record_fast=record_fast,
                     record_slow=record_slow,
@@ -1902,11 +1998,14 @@ def rollout(
         "slow_window_avg_latency": float("nan"),
         "slow_window_p95_latency": float("nan"),
         "slow_tail_latency_cost": float("nan"),
+        "slow_colocation_credit_coef": float("nan"),
         "slow_colocation_cost": float("nan"),
         "slow_cross_stage_transition_rate": float("nan"),
         "slow_colocation_rate": float("nan"),
         "slow_data_weighted_cross_stage_rate": float("nan"),
         "slow_shared_return_credit": float("nan"),
+        "slow_incremental_add_actions": 0.0,
+        "slow_incremental_stop_actions": 0.0,
         "slow_deployment_memory_cost": float("nan"),
         "slow_deployment_storage_cost": float("nan"),
         "slow_migration_cost": float("nan"),
@@ -1923,6 +2022,8 @@ def rollout(
         "slow_count_replica_efficiency_cost": float("nan"),
         "slow_placement_node_compute_load": float("nan"),
         "slow_placement_node_compute_cost": float("nan"),
+        "slow_counterfactual_marginal_value": float("nan"),
+        "slow_counterfactual_samples": 0.0,
         "slow_deployment_memory_fraction": float("nan"),
         "slow_deployment_storage_fraction": float("nan"),
         "slow_migration_fraction": float("nan"),
@@ -2336,11 +2437,14 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_window_avg_latency",
         "slow_window_p95_latency",
         "slow_tail_latency_cost",
+        "slow_colocation_credit_coef",
         "slow_colocation_cost",
         "slow_cross_stage_transition_rate",
         "slow_colocation_rate",
         "slow_data_weighted_cross_stage_rate",
         "slow_shared_return_credit",
+        "slow_incremental_add_actions",
+        "slow_incremental_stop_actions",
         "slow_deployment_memory_cost",
         "slow_deployment_storage_cost",
         "slow_migration_cost",
@@ -2357,6 +2461,8 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_count_replica_efficiency_cost",
         "slow_placement_node_compute_load",
         "slow_placement_node_compute_cost",
+        "slow_counterfactual_marginal_value",
+        "slow_counterfactual_samples",
         "slow_deployment_memory_fraction",
         "slow_deployment_storage_fraction",
         "slow_migration_fraction",
@@ -3119,6 +3225,7 @@ def _restore_pending_slow_collection(agent: HierarchicalPPOAgent, state: object)
     slow.pending_count_indices.clear()
     slow.pending_placement_indices.clear()
     slow.pending_count_stage_keys.clear()
+    slow.pending_count_node_ids.clear()
     slow.pending_placement_stage_keys.clear()
 
 
@@ -3138,6 +3245,11 @@ def save_checkpoint(
         "cached_gaussian": float(numpy_state[4]),
     }
     checkpoint = {
+            # The global incremental Count head has a different action space
+            # and network topology from the legacy per-stage Count head.  Save
+            # the architecture tag so resume failures are explicit instead of
+            # surfacing later as opaque tensor-size mismatches.
+            "slow_allocation_mode": agent.slow_agent.allocation_mode,
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
             "slow_count_optimizer": agent.slow_agent.count_ppo.optimizer.state_dict(),
             "slow_placement_agent": agent.slow_agent.placement_ppo.policy.state_dict(),
@@ -3196,6 +3308,28 @@ def load_checkpoint(
     # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
     # copy their tensors to the parameter device themselves.
     checkpoint = torch.load(path, map_location="cpu")
+    saved_allocation_mode = checkpoint.get("slow_allocation_mode")
+    if saved_allocation_mode is None and "slow_count_agent" in checkpoint:
+        count_state = checkpoint["slow_count_agent"]
+        if isinstance(count_state, dict):
+            saved_allocation_mode = (
+                "global-incremental"
+                if any(
+                    str(key).startswith(("stage_encoder.", "stop_actor."))
+                    for key in count_state
+                )
+                else "legacy-factorized"
+            )
+    if (
+        saved_allocation_mode is not None
+        and str(saved_allocation_mode) != agent.slow_agent.allocation_mode
+    ):
+        raise ValueError(
+            "checkpoint Slow allocation architecture is "
+            f"{saved_allocation_mode!r}, but the current run requested "
+            f"{agent.slow_agent.allocation_mode!r}; resume with the same "
+            "--slow-allocation-mode or start a fresh run"
+        )
     if "slow_count_agent" in checkpoint:
         agent.slow_agent.count_ppo.policy.load_state_dict(checkpoint["slow_count_agent"])
     if "slow_count_optimizer" in checkpoint:
@@ -3377,8 +3511,10 @@ class SlowLearningRateController:
     is taking steps that are too large: Fast is changing at the same time, and
     an actor whose KL is already tiny must not be made even less responsive.
     Count and Placement therefore keep independent patience/reduction state,
-    and a reduction is allowed only while that actor uses a meaningful
-    fraction of its PPO KL budget.
+    and a reduction normally requires a meaningful fraction of its PPO KL
+    budget. Placement may override that gate after it has fallen below its
+    entropy target, where many small one-sided steps can still accumulate into
+    a harmful drift.
     """
 
     def __init__(
@@ -3417,6 +3553,7 @@ class SlowLearningRateController:
                 "reductions": 0,
                 "cooldown_remaining": 0,
                 "low_kl_blocks": 0,
+                "low_entropy_overrides": 0,
             }
             for actor in ("count", "placement")
         }
@@ -3492,6 +3629,9 @@ class SlowLearningRateController:
         placement_approx_kl: float | None = None,
         count_target_kl: float | None = None,
         placement_target_kl: float | None = None,
+        placement_entropy: float | None = None,
+        placement_entropy_target: float | None = None,
+        low_entropy_override: bool = False,
     ) -> bool:
         if not self.enabled or not ready or not slow_updated or not np.isfinite(score):
             return False
@@ -3523,17 +3663,36 @@ class SlowLearningRateController:
             if int(actor_state["reductions"]) >= self.max_reductions:
                 actor_state["bad_updates"] = 0
                 continue
-            if (
+            placement_is_under_exploring = bool(
+                actor == "placement"
+                and low_entropy_override
+                and placement_entropy is not None
+                and placement_entropy_target is not None
+                and np.isfinite(placement_entropy)
+                and np.isfinite(placement_entropy_target)
+                and placement_entropy_target > 0.0
+                and placement_entropy < placement_entropy_target
+            )
+            low_kl = bool(
                 approx_kl is not None
                 and target_kl is not None
                 and np.isfinite(approx_kl)
                 and np.isfinite(target_kl)
                 and target_kl > 0.0
                 and approx_kl < self.kl_floor_fraction * target_kl
-            ):
+            )
+            if low_kl and not placement_is_under_exploring:
                 actor_state["low_kl_blocks"] = int(actor_state["low_kl_blocks"]) + 1
                 actor_state["bad_updates"] = 0
                 continue
+            if low_kl and placement_is_under_exploring:
+                # Low one-step KL normally prevents a needless LR reduction.
+                # Once Placement is already under-exploring, however, many
+                # individually small biased updates can accumulate into a
+                # large policy drift. Let the sustained score guard count it.
+                actor_state["low_entropy_overrides"] = (
+                    int(actor_state["low_entropy_overrides"]) + 1
+                )
             actor_state["bad_updates"] = int(actor_state["bad_updates"]) + 1
             if int(actor_state["bad_updates"]) < self.patience:
                 continue
@@ -3564,6 +3723,21 @@ class SlowLearningRateController:
                 for actor, actor_state in self.actor_state.items()
             },
         }
+
+
+def slow_colocation_credit_coefficient(
+    args: argparse.Namespace,
+    completed_updates: int,
+) -> float:
+    """Anneal duplicate locality shaping while retaining measured link latency."""
+
+    initial = float(getattr(args, "slow_colocation_coef", 0.0))
+    configured_final = getattr(args, "slow_colocation_final_coef", None)
+    final = initial if configured_final is None else float(configured_final)
+    hold = max(int(getattr(args, "slow_colocation_hold_updates", 0)), 0)
+    decay = max(int(getattr(args, "slow_colocation_decay_updates", 1)), 1)
+    progress = float(np.clip((int(completed_updates) - hold) / decay, 0.0, 1.0))
+    return float(initial + progress * (final - initial))
 
 
 def fast_counterfactual_credit_coefficient(
@@ -3727,6 +3901,8 @@ def main() -> None:
         slow_deadline_violation_coef=args.slow_deadline_violation_coef,
         slow_shared_return_coef=args.slow_shared_return_coef,
         slow_deterministic_count_mode=args.slow_deterministic_count_mode,
+        slow_allocation_mode=args.slow_allocation_mode,
+        slow_counterfactual_credit_coef=args.slow_counterfactual_credit_coef,
     )
     loaded_metadata: dict[str, object] = {}
     if args.load_checkpoint:
@@ -3841,7 +4017,16 @@ def main() -> None:
     print(f"  topology_k_nearest={args.topology_k_nearest} deadline_scale={args.deadline_scale}")
     print(f"  synchronized_window_block={args.synchronized_window_block or 'disabled'}")
     print(f"  slow_tail_latency_coef={args.slow_tail_latency_coef:.2f} (P95 weight)")
-    print(f"  slow_colocation_coef={args.slow_colocation_coef:.3f} (cross-stage transition penalty)")
+    slow_colocation_final = (
+        args.slow_colocation_coef
+        if args.slow_colocation_final_coef is None
+        else args.slow_colocation_final_coef
+    )
+    print(
+        f"  slow_colocation_coef={args.slow_colocation_coef:.3f}->{slow_colocation_final:.3f} "
+        f"hold={args.slow_colocation_hold_updates} decay={args.slow_colocation_decay_updates} "
+        "(early cross-stage transition guidance)"
+    )
     print(
         f"  slow_shared_return_coef={args.slow_shared_return_coef:.3f} "
         "colocation_credit=data-volume-weighted"
@@ -3868,7 +4053,8 @@ def main() -> None:
     )
     print(
         f"  temporal_sampling train={effective_sampled_seconds}/{window_seconds}s "
-        f"({effective_sampled_seconds / window_seconds:.1%}) eval=full"
+        f"({effective_sampled_seconds / window_seconds:.1%}) eval=full "
+        f"load_update={args.sampled_load_update_mode}"
     )
     print(f"  arrival_profile={args.arrival_profile}")
     if args.arrival_profile == "stationary":
@@ -3886,6 +4072,10 @@ def main() -> None:
     print(
         f"  max_replicas_per_stage={replica_action_dim} "
         f"actual_replica_count=learned_by_count_ppo artificial_cap={'none' if args.replicas_per_stage == 0 else 'explicit'}"
+    )
+    print(
+        f"  slow_allocation_mode={args.slow_allocation_mode} "
+        f"slow_counterfactual_credit_coef={args.slow_counterfactual_credit_coef:.3f}"
     )
     print(f"  service_resource_fraction={args.service_resource_fraction:.2f} of fixed node memory/storage")
     print(
@@ -3977,7 +4167,7 @@ def main() -> None:
     print(
         f"  slow_lr_decay enabled={args.slow_lr_decay} patience={args.slow_lr_decay_patience} "
         f"factor={args.slow_lr_decay_factor} min_delta={args.slow_lr_decay_min_delta}s "
-        f"min_lr={args.slow_min_lr}"
+        f"min_lr={args.slow_min_lr} low_entropy_override={args.slow_lr_low_entropy_override}"
     )
     print(
         f"  ppo_target_kl count={args.slow_count_target_kl} "
@@ -4203,11 +4393,14 @@ def main() -> None:
             "slow_window_avg_latency": np.nan,
             "slow_window_p95_latency": np.nan,
             "slow_tail_latency_cost": np.nan,
+            "slow_colocation_credit_coef": np.nan,
             "slow_colocation_cost": np.nan,
             "slow_cross_stage_transition_rate": np.nan,
             "slow_colocation_rate": np.nan,
             "slow_data_weighted_cross_stage_rate": np.nan,
             "slow_shared_return_credit": np.nan,
+            "slow_incremental_add_actions": 0.0,
+            "slow_incremental_stop_actions": 0.0,
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
@@ -4224,6 +4417,8 @@ def main() -> None:
             "slow_count_replica_efficiency_cost": np.nan,
             "slow_placement_node_compute_load": np.nan,
             "slow_placement_node_compute_cost": np.nan,
+            "slow_counterfactual_marginal_value": np.nan,
+            "slow_counterfactual_samples": 0.0,
             "slow_deployment_memory_fraction": np.nan,
             "slow_deployment_storage_fraction": np.nan,
             "slow_migration_fraction": np.nan,
@@ -4259,6 +4454,9 @@ def main() -> None:
             ),
             "slow_placement_lr_low_kl_blocks": slow_lr_controller.actor_metric(
                 "placement", "low_kl_blocks"
+            ),
+            "slow_placement_lr_low_entropy_overrides": slow_lr_controller.actor_metric(
+                "placement", "low_entropy_overrides"
             ),
             "slow_policy_loss": 0.0,
             "slow_value_loss": 0.0,
@@ -4456,6 +4654,11 @@ def main() -> None:
     )
     for local_update in range(args.updates):
         update = resume_update_offset + local_update
+        args.slow_colocation_current_coef = slow_colocation_credit_coefficient(
+            args,
+            update,
+        )
+        agent.slow_colocation_coef = args.slow_colocation_current_coef
         args.fast_counterfactual_credit_current_coef = (
             fast_counterfactual_credit_coefficient(args, update)
         )
@@ -4763,6 +4966,9 @@ def main() -> None:
             placement_approx_kl=slow_metrics.get("placement_approx_kl"),
             count_target_kl=args.slow_count_target_kl,
             placement_target_kl=args.slow_placement_target_kl,
+            placement_entropy=slow_metrics.get("placement_entropy"),
+            placement_entropy_target=args.slow_placement_entropy_target,
+            low_entropy_override=args.slow_lr_low_entropy_override,
         )
         slow_count_lr = SlowLearningRateController.optimizer_lr(
             agent.slow_agent.count_ppo.optimizer
@@ -4908,6 +5114,7 @@ def main() -> None:
             "slow_window_avg_latency": stats["slow_window_avg_latency"],
             "slow_window_p95_latency": stats["slow_window_p95_latency"],
             "slow_tail_latency_cost": stats["slow_tail_latency_cost"],
+            "slow_colocation_credit_coef": stats["slow_colocation_credit_coef"],
             "slow_colocation_cost": stats["slow_colocation_cost"],
             "slow_cross_stage_transition_rate": stats["slow_cross_stage_transition_rate"],
             "slow_colocation_rate": stats["slow_colocation_rate"],
@@ -4915,6 +5122,8 @@ def main() -> None:
                 "slow_data_weighted_cross_stage_rate"
             ],
             "slow_shared_return_credit": stats["slow_shared_return_credit"],
+            "slow_incremental_add_actions": stats["slow_incremental_add_actions"],
+            "slow_incremental_stop_actions": stats["slow_incremental_stop_actions"],
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],
@@ -4939,6 +5148,10 @@ def main() -> None:
             ],
             "slow_placement_node_compute_load": stats["slow_placement_node_compute_load"],
             "slow_placement_node_compute_cost": stats["slow_placement_node_compute_cost"],
+            "slow_counterfactual_marginal_value": stats[
+                "slow_counterfactual_marginal_value"
+            ],
+            "slow_counterfactual_samples": stats["slow_counterfactual_samples"],
             "slow_deployment_memory_fraction": stats["slow_deployment_memory_fraction"],
             "slow_deployment_storage_fraction": stats["slow_deployment_storage_fraction"],
             "slow_migration_fraction": stats["slow_migration_fraction"],
@@ -4970,6 +5183,9 @@ def main() -> None:
             ),
             "slow_placement_lr_low_kl_blocks": slow_lr_controller.actor_metric(
                 "placement", "low_kl_blocks"
+            ),
+            "slow_placement_lr_low_entropy_overrides": slow_lr_controller.actor_metric(
+                "placement", "low_entropy_overrides"
             ),
             "slow_policy_loss": losses["slow"]["policy_loss"],
             "slow_value_loss": losses["slow"]["value_loss"],
