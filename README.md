@@ -49,6 +49,26 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ## Current Modules
 
+Configuration is defined by the Python entrypoints and checkpoint metadata;
+the former documentation-only YAML files have been removed. Use each
+entrypoint's `--help` to inspect supported options.
+
+Current entrypoints are `train_dual_ppo.py`, `train_monolithic.py`, and
+`run_comparison.py`. Reusable analysis tools live in `scripts/`:
+`analyze_convergence.py` (update summaries), `plot_training_run.py` (update
+diagnostics), `plot_rollout_training.py` (rollout curves),
+`plot_proposed_monolithic_results.py` (episode and two-scheme curves), and
+`plot_comparison.py` (two-scheme scenario plots).
+
+Historical staged-training launchers and obsolete experiment plans were
+removed; they remain recoverable from Git tag
+`backup-before-comparison-redesign-20260904`. Training outputs, checkpoints,
+paper sources, and checkpoint compatibility code are retained.
+
+Only Proposed and separately trained Monolithic are currently supported by the
+comparison runner. Other comparison implementations have been removed pending
+redesign; archived experiment outputs are retained.
+
 - `edge_drl/env/scenario.py`: realistic synthetic MEC scenario generator.
 - `edge_drl/env/environment.py`: event-driven environment and action masks.
 - `edge_drl/allocators/kkt.py`: KKT sqrt-rule resource allocator.
@@ -59,10 +79,9 @@ kept thin. The problem model is different, so the code is specialized for:
 - `tests/test_env_smoke.py`: KKT and environment smoke tests.
 - `tests/test_dual_ppo_smoke.py`: dual-agent PPO rollout/update tests.
 
-The formal five-sweep, four-scheme IEEE evaluation protocol is recorded in
-`docs/IEEE_COMPARISON.md`. Its paper-facing labels are Proposed, Monolithic
-(separately trained one-stage-per-service PPO), DMDR (native AES-JDR
-adaptation), and SICP (adapted JPS-CP without TSN gate scheduling).
+The formal five-sweep, two-scheme IEEE evaluation protocol is recorded in
+`docs/IEEE_COMPARISON.md`. Its supported labels are Proposed and Monolithic
+(separately trained one-stage-per-service PPO).
 Greedy is restricted to smoke sanity checks and component ablations stay outside
 the main comparison.
 
@@ -71,9 +90,7 @@ the main comparison.
 ```powershell
 python train_dual_ppo.py --train-mode fast-only --rollout-unit requests --updates 2 --requests-per-update 64
 python train_dual_ppo.py --seed 2026 --pressure-profile mec-moderate --train-mode joint --rollout-unit window --updates 40 --sampled-seconds-per-window 60 --num-users 12000 --num-edge-nodes 32 --num-service-types 10 --reward-mode latency --reward-scale 10 --fast-policy-kind gat_node_scorer --max-replicas-per-stage 0 --slow-k-epochs 3 --fast-k-epochs 4 --fast-minibatch-size 512 --device cuda --run-name joint_trajectory_stream_u40 --progress-interval-seconds 10
-python scripts/run_full_training.py --episode-minutes 10 --scenario-refresh-episodes 1 --traffic-scale 1.6
-python scripts/summarize_full_training.py runs
-python scripts/analyze_convergence.py runs/phase2_joint/logs/training.csv
+python scripts/analyze_convergence.py runs/<run_name>/logs/training.csv
 python -m pytest tests
 ```
 

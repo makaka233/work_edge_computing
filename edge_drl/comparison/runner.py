@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 import platform
@@ -15,21 +14,19 @@ import scipy
 import torch
 
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
-from edge_drl.comparison.dmdr import DMDRScheme
 from edge_drl.comparison.io import write_csv, write_json
 from edge_drl.comparison.metrics import evaluate_scheme_episode
 from edge_drl.comparison.monolithic import MonolithicScheme
 from edge_drl.comparison.proposed import ProposedScheme
 from edge_drl.comparison.replay_env import TraceReplayEnv
 from edge_drl.comparison.scenario_transforms import formal_experiment_points, transform_scenario, transform_trace
-from edge_drl.comparison.sicp import SICPScheme
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
 from edge_drl.comparison.trace import generate_comparison_trace
 from edge_drl.comparison.types import ExperimentPoint
 from edge_drl.env.environment import EdgeComputingEnv
 
 
-FORMAL_SCHEMES = ("Proposed", "Monolithic", "DMDR", "SICP")
+FORMAL_SCHEMES = ("Proposed", "Monolithic")
 FORMAL_SCENARIO_FAMILIES = (
     "request_load",
     "compute_capacity",
@@ -45,7 +42,7 @@ def phase_design(phase: int) -> tuple[int, list[int], list[ExperimentPoint], int
     if phase == 2:
         return 60, [2026, 2027, 2028], formal_experiment_points(), 1
     if phase == 3:
-        return 60, list(range(2026, 2046)), formal_experiment_points(), 3
+        return 60, list(range(2026, 2046)), formal_experiment_points(), 1
     raise ValueError("phase must be 1, 2, or 3")
 
 
@@ -56,7 +53,7 @@ def configured_phase_design(
     scenario_families: tuple[str, ...] | None = None,
 ) -> tuple[int, list[int], list[ExperimentPoint], int, bool]:
     """Apply explicit evaluation-only filters without changing the formal defaults."""
-    episode_minutes, eval_seeds, points, dmdr_repeats = phase_design(phase)
+    episode_minutes, eval_seeds, points, routing_repeats = phase_design(phase)
     is_standard_design = eval_seeds_override is None and scenario_families is None
     if eval_seeds_override is not None:
         eval_seeds = list(dict.fromkeys(int(seed) for seed in eval_seeds_override))
@@ -70,7 +67,7 @@ def configured_phase_design(
         if not selected:
             raise ValueError("scenario_families must contain at least one family")
         points = [point for point in points if point.family in selected]
-    return episode_minutes, eval_seeds, points, dmdr_repeats, is_standard_design
+    return episode_minutes, eval_seeds, points, routing_repeats, is_standard_design
 
 
 def run_comparison(
@@ -112,7 +109,7 @@ def run_comparison(
     unknown = sorted(set(schemes) - set(FORMAL_SCHEMES))
     if unknown:
         raise ValueError(f"formal comparison does not include schemes: {unknown}")
-    episode_minutes, eval_seeds, points, dmdr_repeats, is_standard_design = configured_phase_design(
+    episode_minutes, eval_seeds, points, routing_repeats, is_standard_design = configured_phase_design(
         phase,
         eval_seeds_override=eval_seeds_override,
         scenario_families=scenario_families,
@@ -159,7 +156,6 @@ def run_comparison(
         "scenario_families": list(dict.fromkeys(point.family for point in points)),
         "scenario_point_count": len(points),
         "standard_phase_design": is_standard_design,
-        "dmdr_routing_repeats": dmdr_repeats,
         "checkpoint": str(checkpoint_path),
         "monolithic_checkpoint": None if monolithic_checkpoint is None else str(monolithic_checkpoint),
         "learning_checkpoint_protocol": (
@@ -181,8 +177,6 @@ def run_comparison(
         },
         "labels": {
             "Monolithic": "separately trained dual-scale PPO with one aggregated stage per service",
-            "DMDR": "native AES-JDR adaptation from Peng et al., IEEE TSC 2024",
-            "SICP": "adapted JPS-CP; TSN gate scheduling omitted",
         },
     }
     write_json(output / "metadata.json", metadata)
@@ -228,89 +222,84 @@ def run_comparison(
                 }
             )
             for scheme_name in schemes:
-                repeat_count = dmdr_repeats if scheme_name == "DMDR" else 1
-                dmdr_plan_cache: dict[int, dict[str, object]] = {}
-                for repeat in range(repeat_count):
-                    env = TraceReplayEnv(config, scenario, trace)
-                    env.reset()
-                    try:
-                        scheme = _make_scheme(
-                            scheme_name,
-                            env,
-                            checkpoint_path,
-                            checkpoint_args,
-                            device=device,
-                            routing_seed=request_seed + 10_000 * (repeat + 1),
-                            phase=phase,
-                            dmdr_plan_cache=dmdr_plan_cache,
-                            monolithic_checkpoint=monolithic_checkpoint,
-                            monolithic_checkpoint_mode=monolithic_checkpoint_mode,
-                            point=point,
-                        )
-                        result = evaluate_scheme_episode(
-                            scheme=scheme,
-                            env=env,
-                            point=point,
-                            eval_seed=eval_seed,
-                            routing_repeat=repeat,
-                            sampled_seconds_per_window=sampled_seconds_per_window,
-                        )
-                        row = result.to_dict()
-                        row.update(
-                            {
-                                "experiment": point.family,
-                                "parameter": point.value,
-                                "physical_seed": trace.physical_seed,
-                                "demand_seed": trace.demand_seed,
-                                "trace_seed": trace.request_seed,
-                                "routing_seed": request_seed + 10_000 * (repeat + 1),
-                                "requests": result.request_count,
-                                "mean_latency": result.mean_latency_ms,
-                                "p95_latency": result.p95_latency_ms,
-                                "planning_time_ms": result.planning_time_s * 1000.0,
-                                "scheduling_time_ms": result.scheduling_time_s * 1000.0,
-                                "settlement_time_ms": result.kkt_settlement_time_s * 1000.0,
-                            }
-                        )
-                        raw_rows.append(row)
-                        for diagnostic in scheme.diagnostics.planning:
-                            solver_diagnostics.append(
-                                {
-                                    "scheme": scheme_name,
-                                    "scenario_family": point.family,
-                                    "scenario_value": point.value,
-                                    "eval_seed": eval_seed,
-                                    "routing_repeat": repeat,
-                                    **diagnostic,
-                                }
-                            )
-                        if result.failed:
-                            failure_rows.append(row)
-                    except Exception as error:
-                        failure = {
-                            "scheme": scheme_name,
-                            "scenario_family": point.family,
-                            "scenario_value": point.value,
-                            "eval_seed": eval_seed,
-                            "routing_repeat": repeat,
-                            "trace_hash": trace.trace_hash,
+                repeat = 0  # Retained in result rows for historical CSV compatibility.
+                env = TraceReplayEnv(config, scenario, trace)
+                env.reset()
+                try:
+                    scheme = _make_scheme(
+                        scheme_name,
+                        env,
+                        checkpoint_path,
+                        checkpoint_args,
+                        device=device,
+                        monolithic_checkpoint=monolithic_checkpoint,
+                        monolithic_checkpoint_mode=monolithic_checkpoint_mode,
+                        point=point,
+                    )
+                    result = evaluate_scheme_episode(
+                        scheme=scheme,
+                        env=env,
+                        point=point,
+                        eval_seed=eval_seed,
+                        routing_repeat=repeat,
+                        sampled_seconds_per_window=sampled_seconds_per_window,
+                    )
+                    row = result.to_dict()
+                    row.update(
+                        {
                             "experiment": point.family,
                             "parameter": point.value,
                             "physical_seed": trace.physical_seed,
                             "demand_seed": trace.demand_seed,
                             "trace_seed": trace.request_seed,
                             "routing_seed": request_seed + 10_000 * (repeat + 1),
-                            "failed": True,
-                            "failure_reason": str(error),
-                            "traceback": traceback.format_exc(),
+                            "requests": result.request_count,
+                            "mean_latency": result.mean_latency_ms,
+                            "p95_latency": result.p95_latency_ms,
+                            "planning_time_ms": result.planning_time_s * 1000.0,
+                            "scheduling_time_ms": result.scheduling_time_s * 1000.0,
+                            "settlement_time_ms": result.kkt_settlement_time_s * 1000.0,
                         }
-                        failure_rows.append(failure)
-                        raw_rows.append(failure)
-                    _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
-                    print(
-                        f"[{scheme_name}] {point.label} seed={eval_seed} repeat={repeat} "
-                        f"status={'failed' if failure_rows and failure_rows[-1].get('scheme') == scheme_name and failure_rows[-1].get('trace_hash') == trace.trace_hash else 'complete'}"
                     )
+                    raw_rows.append(row)
+                    for diagnostic in scheme.diagnostics.planning:
+                        solver_diagnostics.append(
+                            {
+                                "scheme": scheme_name,
+                                "scenario_family": point.family,
+                                "scenario_value": point.value,
+                                "eval_seed": eval_seed,
+                                "routing_repeat": repeat,
+                                **diagnostic,
+                            }
+                        )
+                    if result.failed:
+                        failure_rows.append(row)
+                except Exception as error:
+                    failure = {
+                        "scheme": scheme_name,
+                        "scenario_family": point.family,
+                        "scenario_value": point.value,
+                        "eval_seed": eval_seed,
+                        "routing_repeat": repeat,
+                        "trace_hash": trace.trace_hash,
+                        "experiment": point.family,
+                        "parameter": point.value,
+                        "physical_seed": trace.physical_seed,
+                        "demand_seed": trace.demand_seed,
+                        "trace_seed": trace.request_seed,
+                        "routing_seed": request_seed + 10_000 * (repeat + 1),
+                        "failed": True,
+                        "failure_reason": str(error),
+                        "traceback": traceback.format_exc(),
+                    }
+                    failure_rows.append(failure)
+                    raw_rows.append(failure)
+                _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
+                print(
+                    f"[{scheme_name}] {point.label} seed={eval_seed} repeat={repeat} "
+                    f"status={'failed' if failure_rows and failure_rows[-1].get('scheme') == scheme_name and failure_rows[-1].get('trace_hash') == trace.trace_hash else 'complete'}"
+                )
 
     _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
     if (
@@ -350,9 +339,6 @@ def _make_scheme(
     checkpoint_args: dict[str, Any],
     *,
     device: str,
-    routing_seed: int,
-    phase: int,
-    dmdr_plan_cache: dict[int, dict[str, object]] | None = None,
     monolithic_checkpoint: str | Path | None = None,
     monolithic_checkpoint_mode: str = "fixed",
     point: ExperimentPoint | None = None,
@@ -368,14 +354,6 @@ def _make_scheme(
             mode=monolithic_checkpoint_mode,
         )
         return MonolithicScheme(env, resolved, device=device)
-    if name == "SICP":
-        return SICPScheme(solver_time_limit_s=30.0 if phase == 1 else 120.0)
-    if name == "DMDR":
-        return DMDRScheme(
-            routing_seed=routing_seed,
-            solver_max_iterations=120 if phase == 1 else 400,
-            plan_cache=dmdr_plan_cache,
-        )
     raise ValueError(name)
 
 
@@ -432,7 +410,3 @@ def _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_di
     )
     write_csv(output / "diagnostics" / "trace_manifest.csv", trace_manifest)
     write_csv(output / "diagnostics" / "solver.csv", solver_diagnostics)
-    write_csv(
-        output / "diagnostics" / "dmdr_native.csv",
-        [row for row in solver_diagnostics if row.get("scheme") == "DMDR"],
-    )

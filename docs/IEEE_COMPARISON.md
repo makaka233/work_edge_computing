@@ -16,12 +16,6 @@ shared physical simulator: compute is `(sum(stage_compute), 0, ...)`, all
 inter-stage outputs are zero, and the aggregate Fast decision is projected to
 the same node for every original stage. Thus the only structural difference is
 the stage aggregation, not the trace, resource accounting, or simulator.
-- **DMDR**: native AES-JDR/RDMP adaptation following Peng et al., IEEE TSC 2024.
-  Integer instance multiplicity is retained as a native diagnostic; the common
-  physical simulator projects it to `N_integer > 0`, and memory/storage are
-  enforced on that indicator.
-- **SICP**: adapted JPS-CP chain placement with OR-Tools CP-SAT; TSN gate
-  scheduling is outside this MEC simulator and is explicitly omitted.
 
 Greedy remains available only as a development sanity check and is never added
 to formal plots or the main result tables.
@@ -30,14 +24,16 @@ Every evaluation point and seed first creates a complete immutable one-second
 request trace. Each scheme receives the identical trace and an independent copy
 of the same transformed physical scenario. Formal episodes contain 3,600
 logical and settlement steps (60 minutes); Phase 1 intentionally uses 600 steps
-for correctness screening. No temporal sampling is used in comparison runs.
+for correctness screening. By default comparison runs are unsampled. Set
+`--sampled-seconds-per-window 6` for training-equivalent weighted settlement;
+this is an approximate evaluation and does not produce formal validation.
 
 ## Phases
 
 1. Phase 1: nominal load, one seed, 10 minutes.
 2. Phase 2: all five parameter sweeps, three paired seeds, 60 minutes.
-3. Phase 3: all sweeps, twenty paired seeds, 60 minutes; DMDR routing is repeated
-   three times and averaged within each seed before Student-t confidence intervals.
+3. Phase 3: all sweeps, twenty paired seeds, 60 minutes. Each scheme is evaluated
+   once per point and seed; statistics use paired seeds.
    The runner refuses Phase 3 unless `--phase2-validation-run` points to a complete,
    failure-free Phase 2 result directory.
 
@@ -72,7 +68,7 @@ The omitted seed, episode length, and sampled-seconds options are copied from
 the Proposed checkpoint (the frozen reference uses 6 representative settlement
 seconds per window).  Monolithic collects all six ten-minute windows of a
 60-minute episode and uses the same per-window load assignments and random
-streams before collapsing the generated trace.  Evaluation remains unsampled.
+streams before collapsing the generated trace.  Evaluation is unsampled unless explicitly configured otherwise.
 The run writes `training_manifest.json`, including the physical seed, demand
 seed, environment/request seed, load assignments, and trace hash for every
 episode so parity can be audited.

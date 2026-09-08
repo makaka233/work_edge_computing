@@ -4,8 +4,6 @@ import torch
 
 from edge_drl.comparison.checkpoint import load_checkpoint_configuration
 from edge_drl.comparison.metrics import evaluate_scheme_episode
-from edge_drl.comparison.sicp import SICPScheme
-from edge_drl.comparison.dmdr import DMDRScheme
 from edge_drl.comparison.scheme import BaseComparisonScheme
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
 from edge_drl.comparison.types import ExperimentPoint
@@ -13,6 +11,7 @@ from edge_drl.comparison.runner import (
     _require_phase2_validation,
     _resolve_monolithic_checkpoint,
     configured_phase_design,
+    FORMAL_SCHEMES,
 )
 from edge_drl.comparison.io import write_json
 from tests.comparison_helpers import tiny_replay_env
@@ -73,7 +72,7 @@ def test_comparison_sampling_matches_training_weighted_settlement() -> None:
 def test_statistics_use_seed_rows_and_paired_student_t_intervals() -> None:
     rows = []
     for seed, proposed, baseline in ((1, 10.0, 12.0), (2, 11.0, 14.0), (3, 9.0, 13.0)):
-        for scheme, value in (("Proposed", proposed), ("SICP", baseline)):
+        for scheme, value in (("Proposed", proposed), ("Monolithic", baseline)):
             rows.append(
                 {
                     "scheme": scheme,
@@ -170,23 +169,14 @@ def test_exploratory_per_point_checkpoint_resolution_remains_available(tmp_path)
     assert _resolve_monolithic_checkpoint(tmp_path, point, mode="per-point") == checkpoint
 
 
-def test_all_comparison_scheme_interfaces_settle_without_invalid_actions() -> None:
-    schemes = (
-        FixedScheme(),
-        SICPScheme(solver_time_limit_s=10.0, workers=1),
-        DMDRScheme(routing_seed=77, solver_max_iterations=100),
-    )
-    hashes = set()
-    for scheme in schemes:
-        env = tiny_replay_env()
-        env.reset()
-        hashes.add(env._comparison_trace.trace_hash)
-        scheme.maybe_plan(env)
-        requests = scheme.adapt_requests(list(env.current_requests))
-        env.current_requests = requests
-        env.current_request = requests[0] if requests else None
-        schedules = scheme.schedule_batch(env, requests)
-        _, _, _, info = env.step(schedules, represented_seconds=1.0)
-        assert all(group["valid"] for group in info["group_infos"])
-        assert env.metrics["invalid_actions"] == 0.0
-    assert len(hashes) == 1
+def test_comparison_registry_contains_only_learning_schemes() -> None:
+    assert FORMAL_SCHEMES == ("Proposed", "Monolithic")
+
+
+def test_phase3_has_no_baseline_specific_routing_repeats() -> None:
+    minutes, seeds, points, repeats, standard = configured_phase_design(3)
+    assert minutes == 60
+    assert len(seeds) == 20
+    assert len(points) == 28
+    assert repeats == 1
+    assert standard is True

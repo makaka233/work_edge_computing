@@ -8,15 +8,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-SCHEME_ORDER = ("Proposed", "Monolithic", "DMDR", "SICP")
+SCHEME_ORDER = ("Proposed", "Monolithic")
 COLORS = {
     "Proposed": "#0072B2",
     "Monolithic": "#D55E00",
-    "DMDR": "#009E73",
-    "SICP": "#CC79A7",
 }
-LINE_STYLES = {"Proposed": "-", "Monolithic": "--", "DMDR": "-.", "SICP": ":"}
-MARKERS = {"Proposed": "o", "Monolithic": "s", "DMDR": "^", "SICP": "D"}
+LINE_STYLES = {"Proposed": "-", "Monolithic": "--"}
+MARKERS = {"Proposed": "o", "Monolithic": "s"}
 FAMILY_ORDER = (
     "request_load",
     "compute_capacity",
@@ -157,7 +155,7 @@ def plot_run(run_dir: Path) -> list[Path]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot formal four-scheme comparison results")
+    parser = argparse.ArgumentParser(description="Plot formal two-scheme comparison results")
     parser.add_argument("run_dir", type=Path)
     args = parser.parse_args()
     for path in plot_run(args.run_dir):

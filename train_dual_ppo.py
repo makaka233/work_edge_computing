@@ -1616,17 +1616,6 @@ class RolloutProgress:
         return min(float(env.metrics.get("requests", 0.0)), self._total_progress_units())
 
 
-def _format_duration(seconds: float) -> str:
-    if not np.isfinite(seconds):
-        return "--:--"
-    seconds = max(int(seconds), 0)
-    minutes, secs = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
-
-
 def _format_metric(value: float, precision: int) -> str:
     if not np.isfinite(value):
         return "--"
@@ -2711,14 +2700,6 @@ def _stage_congestion_externality_costs(
     return costs
 
 
-def _training_reward(
-    policy_info: dict[str, object],
-    env: EdgeComputingEnv,
-    args: argparse.Namespace,
-) -> float:
-    return _training_reward_components(policy_info, env, args)["train_reward"]
-
-
 def evaluate_agent(
     args: argparse.Namespace,
     agent: HierarchicalPPOAgent,
@@ -2931,123 +2912,6 @@ def prefix_eval_stats(stats: dict[str, float], prefix: str) -> dict[str, float]:
         f"{prefix}{key.removeprefix('eval_')}": value
         for key, value in ((key, stats.get(key, float("nan"))) for key in EVAL_STAT_KEYS)
     }
-
-
-def evaluate_policy_diagnostics(
-    args: argparse.Namespace,
-    agent: HierarchicalPPOAgent,
-    *,
-    seed_base: int,
-    max_requests: int,
-    train_mode: str,
-    previous_actions: list[int] | None,
-    rollout_unit: str = "requests",
-) -> tuple[dict[str, float], list[int]]:
-    deterministic_actions: list[int] = []
-    entropies: list[float] = []
-    top1_probs: list[float] = []
-    top1_margins: list[float] = []
-    deterministic_latencies: list[float] = []
-    deterministic_latency_weights: list[float] = []
-    stochastic_latencies: list[float] = []
-    slow_policy = SlowGreedyDeploymentPolicy()
-
-    for seed_idx in range(args.eval_seeds):
-        env = build_env(args, seed_offset=seed_base + seed_idx)
-        env.reset()
-        if rollout_unit == "window":
-            start_env_at_minute(env, rollout_start_minute(args, seed_idx, eval_mode=True))
-        det_target_requests = max_requests if rollout_unit == "requests" else estimate_episode_requests(env)
-        det_progress = RolloutProgress(
-            label=f"diag-det seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
-            target_requests=det_target_requests,
-            interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
-            episode_minutes=env.config.episode_minutes,
-            rollout_unit=rollout_unit,
-            deployment_interval_minutes=env.config.deployment_interval_minutes,
-        )
-        det_stop_time_minute = None
-        if rollout_unit == "window":
-            det_stop_time_minute = min(
-                env.current_time_minute + float(env.config.deployment_interval_minutes),
-                float(env.config.episode_minutes),
-            )
-        while _rollout_active(
-            env,
-            max_requests=max_requests,
-            rollout_unit=rollout_unit,
-            stop_time_minute=det_stop_time_minute,
-        ):
-            requests = list(env.current_requests)
-            if train_mode == "fast-only":
-                if env.needs_deployment_update:
-                    env.apply_deployment(slow_policy.act(env))
-            else:
-                agent.maybe_update_deployment(env, deterministic=True, record=False)
-            actions: list[list[int]] = []
-            diagnostics_by_group: list[list[dict[str, float | int]]] = []
-            for request in requests:
-                action, stage_stats = agent.fast_agent.schedule_with_diagnostics(env, request)
-                actions.append(action)
-                diagnostics_by_group.append(stage_stats)
-            _, _, _, batch_info = env.step(actions)
-            for request, action, stage_stats, info in zip(
-                requests,
-                actions,
-                diagnostics_by_group,
-                batch_info["group_infos"],
-            ):
-                deterministic_latencies.append(float(info["latency_s"]))
-                deterministic_latency_weights.append(float(request.request_count))
-                deterministic_actions.extend(action)
-                entropies.extend(float(s["entropy"]) for s in stage_stats)
-                top1_probs.extend(float(s["top1_prob"]) for s in stage_stats)
-                top1_margins.extend(float(s["top1_margin"]) for s in stage_stats)
-            det_progress.maybe_print(env)
-        det_progress.finish(env)
-
-        stochastic_env = build_env(args, seed_offset=seed_base + seed_idx)
-        stochastic_reset_env = True
-        if rollout_unit == "window":
-            stochastic_env.reset()
-            start_env_at_minute(stochastic_env, rollout_start_minute(args, seed_idx, eval_mode=True))
-            stochastic_reset_env = False
-        stochastic_stats = rollout(
-            stochastic_env,
-            agent,
-            max_requests,
-            args=args,
-            deterministic=False,
-            record=False,
-            train_mode=train_mode,
-            progress_label=f"diag-sto seed={seed_idx + 1:02d}/{args.eval_seeds:02d}",
-            progress_interval_seconds=getattr(args, "progress_interval_seconds", 0.0),
-            rollout_unit=rollout_unit,
-            reset_env=stochastic_reset_env,
-        )
-        stochastic_latencies.append(stochastic_stats["avg_latency_s"])
-
-    action_change_rate = float("nan")
-    if previous_actions is not None:
-        common = min(len(previous_actions), len(deterministic_actions))
-        if common > 0:
-            action_change_rate = float(
-                np.mean(np.asarray(previous_actions[:common]) != np.asarray(deterministic_actions[:common]))
-            )
-
-    diagnostics = {
-        "eval_policy_entropy": float(np.mean(entropies)) if entropies else float("nan"),
-        "eval_top1_prob": float(np.mean(top1_probs)) if top1_probs else float("nan"),
-        "eval_top1_margin": float(np.mean(top1_margins)) if top1_margins else float("nan"),
-        "eval_action_change_rate": action_change_rate,
-        "eval_stochastic_avg_latency_s": float(np.mean(stochastic_latencies)) if stochastic_latencies else float("nan"),
-        "eval_deterministic_avg_latency_s": (
-            float(np.average(deterministic_latencies, weights=deterministic_latency_weights))
-            if deterministic_latencies
-            else float("nan")
-        ),
-    }
-    return diagnostics, deterministic_actions
 
 
 def rollout_baseline(env: EdgeComputingEnv, max_requests: int) -> dict[str, float]:
