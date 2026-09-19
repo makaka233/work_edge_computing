@@ -14,6 +14,7 @@ import scipy
 import torch
 
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
+from edge_drl.comparison.algorithmic import AlgorithmicScheme, HybridScheme
 from edge_drl.comparison.io import write_csv, write_json
 from edge_drl.comparison.metrics import evaluate_scheme_episode
 from edge_drl.comparison.monolithic import MonolithicScheme
@@ -26,7 +27,7 @@ from edge_drl.comparison.types import ExperimentPoint
 from edge_drl.env.environment import EdgeComputingEnv
 
 
-FORMAL_SCHEMES = ("Proposed", "Monolithic")
+FORMAL_SCHEMES = ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
 FORMAL_SCENARIO_FAMILIES = (
     "request_load",
     "compute_capacity",
@@ -86,7 +87,7 @@ def run_comparison(
     sampled_seconds_per_window: int = 0,
 ) -> Path:
     if phase == 3:
-        _require_phase2_validation(phase2_validation_run)
+        _require_phase2_validation(phase2_validation_run, schemes=schemes)
     if "Monolithic" in schemes and monolithic_checkpoint is None:
         raise ValueError(
             "Monolithic is trainable and requires --monolithic-checkpoint; "
@@ -109,12 +110,18 @@ def run_comparison(
     unknown = sorted(set(schemes) - set(FORMAL_SCHEMES))
     if unknown:
         raise ValueError(f"formal comparison does not include schemes: {unknown}")
+    if len(set(schemes)) != len(schemes):
+        raise ValueError("comparison schemes must not be repeated")
     episode_minutes, eval_seeds, points, routing_repeats, is_standard_design = configured_phase_design(
         phase,
         eval_seeds_override=eval_seeds_override,
         scenario_families=scenario_families,
     )
-    is_standard_design = is_standard_design and sampled_seconds_per_window == 0
+    is_standard_design = (
+        is_standard_design
+        and sampled_seconds_per_window == 0
+        and tuple(schemes) == FORMAL_SCHEMES
+    )
     deployment_window_seconds = float(
         checkpoint_args.get("deployment_interval_minutes", 10) * 60
     )
@@ -177,6 +184,8 @@ def run_comparison(
         },
         "labels": {
             "Monolithic": "separately trained dual-scale PPO with one aggregated stage per service",
+            "Hybrid": "frozen Proposed Slow PPO with causal KKT marginal-cost path scheduling",
+            "Algorithmic": "demand-aware binary MILP placement with marginal replicas and the same path scheduling",
         },
     }
     write_json(output / "metadata.json", metadata)
@@ -315,12 +324,15 @@ def run_comparison(
                 "phase": 2,
                 "completed_rows": len(raw_rows),
                 "expected_rows": len(points) * len(eval_seeds) * len(schemes),
+                "schemes": list(schemes),
             },
         )
     return output
 
 
-def _require_phase2_validation(run: str | Path | None) -> None:
+def _require_phase2_validation(
+    run: str | Path | None, *, schemes: tuple[str, ...] = FORMAL_SCHEMES
+) -> None:
     if run is None:
         raise ValueError("Phase 3 requires --phase2-validation-run from a successful complete Phase 2 run")
     marker = Path(run) / "diagnostics" / "phase2_validated.json"
@@ -328,7 +340,11 @@ def _require_phase2_validation(run: str | Path | None) -> None:
         raise ValueError(f"Phase 2 validation marker not found: {marker}")
     with marker.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    if payload.get("validated") is not True or payload.get("phase") != 2:
+    if (
+        payload.get("validated") is not True
+        or payload.get("phase") != 2
+        or payload.get("schemes") != list(schemes)
+    ):
         raise ValueError(f"invalid Phase 2 validation marker: {marker}")
 
 
@@ -345,6 +361,10 @@ def _make_scheme(
 ):
     if name == "Proposed":
         return ProposedScheme(env, checkpoint_path, checkpoint_args, device=device)
+    if name == "Hybrid":
+        return HybridScheme(env, checkpoint_path, checkpoint_args, device=device)
+    if name == "Algorithmic":
+        return AlgorithmicScheme()
     if name == "Monolithic":
         assert monolithic_checkpoint is not None
         assert point is not None

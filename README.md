@@ -58,16 +58,17 @@ Current entrypoints are `train_dual_ppo.py`, `train_monolithic.py`, and
 `analyze_convergence.py` (update summaries), `plot_training_run.py` (update
 diagnostics), `plot_rollout_training.py` (rollout curves),
 `plot_proposed_monolithic_results.py` (episode and two-scheme curves), and
-`plot_comparison.py` (two-scheme scenario plots).
+`plot_comparison.py` (four-scheme scenario plots).
 
 Historical staged-training launchers and obsolete experiment plans were
 removed; they remain recoverable from Git tag
 `backup-before-comparison-redesign-20260904`. Training outputs, checkpoints,
 paper sources, and checkpoint compatibility code are retained.
 
-Only Proposed and separately trained Monolithic are currently supported by the
-comparison runner. Other comparison implementations have been removed pending
-redesign; archived experiment outputs are retained.
+The comparison runner supports Proposed, separately trained Monolithic, a
+hybrid using Proposed Slow deployment with algorithmic request scheduling, and
+a fully algorithmic deployment and scheduling scheme. The last two share the
+same batch-aware serial path scheduler. Archived experiment outputs are retained.
 
 - `edge_drl/env/scenario.py`: realistic synthetic MEC scenario generator.
 - `edge_drl/env/environment.py`: event-driven environment and action masks.
@@ -79,11 +80,10 @@ redesign; archived experiment outputs are retained.
 - `tests/test_env_smoke.py`: KKT and environment smoke tests.
 - `tests/test_dual_ppo_smoke.py`: dual-agent PPO rollout/update tests.
 
-The formal five-sweep, two-scheme IEEE evaluation protocol is recorded in
-`docs/IEEE_COMPARISON.md`. Its supported labels are Proposed and Monolithic
-(separately trained one-stage-per-service PPO).
-Greedy is restricted to smoke sanity checks and component ablations stay outside
-the main comparison.
+The five-sweep, four-scheme evaluation protocol is recorded in
+`docs/IEEE_COMPARISON.md`. The Hybrid comparison is explicitly a component
+substitution and must be interpreted as such. The older Greedy sanity check is
+outside the main comparison.
 
 ## Run
 

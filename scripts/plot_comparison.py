@@ -8,13 +8,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-SCHEME_ORDER = ("Proposed", "Monolithic")
+SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
 COLORS = {
     "Proposed": "#0072B2",
     "Monolithic": "#D55E00",
+    "Hybrid": "#009E73",
+    "Algorithmic": "#CC79A7",
 }
-LINE_STYLES = {"Proposed": "-", "Monolithic": "--"}
-MARKERS = {"Proposed": "o", "Monolithic": "s"}
+LINE_STYLES = {"Proposed": "-", "Monolithic": "--", "Hybrid": "-.", "Algorithmic": ":"}
+MARKERS = {"Proposed": "o", "Monolithic": "s", "Hybrid": "^", "Algorithmic": "D"}
 FAMILY_ORDER = (
     "request_load",
     "compute_capacity",
@@ -121,7 +123,7 @@ def plot_run(run_dir: Path) -> list[Path]:
             rows,
             metric="mean_latency_ms",
             ylabel="Mean latency (ms, log scale)",
-            title="Mean latency across five edge-computing scenarios (seed 2026)",
+            title="Mean latency across five edge-computing scenarios",
             output_stem=plot_dir / "five_scenario_mean_latency_all_schemes",
         )
     )
@@ -130,7 +132,7 @@ def plot_run(run_dir: Path) -> list[Path]:
             rows,
             metric="p95_latency_ms",
             ylabel="P95 latency (ms, log scale)",
-            title="P95 latency across five edge-computing scenarios (seed 2026)",
+            title="P95 latency across five edge-computing scenarios",
             output_stem=plot_dir / "five_scenario_p95_latency_all_schemes",
         )
     )
@@ -155,7 +157,7 @@ def plot_run(run_dir: Path) -> list[Path]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot formal two-scheme comparison results")
+    parser = argparse.ArgumentParser(description="Plot formal four-scheme comparison results")
     parser.add_argument("run_dir", type=Path)
     args = parser.parse_args()
     for path in plot_run(args.run_dir):

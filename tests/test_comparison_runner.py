@@ -102,8 +102,13 @@ def test_phase3_requires_a_successful_phase2_marker(tmp_path) -> None:
     with pytest.raises(ValueError):
         _require_phase2_validation(None)
     run = tmp_path / "phase2"
-    write_json(run / "diagnostics" / "phase2_validated.json", {"validated": True, "phase": 2})
+    write_json(
+        run / "diagnostics" / "phase2_validated.json",
+        {"validated": True, "phase": 2, "schemes": list(FORMAL_SCHEMES)},
+    )
     _require_phase2_validation(run)
+    with pytest.raises(ValueError):
+        _require_phase2_validation(run, schemes=("Proposed", "Monolithic"))
 
 
 def test_single_seed_phase2_keeps_all_five_scenario_sweeps_but_is_not_formal_validation() -> None:
@@ -169,8 +174,8 @@ def test_exploratory_per_point_checkpoint_resolution_remains_available(tmp_path)
     assert _resolve_monolithic_checkpoint(tmp_path, point, mode="per-point") == checkpoint
 
 
-def test_comparison_registry_contains_only_learning_schemes() -> None:
-    assert FORMAL_SCHEMES == ("Proposed", "Monolithic")
+def test_comparison_registry_contains_four_distinct_schemes() -> None:
+    assert FORMAL_SCHEMES == ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
 
 
 def test_phase3_has_no_baseline_specific_routing_repeats() -> None:
