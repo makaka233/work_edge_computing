@@ -62,8 +62,25 @@ inter-stage outputs are zero, and the aggregate Fast decision is projected to
 the same node for every original stage. Thus the only structural difference is
 the stage aggregation, not the trace, resource accounting, or simulator.
 
-Greedy remains available only as a development sanity check and is never added
-to formal plots or the main result tables.
+The older training-side Greedy helper remains a development sanity check. A
+separate optional `GreedyFast` scheme uses the frozen Proposed Slow checkpoint
+and substitutes a deterministic stage-wise Fast rule. At each stage it picks
+the reachable deployed node with the lowest immediate estimated compute plus
+incoming-transfer delay. The estimate uses current node/link load and the
+linear work/data already assigned to that causal phase in the current batch.
+It checks future-stage reachability but does not optimize their delay, solve a
+whole-chain dynamic program, or use the KKT marginal-cost formula employed by
+Hybrid and Algorithmic. Actual latency still comes from the common simulator.
+This is an exploratory comparator, not part of the frozen default four-scheme
+formal protocol or its Phase 2 validation marker.
+
+To compare it against Proposed without changing the formal scheme registry:
+
+```powershell
+$runId = "greedy_fast_probe_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+python .\run_comparison.py --checkpoint ".\runs\global_incremental_cf_s6_u180_20260903_192623\checkpoints\best.pt" --schemes Proposed GreedyFast --phase 1 --sampled-seconds-per-window 6 --device cuda --run-id $runId
+```
 
 Every evaluation point and seed first creates a complete immutable one-second
 request trace. Each scheme receives the identical trace and an independent copy

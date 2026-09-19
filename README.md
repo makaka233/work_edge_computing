@@ -83,7 +83,9 @@ same batch-aware serial path scheduler. Archived experiment outputs are retained
 The five-sweep, four-scheme evaluation protocol is recorded in
 `docs/IEEE_COMPARISON.md`. The Hybrid comparison is explicitly a component
 substitution and must be interpreted as such. The older Greedy sanity check is
-outside the main comparison.
+outside the main comparison. An optional `GreedyFast` comparison reuses the
+frozen Proposed Slow policy with a separate stage-wise greedy scheduler; it
+does not alter the default four-scheme protocol.
 
 ## Run
 

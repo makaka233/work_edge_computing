@@ -8,15 +8,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
+SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic", "GreedyFast")
 COLORS = {
     "Proposed": "#0072B2",
     "Monolithic": "#D55E00",
     "Hybrid": "#009E73",
     "Algorithmic": "#CC79A7",
+    "GreedyFast": "#E69F00",
 }
-LINE_STYLES = {"Proposed": "-", "Monolithic": "--", "Hybrid": "-.", "Algorithmic": ":"}
-MARKERS = {"Proposed": "o", "Monolithic": "s", "Hybrid": "^", "Algorithmic": "D"}
+LINE_STYLES = {"Proposed": "-", "Monolithic": "--", "Hybrid": "-.", "Algorithmic": ":", "GreedyFast": "--"}
+MARKERS = {"Proposed": "o", "Monolithic": "s", "Hybrid": "^", "Algorithmic": "D", "GreedyFast": "v"}
 FAMILY_ORDER = (
     "request_load",
     "compute_capacity",

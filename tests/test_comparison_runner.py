@@ -8,6 +8,7 @@ from edge_drl.comparison.scheme import BaseComparisonScheme
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
 from edge_drl.comparison.types import ExperimentPoint
 from edge_drl.comparison.runner import (
+    AVAILABLE_SCHEMES,
     _require_phase2_validation,
     _resolve_monolithic_checkpoint,
     configured_phase_design,
@@ -176,6 +177,7 @@ def test_exploratory_per_point_checkpoint_resolution_remains_available(tmp_path)
 
 def test_comparison_registry_contains_four_distinct_schemes() -> None:
     assert FORMAL_SCHEMES == ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
+    assert AVAILABLE_SCHEMES == FORMAL_SCHEMES + ("GreedyFast",)
 
 
 def test_phase3_has_no_baseline_specific_routing_repeats() -> None:

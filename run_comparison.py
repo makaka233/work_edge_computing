@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from edge_drl.comparison.runner import FORMAL_SCENARIO_FAMILIES, FORMAL_SCHEMES, run_comparison
+from edge_drl.comparison.runner import AVAILABLE_SCHEMES, FORMAL_SCENARIO_FAMILIES, FORMAL_SCHEMES, run_comparison
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Required for Phase 3; path to a successfully completed Phase 2 result directory",
     )
-    parser.add_argument("--schemes", nargs="+", choices=FORMAL_SCHEMES, default=list(FORMAL_SCHEMES))
+    parser.add_argument("--schemes", nargs="+", choices=AVAILABLE_SCHEMES, default=list(FORMAL_SCHEMES))
     parser.add_argument(
         "--eval-seeds",
         nargs="+",

@@ -15,6 +15,7 @@ import torch
 
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
 from edge_drl.comparison.algorithmic import AlgorithmicScheme, HybridScheme
+from edge_drl.comparison.greedy_fast import GreedyFastScheme
 from edge_drl.comparison.io import write_csv, write_json
 from edge_drl.comparison.metrics import evaluate_scheme_episode
 from edge_drl.comparison.monolithic import MonolithicScheme
@@ -28,6 +29,7 @@ from edge_drl.env.environment import EdgeComputingEnv
 
 
 FORMAL_SCHEMES = ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
+AVAILABLE_SCHEMES = FORMAL_SCHEMES + ("GreedyFast",)
 FORMAL_SCENARIO_FAMILIES = (
     "request_load",
     "compute_capacity",
@@ -107,7 +109,7 @@ def run_comparison(
             "to name one checkpoint file"
         )
     checkpoint_path, checkpoint_args, checkpoint_internal = load_checkpoint_configuration(checkpoint)
-    unknown = sorted(set(schemes) - set(FORMAL_SCHEMES))
+    unknown = sorted(set(schemes) - set(AVAILABLE_SCHEMES))
     if unknown:
         raise ValueError(f"formal comparison does not include schemes: {unknown}")
     if len(set(schemes)) != len(schemes):
@@ -186,6 +188,7 @@ def run_comparison(
             "Monolithic": "separately trained dual-scale PPO with one aggregated stage per service",
             "Hybrid": "frozen Proposed Slow PPO with causal KKT marginal-cost path scheduling",
             "Algorithmic": "demand-aware binary MILP placement with marginal replicas and the same path scheduling",
+            "GreedyFast": "frozen Proposed Slow PPO with myopic batch-aware greedy stage scheduling",
         },
     }
     write_json(output / "metadata.json", metadata)
@@ -363,6 +366,8 @@ def _make_scheme(
         return ProposedScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name == "Hybrid":
         return HybridScheme(env, checkpoint_path, checkpoint_args, device=device)
+    if name == "GreedyFast":
+        return GreedyFastScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name == "Algorithmic":
         return AlgorithmicScheme()
     if name == "Monolithic":
