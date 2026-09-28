@@ -6,7 +6,12 @@ from itertools import product
 import numpy as np
 import torch
 
-from edge_drl.agents.drl import FastSchedulingPPOAgent, HierarchicalPPOAgent, fast_structured_obs_dim
+from edge_drl.agents.drl import (
+    FastSchedulingPPOAgent,
+    HierarchicalPPOAgent,
+    fast_kkt_autoregressive_obs_dim,
+    fast_structured_obs_dim,
+)
 from edge_drl.comparison.checkpoint import build_proposed_agent
 from edge_drl.models.ppo import StructuredPathDistribution
 from tests.comparison_helpers import tiny_replay_env
@@ -238,3 +243,65 @@ def test_comparison_loader_reconstructs_structured_policy(tmp_path) -> None:
     )
     assert loaded.fast_agent.policy_kind == "structured_path"
     assert len(loaded.fast_agent.schedule(env, request, deterministic=True, record=False)) == 2
+
+
+def test_kkt_autoregressive_credit_telescopes_to_authoritative_batch_cost() -> None:
+    env, original = _env_and_request()
+    request = replace(original, request_count=2)
+    other = replace(
+        original,
+        request_id=original.request_id + 10_000,
+        request_count=3,
+        home_node=(original.home_node + 1) % 6,
+        input_mb=1.5 * original.input_mb,
+    )
+    env.current_requests = [request, other]
+    agent = FastSchedulingPPOAgent(
+        num_nodes=6,
+        max_service_stages=3,
+        policy_kind="kkt_autoregressive_path",
+        k_epochs=1,
+    )
+
+    schedules = agent.schedule_batch(env, [request, other], deterministic=True, record=True)
+    assert len(schedules) == len(agent.ppo.buffer) == 2
+    assert agent.ppo.gamma == 1.0
+    assert agent.ppo.buffer.states[0].shape == (fast_kkt_autoregressive_obs_dim(6, 3),)
+    assert not np.array_equal(agent.ppo.buffer.states[0], agent.ppo.buffer.states[1])
+    infos = env.evaluate_batch_schedules([request, other], schedules)
+    assert all(info["valid"] for info in infos)
+
+    assert agent.finalize_kkt_autoregressive_batch_credit(infos, reward_scale=10.0)
+    expected_mean = sum(
+        current.request_count
+        * (
+            info["compute_delay_s"]
+            + info["link_delay_s"]
+            + info["propagation_delay_s"]
+            + info["penalty_latency_s"]
+        )
+        for current, info in zip([request, other], infos)
+    ) / sum(current.request_count for current in [request, other])
+    assert np.isclose(-sum(agent.ppo.buffer.rewards) / 10.0, expected_mean, rtol=1e-7, atol=1e-9)
+    assert agent.ppo.buffer.dones == [False, True]
+    assert agent.ppo.buffer.weights == [1.0, 1.0]
+    assert abs(agent.last_kkt_credit_diagnostics["fast_kkt_terminal_correction_s"]) < 1e-8
+
+
+def test_kkt_autoregressive_policy_updates_with_one_second_subtrajectory() -> None:
+    env, request = _env_and_request()
+    env.current_requests = [request, request]
+    agent = FastSchedulingPPOAgent(
+        num_nodes=6,
+        max_service_stages=3,
+        policy_kind="kkt_autoregressive_path",
+        k_epochs=1,
+        minibatch_size=8,
+    )
+    schedules = agent.schedule_batch(env, [request, request], deterministic=False, record=True)
+    infos = env.evaluate_batch_schedules([request, request], schedules)
+    agent.finalize_kkt_autoregressive_batch_credit(infos, reward_scale=10.0)
+    metrics = agent.update()
+    assert np.isfinite(metrics["loss"])
+    assert np.isfinite(metrics["value_loss"])
+    assert len(agent.ppo.buffer) == 0

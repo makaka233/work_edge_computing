@@ -92,6 +92,9 @@ FAST_PATH_STAGE_FEATURE_DIM = 5
 FAST_PATH_SUMMARY_DIM = 6
 FAST_STRUCT_NODE_FEATURE_DIM = 9
 FAST_STRUCT_EDGE_FEATURE_DIM = 5
+FAST_KKT_GLOBAL_DIM = 18
+FAST_KKT_NODE_FEATURE_DIM = 11
+FAST_KKT_EDGE_FEATURE_DIM = 9
 
 
 def fast_path_feature_dim(max_service_stages: int) -> int:
@@ -107,6 +110,14 @@ def fast_structured_obs_dim(num_nodes: int, max_service_stages: int) -> int:
         FAST_PATH_GLOBAL_DIM
         + max_service_stages * num_nodes * FAST_STRUCT_NODE_FEATURE_DIM
         + (max_service_stages - 1) * num_nodes * num_nodes * FAST_STRUCT_EDGE_FEATURE_DIM
+    )
+
+
+def fast_kkt_autoregressive_obs_dim(num_nodes: int, max_service_stages: int) -> int:
+    return (
+        FAST_KKT_GLOBAL_DIM
+        + max_service_stages * num_nodes * FAST_KKT_NODE_FEATURE_DIM
+        + (max_service_stages - 1) * num_nodes * num_nodes * FAST_KKT_EDGE_FEATURE_DIM
     )
 
 
@@ -1594,6 +1605,10 @@ class FastSchedulingPPOAgent:
     _phase_link_sqrt_cache_key: tuple[object, ...] | None = field(default=None, init=False, repr=False)
     _phase_link_sqrt_cache: np.ndarray | None = field(default=None, init=False, repr=False)
     _phase_link_sqrt_by_request: dict[int, np.ndarray] = field(default_factory=dict, init=False, repr=False)
+    _pending_kkt_batch_credits: list[float] = field(default_factory=list, init=False, repr=False)
+    _pending_kkt_batch_counts: list[float] = field(default_factory=list, init=False, repr=False)
+    _pending_kkt_batch_recorded: bool = field(default=False, init=False, repr=False)
+    last_kkt_credit_diagnostics: dict[str, float] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         if self.reservation_microbatch_size < 1:
@@ -1610,7 +1625,11 @@ class FastSchedulingPPOAgent:
             raise ValueError("entropy_adaptation_rate must be non-negative")
         path_mode = self.policy_kind == "path_scorer"
         structured_mode = self.policy_kind == "structured_path"
-        if structured_mode:
+        kkt_autoregressive_mode = self.policy_kind == "kkt_autoregressive_path"
+        if kkt_autoregressive_mode:
+            global_dim = FAST_KKT_GLOBAL_DIM
+            node_feature_dim = FAST_KKT_NODE_FEATURE_DIM
+        elif structured_mode:
             global_dim = FAST_PATH_GLOBAL_DIM
             node_feature_dim = FAST_STRUCT_NODE_FEATURE_DIM
         elif path_mode:
@@ -1623,17 +1642,20 @@ class FastSchedulingPPOAgent:
             obs_dim=(
                 fast_path_obs_dim(self.max_service_stages, self.path_candidate_limit)
                 if path_mode
+                else fast_kkt_autoregressive_obs_dim(self.num_nodes, self.max_service_stages)
+                if kkt_autoregressive_mode
                 else fast_structured_obs_dim(self.num_nodes, self.max_service_stages)
                 if structured_mode
                 else fast_obs_dim(self.num_nodes, self.policy_kind, self.chain_context)
             ),
             action_dim=(
                 self.path_candidate_limit if path_mode else self.num_nodes ** self.max_service_stages
-                if structured_mode else self.num_nodes
+                if structured_mode or kkt_autoregressive_mode else self.num_nodes
             ),
             hidden_dim=128,
             lr=self.lr,
-            gamma=0.99,
+            gamma=1.0 if kkt_autoregressive_mode else 0.99,
+            gae_lambda=1.0 if kkt_autoregressive_mode else 0.95,
             k_epochs=self.k_epochs,
             entropy_coef=self.entropy_current_coef,
             value_coef=self.value_coef,
@@ -1643,8 +1665,14 @@ class FastSchedulingPPOAgent:
             global_dim=global_dim,
             node_feature_dim=node_feature_dim,
             candidate_cost_feature_index=3 if path_mode else None,
-            edge_feature_dim=FAST_STRUCT_EDGE_FEATURE_DIM if structured_mode else FAST_EDGE_FEATURE_DIM,
-            max_service_stages=self.max_service_stages if structured_mode else None,
+            edge_feature_dim=(
+                FAST_KKT_EDGE_FEATURE_DIM
+                if kkt_autoregressive_mode
+                else FAST_STRUCT_EDGE_FEATURE_DIM
+                if structured_mode
+                else FAST_EDGE_FEATURE_DIM
+            ),
+            max_service_stages=self.max_service_stages if structured_mode or kkt_autoregressive_mode else None,
             num_nodes=self.path_candidate_limit if path_mode else self.num_nodes,
             group_balanced_updates=self.load_balanced_updates,
             group_weight_targets=self.load_group_weights,
@@ -1676,6 +1704,29 @@ class FastSchedulingPPOAgent:
         env._require_ready()
         if not requests:
             return []
+        if self.policy_kind == "kkt_autoregressive_path":
+            return self._schedule_kkt_autoregressive_batch(
+                env,
+                requests,
+                deterministic=deterministic,
+                record=record,
+            )
+        if self.policy_kind == "kkt_autoregressive_path":
+            _, _, incidence, _ = self._structured_route_metrics(env)
+            state, mask = self._kkt_autoregressive_path_state(
+                env,
+                request,
+                remaining_requests=[request],
+                batch_size=1,
+                decision_index=0,
+                compute_sqrt_ledger=np.zeros((self.max_service_stages, self.num_nodes), dtype=np.float64),
+                link_sqrt_ledger=np.zeros(
+                    (2 * self.max_service_stages - 1, incidence.shape[-1]), dtype=np.float64
+                ),
+            )
+            stats = self.ppo.action_stats(state, mask)
+            return self._decode_structured_path(int(stats["action"]), len(request.stage_compute_gcycles)), [stats]
+
         if self.policy_kind == "structured_path":
             return self._schedule_structured_batch(env, requests, deterministic=deterministic, record=record)
         if self.policy_kind == "path_scorer":
@@ -2016,6 +2067,393 @@ class FastSchedulingPPOAgent:
 
     def _decode_structured_path(self, action: int, stage_count: int) -> list[int]:
         return [int(action // (self.num_nodes ** stage_id) % self.num_nodes) for stage_id in range(stage_count)]
+
+    def _kkt_route_features(
+        self,
+        env: EdgeComputingEnv,
+        *,
+        phase: int,
+        data_mb: float,
+        multiplicity: float,
+        link_sqrt_ledger: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return exact causal KKT route costs before the current group is reserved."""
+
+        transfer_per_mb, propagation, incidence, effective_capacity = self._structured_route_metrics(env)
+        reachable = np.isfinite(transfer_per_mb)
+        if data_mb <= 0.0:
+            zeros = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float64)
+            return zeros, zeros, zeros, zeros, zeros, zeros
+        count = max(float(multiplicity), 1e-9)
+        sqrt_data = np.sqrt(float(data_mb))
+        own_weight = count * sqrt_data
+        ledger = np.maximum(link_sqrt_ledger[phase], 0.0)
+        capacity = np.maximum(effective_capacity, 1e-9)
+        flat_incidence = incidence.reshape(-1, incidence.shape[-1])
+        own_delay = (flat_incidence @ (sqrt_data * (ledger + own_weight) / capacity)).reshape(
+            self.num_nodes, self.num_nodes
+        )
+        marginal_mean = (
+            flat_incidence @ ((2.0 * ledger * own_weight + own_weight**2) / (capacity * count))
+        ).reshape(self.num_nodes, self.num_nodes)
+        ledger_pressure = (flat_incidence @ (ledger / capacity)).reshape(self.num_nodes, self.num_nodes)
+        hop_count = flat_incidence.sum(axis=1).reshape(self.num_nodes, self.num_nodes)
+        mean_effective_capacity = (
+            (flat_incidence @ effective_capacity).reshape(self.num_nodes, self.num_nodes)
+            / np.maximum(hop_count, 1.0)
+        )
+        assert env.scenario is not None
+        physical = np.isfinite(env.scenario.bandwidth_mb_s) & (env.scenario.bandwidth_mb_s > 0.0)
+        np.fill_diagonal(physical, False)
+        physical_links = np.argwhere(physical)
+        raw_link_capacity = env.scenario.bandwidth_mb_s[physical_links[:, 0], physical_links[:, 1]]
+        link_background = env.link_load[physical_links[:, 0], physical_links[:, 1]]
+        mean_raw_capacity = (
+            (flat_incidence @ raw_link_capacity).reshape(self.num_nodes, self.num_nodes)
+            / np.maximum(hop_count, 1.0)
+        )
+        mean_background_load = (
+            (flat_incidence @ link_background).reshape(self.num_nodes, self.num_nodes)
+            / np.maximum(hop_count, 1.0)
+        )
+        own_delay = np.where(reachable, own_delay, np.inf)
+        marginal_mean = np.where(reachable, marginal_mean, np.inf)
+        return (
+            own_delay,
+            marginal_mean,
+            ledger_pressure,
+            mean_raw_capacity,
+            mean_effective_capacity,
+            mean_background_load,
+        )
+
+    def _kkt_autoregressive_path_state(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        *,
+        remaining_requests: list[TaskRequest],
+        batch_size: int,
+        decision_index: int,
+        compute_sqrt_ledger: np.ndarray,
+        link_sqrt_ledger: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build a full-path state from only already committed batch decisions."""
+
+        env._require_ready()
+        assert env.scenario is not None and env.deployment is not None
+        stages = self.max_service_stages
+        stage_count = len(request.stage_compute_gcycles)
+        count = max(float(request.request_count), 1e-9)
+        capacities = np.asarray([node.compute_gcycles_per_s for node in env.scenario.nodes], dtype=np.float64)
+        effective_compute = capacities * np.maximum(1.0 - 0.75 * env.node_compute_load, 0.10)
+        max_capacity = max(float(capacities.max()), 1e-9)
+        node_features = np.zeros((stages, self.num_nodes, FAST_KKT_NODE_FEATURE_DIM), dtype=np.float32)
+        edge_features = np.zeros(
+            (stages - 1, self.num_nodes, self.num_nodes, FAST_KKT_EDGE_FEATURE_DIM), dtype=np.float32
+        )
+        node_mask = np.zeros((stages, self.num_nodes), dtype=bool)
+        ingress = self._kkt_route_features(
+            env,
+            phase=0,
+            data_mb=float(request.input_mb),
+            multiplicity=count,
+            link_sqrt_ledger=link_sqrt_ledger,
+        )
+        _, ingress_marginal, _, _, _, _ = ingress
+        _, propagation, _, _ = self._structured_route_metrics(env)
+        for stage_id, compute_raw in enumerate(request.stage_compute_gcycles):
+            deployed = np.flatnonzero(env.deployment[request.service_id, stage_id])
+            compute = max(float(compute_raw), 0.0)
+            sqrt_compute = np.sqrt(compute)
+            own_weight = count * sqrt_compute
+            for node_id in deployed:
+                capacity = max(float(effective_compute[node_id]), 1e-9)
+                ledger = max(float(compute_sqrt_ledger[stage_id, node_id]), 0.0)
+                own_isolated = compute / capacity
+                own_delay = sqrt_compute * (ledger + own_weight) / capacity
+                marginal_mean = (2.0 * ledger * own_weight + own_weight**2) / (capacity * count)
+                externality = sqrt_compute * ledger / capacity
+                ingress_cost = 0.0
+                if stage_id == 0:
+                    if not np.isfinite(ingress_marginal[request.home_node, node_id]):
+                        continue
+                    ingress_cost = float(
+                        ingress_marginal[request.home_node, node_id]
+                        + propagation[request.home_node, node_id]
+                    )
+                node_mask[stage_id, node_id] = True
+                node_features[stage_id, node_id] = [
+                    node_id / max(self.num_nodes - 1, 1),
+                    stage_id / max(stages - 1, 1),
+                    capacities[node_id] / max_capacity,
+                    float(env.node_compute_load[node_id]),
+                    effective_compute[node_id] / max_capacity,
+                    float(np.log1p(ledger / capacity)),
+                    float(np.log1p(own_isolated)),
+                    float(np.log1p(own_delay)),
+                    float(np.log1p(marginal_mean)),
+                    float(np.log1p(externality)),
+                    float(np.log1p(ingress_cost)),
+                ]
+
+        transfer_per_mb, propagation, _, _ = self._structured_route_metrics(env)
+        reachable = np.isfinite(transfer_per_mb)
+        finite_raw_bandwidth = env.scenario.bandwidth_mb_s[
+            np.isfinite(env.scenario.bandwidth_mb_s) & (env.scenario.bandwidth_mb_s > 0.0)
+        ]
+        max_link_capacity = max(
+            float(finite_raw_bandwidth.max()) if finite_raw_bandwidth.size else 1.0,
+            1e-9,
+        )
+        for stage_id in range(stage_count - 1):
+            own_delay, marginal, pressure, raw_capacity, effective_capacity, background = self._kkt_route_features(
+                env,
+                phase=2 * stage_id + 2,
+                data_mb=float(request.stage_output_mb[stage_id]),
+                multiplicity=count,
+                link_sqrt_ledger=link_sqrt_ledger,
+            )
+            total_own = own_delay + np.where(reachable, propagation, 0.0)
+            total_marginal = marginal + np.where(reachable, propagation, 0.0)
+            edge_features[stage_id, ..., 0] = reachable
+            edge_features[stage_id, ..., 1] = np.log1p(np.where(reachable, total_own, 0.0))
+            edge_features[stage_id, ..., 2] = np.log1p(np.where(reachable, total_marginal, 0.0))
+            edge_features[stage_id, ..., 3] = np.log1p(np.where(reachable, pressure, 0.0))
+            edge_features[stage_id, ..., 4] = np.where(reachable, raw_capacity / max_link_capacity, 0.0)
+            edge_features[stage_id, ..., 5] = np.where(reachable, effective_capacity / max_link_capacity, 0.0)
+            edge_features[stage_id, ..., 6] = np.where(reachable, background, 0.0)
+            edge_features[stage_id, ..., 7] = np.where(reachable, np.log1p(propagation), 0.0)
+            edge_features[stage_id, ..., 8] = np.eye(self.num_nodes, dtype=np.float32)
+
+        possible = node_mask[0].copy()
+        for stage_id in range(1, stage_count):
+            possible = node_mask[stage_id] & (
+                (possible[:, None] & (edge_features[stage_id - 1, ..., 0] > 0.5)).any(axis=0)
+            )
+        if not possible.any():
+            node_mask[:stage_count] = False
+            node_mask[:stage_count, request.home_node] = True
+            for stage_id in range(stage_count - 1):
+                edge_features[stage_id] = 0.0
+                edge_features[stage_id, request.home_node, request.home_node, 0] = 1.0
+                edge_features[stage_id, request.home_node, request.home_node, 8] = 1.0
+        for stage_id in range(stage_count, stages):
+            node_mask[stage_id, 0] = True
+            edge_features[stage_id - 1, :, 0, 0] = 1.0
+
+        remaining_count = float(sum(item.request_count for item in remaining_requests))
+        remaining_compute = np.asarray(
+            [sum(item.stage_compute_gcycles) for item in remaining_requests], dtype=np.float64
+        )
+        remaining_input = np.asarray([item.input_mb for item in remaining_requests], dtype=np.float64)
+        remaining_output = np.asarray(
+            [sum(item.stage_output_mb) for item in remaining_requests], dtype=np.float64
+        )
+        remaining_deadline = np.asarray([item.deadline_s for item in remaining_requests], dtype=np.float64)
+        service_diversity = len({item.service_id for item in remaining_requests})
+        global_features = np.asarray(
+            [
+                request.service_id / max(env.config.num_service_types - 1, 1),
+                float(request.input_mb) / 3.0,
+                float(sum(request.stage_compute_gcycles)) / 20.0,
+                float(request.deadline_s),
+                count / 100.0,
+                float(env.current_time_minute) / max(env.config.episode_minutes, 1),
+                stage_count / max(stages, 1),
+                float(np.log1p(batch_size)) / np.log1p(5_000.0),
+                float(np.mean(env.node_compute_load)),
+                len(remaining_requests) / max(batch_size, 1),
+                float(np.log1p(remaining_count)) / np.log1p(5_000.0),
+                float(remaining_compute.mean()) / 20.0 if remaining_compute.size else 0.0,
+                float(remaining_compute.std()) / 20.0 if remaining_compute.size else 0.0,
+                float(remaining_input.mean()) / 3.0 if remaining_input.size else 0.0,
+                float(remaining_output.mean()) / 3.0 if remaining_output.size else 0.0,
+                float(remaining_deadline.mean()) if remaining_deadline.size else 0.0,
+                service_diversity / max(env.config.num_service_types, 1),
+                decision_index / max(batch_size - 1, 1),
+            ],
+            dtype=np.float32,
+        )
+        state = np.concatenate([global_features, node_features.reshape(-1), edge_features.reshape(-1)])
+        return state, node_mask.reshape(-1)
+
+    def _reserve_kkt_path_and_measure_credit(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        path: list[int],
+        compute_sqrt_ledger: np.ndarray,
+        link_sqrt_ledger: np.ndarray,
+    ) -> float:
+        """Reserve one selected path and return its exact total weighted KKT increment."""
+
+        assert env.scenario is not None
+        count = max(float(request.request_count), 1e-9)
+        capacities = np.asarray([node.compute_gcycles_per_s for node in env.scenario.nodes], dtype=np.float64)
+        effective_compute = capacities * np.maximum(1.0 - 0.75 * env.node_compute_load, 0.10)
+        _, propagation, incidence, effective_link = self._structured_route_metrics(env)
+        increment = 0.0
+        for stage_id, node_id in enumerate(path):
+            sqrt_compute = np.sqrt(max(float(request.stage_compute_gcycles[stage_id]), 0.0))
+            own_weight = count * sqrt_compute
+            ledger = max(float(compute_sqrt_ledger[stage_id, node_id]), 0.0)
+            increment += (2.0 * ledger * own_weight + own_weight**2) / max(
+                float(effective_compute[node_id]), 1e-9
+            )
+            compute_sqrt_ledger[stage_id, node_id] += own_weight
+
+        transfers = [(0, request.home_node, path[0], float(request.input_mb))]
+        transfers.extend(
+            (2 * stage_id + 2, path[stage_id], path[stage_id + 1], float(request.stage_output_mb[stage_id]))
+            for stage_id in range(len(path) - 1)
+        )
+        for phase, src, dst, data_mb in transfers:
+            if data_mb <= 0.0 or src == dst:
+                continue
+            route_incidence = incidence[src, dst]
+            if not route_incidence.any():
+                increment += count * float(env.config.invalid_action_penalty)
+                continue
+            sqrt_data = np.sqrt(data_mb)
+            own_weight = count * sqrt_data
+            ledger = np.maximum(link_sqrt_ledger[phase], 0.0)
+            capacity = np.maximum(effective_link, 1e-9)
+            increment += float(
+                np.sum(route_incidence * (2.0 * ledger * own_weight + own_weight**2) / capacity)
+            )
+            increment += count * float(propagation[src, dst])
+            link_sqrt_ledger[phase] += own_weight * route_incidence
+        return float(increment)
+
+    def _kkt_proxy_regret(self, state: np.ndarray, mask: np.ndarray, path: list[int]) -> float:
+        stages = self.max_service_stages
+        count = len(path)
+        node_end = FAST_KKT_GLOBAL_DIM + stages * self.num_nodes * FAST_KKT_NODE_FEATURE_DIM
+        node_features = state[FAST_KKT_GLOBAL_DIM:node_end].reshape(
+            stages, self.num_nodes, FAST_KKT_NODE_FEATURE_DIM
+        )
+        edge_features = state[node_end:].reshape(
+            stages - 1, self.num_nodes, self.num_nodes, FAST_KKT_EDGE_FEATURE_DIM
+        )
+        node_mask = mask.reshape(stages, self.num_nodes)
+        node_cost = np.expm1(node_features[:count, :, 8]).astype(np.float64)
+        node_cost[0] += np.expm1(node_features[0, :, 10])
+        best = np.where(node_mask[0], node_cost[0], np.inf)
+        selected = float(node_cost[0, path[0]])
+        for stage_id in range(1, count):
+            route = np.expm1(edge_features[stage_id - 1, ..., 2])
+            route = np.where(edge_features[stage_id - 1, ..., 0] > 0.5, route, np.inf)
+            best = np.where(node_mask[stage_id], node_cost[stage_id] + np.min(best[:, None] + route, axis=0), np.inf)
+            selected += float(node_cost[stage_id, path[stage_id]] + route[path[stage_id - 1], path[stage_id]])
+        optimum = float(np.min(best))
+        return max(selected - optimum, 0.0) if np.isfinite(selected + optimum) else 0.0
+
+    def _schedule_kkt_autoregressive_batch(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        *,
+        deterministic: bool,
+        record: bool,
+    ) -> list[list[int]]:
+        """Select complete paths sequentially and expose only committed KKT load."""
+
+        _, _, incidence, _ = self._structured_route_metrics(env)
+        compute_ledger = np.zeros((self.max_service_stages, self.num_nodes), dtype=np.float64)
+        link_ledger = np.zeros((2 * self.max_service_stages - 1, incidence.shape[-1]), dtype=np.float64)
+        total_count = max(float(sum(request.request_count for request in requests)), 1.0)
+        schedules: list[list[int]] = []
+        credits: list[float] = []
+        counts: list[float] = []
+        self._path_selected_proxy_regrets.clear()
+        self._pending_kkt_batch_credits.clear()
+        self._pending_kkt_batch_counts.clear()
+        self._pending_kkt_batch_recorded = bool(record)
+        for request_index, request in enumerate(requests):
+            state, mask = self._kkt_autoregressive_path_state(
+                env,
+                request,
+                remaining_requests=requests[request_index:],
+                batch_size=len(requests),
+                decision_index=request_index,
+                compute_sqrt_ledger=compute_ledger,
+                link_sqrt_ledger=link_ledger,
+            )
+            action, logprob, value = self.ppo.act(state, mask, deterministic=deterministic)
+            path = self._decode_structured_path(action, len(request.stage_compute_gcycles))
+            schedules.append(path)
+            self._path_selected_proxy_regrets.setdefault(id(request), []).append(
+                self._kkt_proxy_regret(state, mask, path)
+            )
+            if record:
+                self.ppo.buffer.states.append(state)
+                self.ppo.buffer.masks.append(mask)
+                self.ppo.buffer.actions.append(action)
+                self.ppo.buffer.logprobs.append(logprob)
+                self.ppo.buffer.values.append(value)
+                load_group = env.config.demand_load_group
+                self.ppo.buffer.sample_groups.append(
+                    float(env.config.demand_load_multiplier if load_group is None else load_group)
+                )
+            increment = self._reserve_kkt_path_and_measure_credit(
+                env,
+                request,
+                path,
+                compute_ledger,
+                link_ledger,
+            )
+            credits.append(increment / total_count)
+            counts.append(float(request.request_count))
+        if record:
+            self._pending_kkt_batch_credits.extend(credits)
+            self._pending_kkt_batch_counts.extend(counts)
+        return schedules
+
+    def finalize_kkt_autoregressive_batch_credit(
+        self,
+        group_infos: list[dict[str, object]],
+        *,
+        reward_scale: float,
+    ) -> bool:
+        """Close one Fast subtrajectory against the environment's authoritative settlement."""
+
+        if self.policy_kind != "kkt_autoregressive_path" or not self._pending_kkt_batch_recorded:
+            return False
+        if len(group_infos) != len(self._pending_kkt_batch_credits):
+            raise ValueError("KKT Fast credits do not match the settled request groups")
+        total_count = max(float(sum(self._pending_kkt_batch_counts)), 1.0)
+        actual_mean = sum(
+            count
+            * (
+                float(info["compute_delay_s"])
+                + float(info["link_delay_s"])
+                + float(info["propagation_delay_s"])
+                + float(info["penalty_latency_s"])
+            )
+            for count, info in zip(self._pending_kkt_batch_counts, group_infos)
+        ) / total_count
+        predicted_mean = float(sum(self._pending_kkt_batch_credits))
+        correction = float(actual_mean - predicted_mean)
+        corrected = list(self._pending_kkt_batch_credits)
+        if corrected:
+            corrected[-1] += correction
+        for index, credit in enumerate(corrected):
+            self.ppo.buffer.rewards.append(-float(credit) * float(reward_scale))
+            self.ppo.buffer.dones.append(index == len(corrected) - 1)
+            self.ppo.buffer.weights.append(1.0)
+        self.last_kkt_credit_diagnostics = {
+            "fast_kkt_predicted_mean_cost_s": predicted_mean,
+            "fast_kkt_actual_mean_cost_s": float(actual_mean),
+            "fast_kkt_terminal_correction_s": correction,
+            "fast_kkt_credit_abs_error_s": abs(correction),
+            "fast_kkt_batch_groups": float(len(corrected)),
+            "fast_kkt_batch_requests": total_count,
+        }
+        self._pending_kkt_batch_credits.clear()
+        self._pending_kkt_batch_counts.clear()
+        self._pending_kkt_batch_recorded = False
+        return True
 
     def _structured_proxy_regret(self, state: np.ndarray, mask: np.ndarray, path: list[int]) -> float:
         stages = self.max_service_stages
@@ -2417,7 +2855,7 @@ class FastSchedulingPPOAgent:
     def assign_schedule_rewards(self, rewards: list[float], done: bool, weight: float = 1.0) -> None:
         """Attach one additive latency reward to each stage action."""
 
-        if self.policy_kind in {"path_scorer", "structured_path"}:
+        if self.policy_kind in {"path_scorer", "structured_path", "kkt_autoregressive_path"}:
             self.ppo.buffer.rewards.append(float(sum(rewards)))
             self.ppo.buffer.dones.append(True)
             self.ppo.buffer.weights.append(float(weight))
@@ -2606,7 +3044,7 @@ class FastSchedulingPPOAgent:
         actor logits so it remains a useful difference-reward signal.
         """
 
-        if self.policy_kind in {"path_scorer", "structured_path"}:
+        if self.policy_kind in {"path_scorer", "structured_path", "kkt_autoregressive_path"}:
             # A stage-local alternative can be worse for the complete chain.
             # Attribute the path-level proxy gap once, not at every stage.
             queued = self._path_selected_proxy_regrets.get(id(request), [])

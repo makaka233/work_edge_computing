@@ -441,9 +441,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-deployed-node-coef", type=float, default=0.0)
     parser.add_argument(
         "--fast-policy-kind",
-        choices=["node_scorer", "gat_node_scorer", "path_scorer", "structured_path"],
+        choices=[
+            "node_scorer",
+            "gat_node_scorer",
+            "path_scorer",
+            "structured_path",
+            "kkt_autoregressive_path",
+        ],
         default="gat_node_scorer",
-        help="path_scorer uses a Top-K slate; structured_path scores all deployed, routable complete paths by dynamic programming",
+        help=(
+            "path_scorer uses a Top-K slate; structured_path scores all deployed, routable complete paths; "
+            "kkt_autoregressive_path adds causal within-batch KKT ledgers and exact incremental credit"
+        ),
     )
     parser.add_argument(
         "--fast-path-candidate-limit",
@@ -932,6 +941,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--fast-reservation-microbatch-size must be >= 1")
     if args.fast_path_candidate_limit < 1:
         parser.error("--fast-path-candidate-limit must be >= 1")
+    if args.fast_policy_kind == "kkt_autoregressive_path" and args.fast_bc_requests > 0:
+        parser.error("kkt_autoregressive_path is trained on-policy and does not accept --fast-bc-requests")
     if (
         args.slow_idle_replica_coef < 0.0
         or args.slow_count_unused_replica_coef < 0.0
@@ -1732,6 +1743,10 @@ def rollout(
     fast_oracle_latency_gaps: list[float] = []
     fast_oracle_relative_gaps: list[float] = []
     fast_oracle_weights: list[float] = []
+    fast_kkt_predicted_costs: list[float] = []
+    fast_kkt_actual_costs: list[float] = []
+    fast_kkt_terminal_corrections: list[float] = []
+    fast_kkt_credit_weights: list[float] = []
     latencies: list[float] = []
     compute_latencies: list[float] = []
     link_latencies: list[float] = []
@@ -1866,6 +1881,20 @@ def rollout(
         deployment_window = int(env.metrics["deployment_updates"])
         _, _, done, batch_info = env.step(actions, represented_seconds=step_represented_seconds)
         group_infos = batch_info["group_infos"]
+        fast_batch_credit_assigned = False
+        if record_fast:
+            fast_batch_credit_assigned = agent.fast_agent.finalize_kkt_autoregressive_batch_credit(
+                group_infos,
+                reward_scale=reward_scale,
+            )
+            if fast_batch_credit_assigned:
+                credit_diag = agent.fast_agent.last_kkt_credit_diagnostics
+                fast_kkt_predicted_costs.append(float(credit_diag["fast_kkt_predicted_mean_cost_s"]))
+                fast_kkt_actual_costs.append(float(credit_diag["fast_kkt_actual_mean_cost_s"]))
+                fast_kkt_terminal_corrections.append(
+                    float(credit_diag["fast_kkt_terminal_correction_s"])
+                )
+                fast_kkt_credit_weights.append(float(credit_diag["fast_kkt_batch_requests"]))
         for group_idx, (request, info) in enumerate(zip(requests, group_infos)):
             request_count = float(info.get("request_count", request.request_count))
             train_reward_info = _training_reward_components(info, env, args)
@@ -1931,7 +1960,7 @@ def rollout(
                     slow_stage_costs=stage_latency_costs,
                     slow_stage_marginal_values=batch_slow_marginal_values[group_idx],
                     env=env,
-                    record_fast=record_fast,
+                    record_fast=bool(record_fast and not fast_batch_credit_assigned),
                     record_slow=record_slow,
                 )
             rewards.append(float(info["reward"]))
@@ -2066,6 +2095,21 @@ def rollout(
         "avg_fast_counterfactual_regret_s": _weighted_mean(
             fast_counterfactual_regret_costs,
             weights,
+        ),
+        "avg_fast_kkt_predicted_cost_s": _weighted_mean(
+            fast_kkt_predicted_costs,
+            fast_kkt_credit_weights,
+        ),
+        "avg_fast_kkt_actual_cost_s": _weighted_mean(
+            fast_kkt_actual_costs,
+            fast_kkt_credit_weights,
+        ),
+        "avg_fast_kkt_terminal_correction_s": _weighted_mean(
+            fast_kkt_terminal_corrections,
+            fast_kkt_credit_weights,
+        ),
+        "max_fast_kkt_credit_abs_error_s": (
+            max((abs(value) for value in fast_kkt_terminal_corrections), default=0.0)
         ),
         "fast_counterfactual_credit_coef": fast_counterfactual_coef,
         "fast_oracle_samples": float(len(fast_oracle_latency_gaps)),
@@ -2368,6 +2412,9 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "avg_train_latency_cost_s",
         "avg_fast_externality_cost_s",
         "avg_fast_counterfactual_regret_s",
+        "avg_fast_kkt_predicted_cost_s",
+        "avg_fast_kkt_actual_cost_s",
+        "avg_fast_kkt_terminal_correction_s",
         "avg_train_resource_penalty",
         "avg_diagnostic_resource_penalty",
         "avg_compute_hotspot_penalty",
@@ -2471,6 +2518,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "avg_fast_oracle_latency_gap_s",
         "avg_fast_oracle_relative_gap",
         "fast_counterfactual_credit_coef",
+        "max_fast_kkt_credit_abs_error_s",
     ]
 
     aggregated: dict[str, float] = {
@@ -4094,7 +4142,14 @@ def main() -> None:
         f"placement={args.slow_placement_target_kl} fast={args.fast_target_kl}"
     )
     print(f"  slow_agent=service deployment every {args.deployment_interval_minutes} minutes")
-    print("  fast_agent=independent request scheduling within each one-second batch")
+    print(
+        "  fast_agent="
+        + (
+            "causal sequential complete-path PPO within each one-second batch"
+            if args.fast_policy_kind == "kkt_autoregressive_path"
+            else "independent request scheduling within each one-second batch"
+        )
+    )
     if args.fast_bc_requests > 0:
         print(
             "  fast_bc samples={} loss={:.4f} accuracy={:.4f}".format(
@@ -4242,6 +4297,10 @@ def main() -> None:
             "avg_train_latency_cost_s": np.nan,
             "avg_fast_externality_cost_s": np.nan,
             "avg_fast_counterfactual_regret_s": np.nan,
+            "avg_fast_kkt_predicted_cost_s": np.nan,
+            "avg_fast_kkt_actual_cost_s": np.nan,
+            "avg_fast_kkt_terminal_correction_s": np.nan,
+            "max_fast_kkt_credit_abs_error_s": np.nan,
             "fast_oracle_samples": 0,
             "avg_fast_oracle_latency_gap_s": np.nan,
             "avg_fast_oracle_relative_gap": np.nan,
@@ -4958,6 +5017,14 @@ def main() -> None:
             "avg_fast_externality_cost_s": stats["avg_fast_externality_cost_s"],
             "avg_fast_counterfactual_regret_s": stats[
                 "avg_fast_counterfactual_regret_s"
+            ],
+            "avg_fast_kkt_predicted_cost_s": stats["avg_fast_kkt_predicted_cost_s"],
+            "avg_fast_kkt_actual_cost_s": stats["avg_fast_kkt_actual_cost_s"],
+            "avg_fast_kkt_terminal_correction_s": stats[
+                "avg_fast_kkt_terminal_correction_s"
+            ],
+            "max_fast_kkt_credit_abs_error_s": stats[
+                "max_fast_kkt_credit_abs_error_s"
             ],
             "fast_oracle_samples": int(stats["fast_oracle_samples"]),
             "avg_fast_oracle_latency_gap_s": stats[

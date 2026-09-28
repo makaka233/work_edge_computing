@@ -416,6 +416,10 @@ class StructuredPathActorCritic(nn.Module):
         num_nodes: int,
         max_service_stages: int,
         hidden_dim: int = 64,
+        compute_cost_feature_index: int = 6,
+        ingress_cost_feature_index: int = 8,
+        route_cost_feature_index: int = 1,
+        centralized_critic: bool = False,
     ):
         super().__init__()
         self.global_dim = global_dim
@@ -423,6 +427,10 @@ class StructuredPathActorCritic(nn.Module):
         self.edge_feature_dim = edge_feature_dim
         self.num_nodes = num_nodes
         self.max_service_stages = max_service_stages
+        self.compute_cost_feature_index = compute_cost_feature_index
+        self.ingress_cost_feature_index = ingress_cost_feature_index
+        self.route_cost_feature_index = route_cost_feature_index
+        self.centralized_critic = bool(centralized_critic)
         self.node_offset = global_dim
         self.edge_offset = global_dim + max_service_stages * num_nodes * node_feature_dim
         self.global_encoder = nn.Sequential(nn.Linear(global_dim, hidden_dim), nn.ReLU())
@@ -431,7 +439,13 @@ class StructuredPathActorCritic(nn.Module):
         self.src_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.dst_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.edge_scorer = nn.Linear(edge_feature_dim, 1)
-        self.critic = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+        if self.centralized_critic:
+            self.critic_edge_encoder = nn.Sequential(nn.Linear(edge_feature_dim, hidden_dim), nn.ReLU())
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_dim * (3 if self.centralized_critic else 2), hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
         self.compute_guidance_log_scale = nn.Parameter(torch.tensor(-1.0))
         self.route_guidance_log_scale = nn.Parameter(torch.tensor(-1.0))
 
@@ -452,8 +466,12 @@ class StructuredPathActorCritic(nn.Module):
         node_emb = self.node_encoder(node_features)
         context = global_emb[:, None, None, :].expand(-1, stages, nodes, -1)
         unary = self.node_scorer(torch.cat([context, node_emb], dim=-1)).squeeze(-1)
-        unary = unary - torch.nn.functional.softplus(self.compute_guidance_log_scale) * node_features[..., 6]
-        unary[:, 0] = unary[:, 0] - torch.nn.functional.softplus(self.route_guidance_log_scale) * node_features[:, 0, :, 8]
+        unary = unary - torch.nn.functional.softplus(self.compute_guidance_log_scale) * node_features[
+            ..., self.compute_cost_feature_index
+        ]
+        unary[:, 0] = unary[:, 0] - torch.nn.functional.softplus(self.route_guidance_log_scale) * node_features[
+            :, 0, :, self.ingress_cost_feature_index
+        ]
         active_nodes = torch.arange(stages, device=states.device)[None, :] < stage_count[:, None]
         unary = torch.where(active_nodes[:, :, None], unary, torch.zeros_like(unary))
 
@@ -461,7 +479,9 @@ class StructuredPathActorCritic(nn.Module):
         dst = self.dst_proj(node_emb[:, 1:])
         pair = torch.einsum("bsih,bsjh->bsij", src, dst) / math.sqrt(src.shape[-1])
         pair = pair + self.edge_scorer(edge_features).squeeze(-1)
-        pair = pair - torch.nn.functional.softplus(self.route_guidance_log_scale) * edge_features[..., 1]
+        pair = pair - torch.nn.functional.softplus(self.route_guidance_log_scale) * edge_features[
+            ..., self.route_cost_feature_index
+        ]
         active_edges = torch.arange(stages - 1, device=states.device)[None, :] < (stage_count - 1)[:, None]
         pair = torch.where(active_edges[:, :, None, None], pair, torch.zeros_like(pair))
         pair_mask = edge_features[..., 0] > 0.5
@@ -469,7 +489,16 @@ class StructuredPathActorCritic(nn.Module):
 
         pooling_mask = (node_mask & active_nodes[:, :, None]).to(node_emb.dtype).unsqueeze(-1)
         pooled = (node_emb * pooling_mask).sum(dim=(1, 2)) / pooling_mask.sum(dim=(1, 2)).clamp_min(1.0)
-        values = self.critic(torch.cat([global_emb, pooled], dim=-1)).squeeze(-1)
+        critic_parts = [global_emb, pooled]
+        if self.centralized_critic:
+            edge_emb = self.critic_edge_encoder(edge_features)
+            edge_mask = (edge_features[..., 0] > 0.5) & active_edges[:, :, None, None]
+            edge_mask_float = edge_mask.to(edge_emb.dtype).unsqueeze(-1)
+            pooled_edges = (edge_emb * edge_mask_float).sum(dim=(1, 2, 3)) / edge_mask_float.sum(
+                dim=(1, 2, 3)
+            ).clamp_min(1.0)
+            critic_parts.append(pooled_edges)
+        values = self.critic(torch.cat(critic_parts, dim=-1)).squeeze(-1)
         return distribution, values
 
 
@@ -840,7 +869,7 @@ class PPOAgent:
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
             ).to(self.device)
-        elif policy_kind == "structured_path":
+        elif policy_kind in {"structured_path", "kkt_autoregressive_path"}:
             if (
                 global_dim is None
                 or node_feature_dim is None
@@ -856,6 +885,10 @@ class PPOAgent:
                 num_nodes=num_nodes,
                 max_service_stages=max_service_stages,
                 hidden_dim=64,
+                compute_cost_feature_index=8 if policy_kind == "kkt_autoregressive_path" else 6,
+                ingress_cost_feature_index=10 if policy_kind == "kkt_autoregressive_path" else 8,
+                route_cost_feature_index=2 if policy_kind == "kkt_autoregressive_path" else 1,
+                centralized_critic=policy_kind == "kkt_autoregressive_path",
             ).to(self.device)
         elif policy_kind in {"slow_gat_node", "slow_gat_count", "slow_gat_stage"}:
             if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:

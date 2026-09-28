@@ -129,6 +129,29 @@ another distinct checkpoint architecture and must begin a fresh run; the
 earlier structured-path checkpoints also cannot be resumed after the link
 feature change.
 
+`--fast-policy-kind kkt_autoregressive_path` is the model-informed, strictly
+on-policy Fast PPO mode. It retains the same no-Top-K complete-path action and
+deployment/routing masks, but schedules the request groups in each one-second
+batch sequentially. After every sampled path it updates causal per-stage
+compute and per-transfer-phase physical-link sqrt-load ledgers. The next action
+therefore observes only paths that have actually been committed, rather than an
+estimated allocation for undecided requests. Node and route features expose raw
+and effective capacity, background load, current ledger pressure, task demand,
+own KKT delay, exact marginal batch cost, propagation, and reachability. A
+centralized critic additionally pools the feasible node/edge state and a
+permutation-invariant summary of the remaining requests.
+
+Its dense Fast reward is the negative increment of the environment's KKT total
+weighted controllable latency. Within each one-second batch, `gamma=1` and
+`GAE lambda=1`; only the final request closes the Fast subtrajectory. A terminal
+correction compares the sum of analytical increments with the authoritative
+joint environment settlement. The rollout logs record predicted cost, actual
+cost, terminal correction, and maximum absolute credit error. KKT never chooses
+an action, supplies a teacher label, initializes a path, or provides an
+inference fallback: the PPO actor still samples every complete path directly.
+Behavior cloning is rejected for this mode. It has a distinct checkpoint
+architecture and must start a fresh run.
+
 For current MEC convergence experiments, one episode is a 60-minute trajectory
 with six Slow decisions and 3,600 logical one-second steps. Each update collects
 two complete trajectories, or 12 ten-minute windows, before updating Fast and
