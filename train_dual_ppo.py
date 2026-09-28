@@ -439,7 +439,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compute-imbalance-coef", type=float, default=0.0)
     parser.add_argument("--link-imbalance-coef", type=float, default=0.0)
     parser.add_argument("--idle-deployed-node-coef", type=float, default=0.0)
-    parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
+    parser.add_argument(
+        "--fast-policy-kind",
+        choices=["node_scorer", "gat_node_scorer", "path_scorer", "structured_path"],
+        default="gat_node_scorer",
+        help="path_scorer uses a Top-K slate; structured_path scores all deployed, routable complete paths by dynamic programming",
+    )
+    parser.add_argument(
+        "--fast-path-candidate-limit",
+        type=int,
+        default=32,
+        help="Maximum number of complete paths scored by path_scorer per request",
+    )
     parser.add_argument(
         "--fast-chain-context",
         choices=["auto", "legacy", "chain-v2"],
@@ -919,6 +930,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("Fast oracle beam width and candidates per stage must be >= 1")
     if args.fast_reservation_microbatch_size < 1:
         parser.error("--fast-reservation-microbatch-size must be >= 1")
+    if args.fast_path_candidate_limit < 1:
+        parser.error("--fast-path-candidate-limit must be >= 1")
     if (
         args.slow_idle_replica_coef < 0.0
         or args.slow_count_unused_replica_coef < 0.0
@@ -2967,6 +2980,33 @@ def pretrain_fast_agent(
             for request in tick_requests:
                 expert_nodes = expert.act(env, request)
                 expert_batch.append(expert_nodes)
+                if agent.fast_agent.policy_kind == "structured_path":
+                    if env.evaluate_schedule(request, expert_nodes)["valid"]:
+                        state, mask = agent.fast_agent._structured_path_state(env, request)
+                        target = sum(
+                            int(node_id) * (agent.fast_agent.num_nodes ** stage_id)
+                            for stage_id, node_id in enumerate(expert_nodes)
+                        )
+                        states.append(state)
+                        masks.append(mask)
+                        actions.append(target)
+                    continue
+                if agent.fast_agent.policy_kind == "path_scorer":
+                    candidates, state, mask = agent.fast_agent._path_candidates(env, request)
+                    expert_path = tuple(expert_nodes)
+                    if expert_path in candidates:
+                        target = candidates.index(expert_path)
+                    else:
+                        target = min(
+                            range(len(candidates)),
+                            key=lambda index: float(
+                                env.evaluate_schedule(request, list(candidates[index]))["latency_s"]
+                            ),
+                        )
+                    states.append(state)
+                    masks.append(mask)
+                    actions.append(target)
+                    continue
                 partial_nodes: list[int] = []
                 for stage_id, node_id in enumerate(expert_nodes):
                     state = agent.fast_agent._build_state(env, request, stage_id, partial_nodes)
@@ -3172,6 +3212,18 @@ def load_checkpoint(
     # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
     # copy their tensors to the parameter device themselves.
     checkpoint = torch.load(path, map_location="cpu")
+    if "fast_agent" in checkpoint:
+        saved_fast = checkpoint["fast_agent"]
+        expected_fast = agent.fast_agent.ppo.policy.state_dict()
+        if (
+            set(saved_fast) != set(expected_fast)
+            or any(saved_fast[key].shape != expected_fast[key].shape for key in expected_fast)
+        ):
+            raise ValueError(
+                "checkpoint Fast policy architecture differs from this run; "
+                "match --fast-policy-kind, --fast-chain-context, and "
+                "--fast-path-candidate-limit, or start a fresh run"
+            )
     saved_allocation_mode = checkpoint.get("slow_allocation_mode")
     if saved_allocation_mode is None and "slow_count_agent" in checkpoint:
         count_state = checkpoint["slow_count_agent"]
@@ -3744,6 +3796,7 @@ def main() -> None:
         fast_policy_kind=args.fast_policy_kind,
         fast_chain_context=args.fast_chain_context,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
+        fast_path_candidate_limit=args.fast_path_candidate_limit,
         fast_load_balanced_updates=args.fast_load_balanced_updates,
         fast_load_group_weights=_load_probabilities_for_args(
             args,
@@ -3796,7 +3849,10 @@ def main() -> None:
     )
     print(f"  train_mode={args.train_mode}")
     print(f"  training_design={args.training_design}")
-    print(f"  fast_policy_kind={args.fast_policy_kind}")
+    print(
+        f"  fast_policy_kind={args.fast_policy_kind}"
+        + (f" path_candidate_limit={args.fast_path_candidate_limit}" if args.fast_policy_kind == "path_scorer" else "")
+    )
     print(
         f"  fast_chain_context={args.fast_chain_context} "
         f"counterfactual_credit={args.fast_counterfactual_credit_coef:.3f}"

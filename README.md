@@ -94,6 +94,41 @@ python scripts/analyze_convergence.py runs/<run_name>/logs/training.csv
 python -m pytest tests
 ```
 
+The optional `--fast-policy-kind path_scorer` changes one Fast action from a
+single stage node to a complete service path. At each request, it constructs
+paths only from the current Slow deployment and routable inter-stage links,
+retains at most `--fast-path-candidate-limit` (default 32) low-cost paths with
+some first-stage replica diversity, and masks the unused action slots. The
+candidate cost proxy includes serial stage compute, routed transfer and
+propagation, current physical load, and estimated
+same-phase batch contention. A shared PPO path scorer still chooses among the
+retained paths; the proxy does not itself choose the action. One path action
+receives the sum of that request's Fast stage rewards; optional counterfactual
+credit compares complete candidate paths rather than isolated stage choices.
+If no feasible path exists, one fallback action is kept so the environment can
+report its normal invalid-action penalty. Existing stage-wise Fast modes remain
+the default.
+
+`path_scorer` has a different observation and action architecture. Start a new
+training run for it; a stage-wise Fast checkpoint cannot be resumed as a path
+policy with `--load-checkpoint`. Keep the same candidate limit when resuming a
+path-policy checkpoint.
+
+`--fast-policy-kind structured_path` is the no-Top-K alternative. It masks
+undeployed nodes and unreachable consecutive-stage transitions, then uses a
+forward-backward dynamic program to sample and train on one complete path.
+It does not enumerate or preselect a fixed number of paths; the old
+`--fast-path-candidate-limit` setting has no effect in this mode. Compute
+features use the environment's per-stage KKT sqrt-load rule. Ingress and
+inter-stage route features now use its per-serial-phase link KKT sqrt-load rule,
+including every routed hop and an explicit same-node signal. Compute and link
+loads are estimated from other requests' feasible placements, then updated by
+the paths selected in preceding microbatches. These are estimates of other
+requests' assignments, not an exact future joint settlement. This policy has
+another distinct checkpoint architecture and must begin a fresh run; the
+earlier structured-path checkpoints also cannot be resumed after the link
+feature change.
+
 For current MEC convergence experiments, one episode is a 60-minute trajectory
 with six Slow decisions and 3,600 logical one-second steps. Each update collects
 two complete trajectories, or 12 ten-minute windows, before updating Fast and

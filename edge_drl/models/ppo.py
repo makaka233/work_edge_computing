@@ -238,11 +238,18 @@ class NodeScoringActorCritic(nn.Module):
         node_feature_dim: int,
         num_nodes: int,
         hidden_dim: int = 128,
+        candidate_cost_feature_index: int | None = None,
     ):
         super().__init__()
+        if candidate_cost_feature_index is not None and not 0 <= candidate_cost_feature_index < node_feature_dim:
+            raise ValueError("candidate_cost_feature_index is outside the candidate features")
         self.global_dim = global_dim
         self.node_feature_dim = node_feature_dim
         self.num_nodes = num_nodes
+        self.candidate_cost_feature_index = candidate_cost_feature_index
+        if candidate_cost_feature_index is not None:
+            # Only path-level policies own this parameter; old checkpoints are unchanged.
+            self.cost_guidance_log_scale = nn.Parameter(torch.tensor(-1.0))
         self.global_encoder = nn.Sequential(
             nn.Linear(global_dim, hidden_dim),
             nn.ReLU(),
@@ -274,6 +281,10 @@ class NodeScoringActorCritic(nn.Module):
         expanded_global = global_emb.unsqueeze(1).expand(-1, self.num_nodes, -1)
         pair_emb = torch.cat([expanded_global, node_emb], dim=-1)
         logits = self.scorer(pair_emb).squeeze(-1)
+        if self.candidate_cost_feature_index is not None:
+            logits = logits - torch.nn.functional.softplus(self.cost_guidance_log_scale) * node_features[
+                :, :, self.candidate_cost_feature_index
+            ]
 
         safe_masks = masks.bool()
         fallback = torch.zeros_like(safe_masks)
@@ -286,6 +297,180 @@ class NodeScoringActorCritic(nn.Module):
         pooled_nodes = (node_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
         values = self.critic(torch.cat([global_emb, pooled_nodes], dim=-1)).squeeze(-1)
         return dist, values
+
+
+class StructuredPathDistribution:
+    """Exact categorical distribution over a masked layered service graph.
+
+    It never materializes the product of per-stage replica counts. Node and
+    transition potentials define complete-path probabilities; forward-backward
+    computes their partition function and entropy in O(stages * nodes**2).
+    """
+
+    def __init__(self, unary: torch.Tensor, pair: torch.Tensor, node_mask: torch.Tensor, pair_mask: torch.Tensor):
+        self.num_nodes = unary.shape[-1]
+        self.num_stages = unary.shape[1]
+        self.node_mask = node_mask
+        self.pair_mask = pair_mask
+        self.unary = unary.masked_fill(~node_mask, -1e9)
+        self.pair = pair.masked_fill(~pair_mask, -1e9)
+        alphas = [self.unary[:, 0]]
+        for stage_id in range(1, self.num_stages):
+            alphas.append(
+                self.unary[:, stage_id]
+                + torch.logsumexp(alphas[-1].unsqueeze(-1) + self.pair[:, stage_id - 1], dim=1)
+            )
+        self.alphas = alphas
+        self.log_partition = torch.logsumexp(alphas[-1], dim=-1)
+
+    def _encode(self, nodes: list[torch.Tensor]) -> torch.Tensor:
+        action = torch.zeros_like(nodes[0])
+        for stage_id, node in enumerate(nodes):
+            action = action + node * (self.num_nodes ** stage_id)
+        return action
+
+    def _decode(self, actions: torch.Tensor) -> list[torch.Tensor]:
+        return [
+            torch.div(actions, self.num_nodes ** stage_id, rounding_mode="floor") % self.num_nodes
+            for stage_id in range(self.num_stages)
+        ]
+
+    def sample(self) -> torch.Tensor:
+        nodes = [torch.empty_like(self.alphas[0], dtype=torch.long)[:, 0] for _ in range(self.num_stages)]
+        nodes[-1] = Categorical(logits=self.alphas[-1]).sample()
+        for stage_id in range(self.num_stages - 2, -1, -1):
+            to_next = self.pair[:, stage_id].gather(
+                2,
+                nodes[stage_id + 1][:, None, None].expand(-1, self.num_nodes, 1),
+            ).squeeze(-1)
+            nodes[stage_id] = Categorical(logits=self.alphas[stage_id] + to_next).sample()
+        return self._encode(nodes)
+
+    def mode(self) -> torch.Tensor:
+        scores = self.unary[:, 0]
+        backpointers: list[torch.Tensor] = []
+        for stage_id in range(1, self.num_stages):
+            best_score, best_previous = (scores.unsqueeze(-1) + self.pair[:, stage_id - 1]).max(dim=1)
+            scores = best_score + self.unary[:, stage_id]
+            backpointers.append(best_previous)
+        nodes = [torch.empty_like(scores, dtype=torch.long)[:, 0] for _ in range(self.num_stages)]
+        nodes[-1] = scores.argmax(dim=-1)
+        for stage_id in range(self.num_stages - 2, -1, -1):
+            nodes[stage_id] = backpointers[stage_id].gather(1, nodes[stage_id + 1][:, None]).squeeze(1)
+        return self._encode(nodes)
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        nodes = self._decode(actions)
+        score = self.unary[:, 0].gather(1, nodes[0][:, None]).squeeze(1)
+        for stage_id in range(1, self.num_stages):
+            score = score + self.unary[:, stage_id].gather(1, nodes[stage_id][:, None]).squeeze(1)
+            flat_edge = self.pair[:, stage_id - 1].reshape(-1, self.num_nodes * self.num_nodes)
+            edge_index = nodes[stage_id - 1] * self.num_nodes + nodes[stage_id]
+            score = score + flat_edge.gather(1, edge_index[:, None]).squeeze(1)
+        return score - self.log_partition
+
+    def entropy(self) -> torch.Tensor:
+        betas = [torch.zeros_like(self.unary[:, 0]) for _ in range(self.num_stages)]
+        for stage_id in range(self.num_stages - 2, -1, -1):
+            betas[stage_id] = torch.logsumexp(
+                self.pair[:, stage_id]
+                + self.unary[:, stage_id + 1].unsqueeze(1)
+                + betas[stage_id + 1].unsqueeze(1),
+                dim=2,
+            )
+        expected_score = torch.zeros_like(self.log_partition)
+        for stage_id in range(self.num_stages):
+            node_probs = torch.exp(self.alphas[stage_id] + betas[stage_id] - self.log_partition[:, None])
+            expected_score = expected_score + (node_probs * self.unary[:, stage_id]).sum(dim=1)
+            if stage_id < self.num_stages - 1:
+                edge_probs = torch.exp(
+                    self.alphas[stage_id].unsqueeze(-1)
+                    + self.pair[:, stage_id]
+                    + self.unary[:, stage_id + 1].unsqueeze(1)
+                    + betas[stage_id + 1].unsqueeze(1)
+                    - self.log_partition[:, None, None]
+                )
+                expected_score = expected_score + (edge_probs * self.pair[:, stage_id]).sum(dim=(1, 2))
+        return (self.log_partition - expected_score).clamp_min(0.0)
+
+    def maximum_entropy(self) -> torch.Tensor:
+        counts = torch.zeros_like(self.unary[:, 0]).masked_fill(~self.node_mask[:, 0], -1e9)
+        for stage_id in range(1, self.num_stages):
+            edges = torch.zeros_like(self.pair[:, stage_id - 1]).masked_fill(
+                ~self.pair_mask[:, stage_id - 1], -1e9
+            )
+            counts = torch.logsumexp(counts.unsqueeze(-1) + edges, dim=1)
+            counts = counts.masked_fill(~self.node_mask[:, stage_id], -1e9)
+        return torch.logsumexp(counts, dim=-1).clamp_min(0.0)
+
+
+class StructuredPathActorCritic(nn.Module):
+    """Node/transition factor policy for whole-chain actions without Top-K."""
+
+    def __init__(
+        self,
+        *,
+        global_dim: int,
+        node_feature_dim: int,
+        edge_feature_dim: int,
+        num_nodes: int,
+        max_service_stages: int,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+        self.global_dim = global_dim
+        self.node_feature_dim = node_feature_dim
+        self.edge_feature_dim = edge_feature_dim
+        self.num_nodes = num_nodes
+        self.max_service_stages = max_service_stages
+        self.node_offset = global_dim
+        self.edge_offset = global_dim + max_service_stages * num_nodes * node_feature_dim
+        self.global_encoder = nn.Sequential(nn.Linear(global_dim, hidden_dim), nn.ReLU())
+        self.node_encoder = nn.Sequential(nn.Linear(node_feature_dim, hidden_dim), nn.ReLU())
+        self.node_scorer = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+        self.src_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.dst_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.edge_scorer = nn.Linear(edge_feature_dim, 1)
+        self.critic = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
+        self.compute_guidance_log_scale = nn.Parameter(torch.tensor(-1.0))
+        self.route_guidance_log_scale = nn.Parameter(torch.tensor(-1.0))
+
+    def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[StructuredPathDistribution, torch.Tensor]:
+        batch_size = states.shape[0]
+        stages = self.max_service_stages
+        nodes = self.num_nodes
+        global_features = states[:, : self.global_dim]
+        node_features = states[:, self.node_offset : self.edge_offset].reshape(
+            batch_size, stages, nodes, self.node_feature_dim
+        )
+        edge_features = states[:, self.edge_offset :].reshape(
+            batch_size, stages - 1, nodes, nodes, self.edge_feature_dim
+        )
+        node_mask = masks.reshape(batch_size, stages, nodes).bool()
+        stage_count = torch.round(global_features[:, 6] * stages).long().clamp(1, stages)
+        global_emb = self.global_encoder(global_features)
+        node_emb = self.node_encoder(node_features)
+        context = global_emb[:, None, None, :].expand(-1, stages, nodes, -1)
+        unary = self.node_scorer(torch.cat([context, node_emb], dim=-1)).squeeze(-1)
+        unary = unary - torch.nn.functional.softplus(self.compute_guidance_log_scale) * node_features[..., 6]
+        unary[:, 0] = unary[:, 0] - torch.nn.functional.softplus(self.route_guidance_log_scale) * node_features[:, 0, :, 8]
+        active_nodes = torch.arange(stages, device=states.device)[None, :] < stage_count[:, None]
+        unary = torch.where(active_nodes[:, :, None], unary, torch.zeros_like(unary))
+
+        src = self.src_proj(node_emb[:, :-1])
+        dst = self.dst_proj(node_emb[:, 1:])
+        pair = torch.einsum("bsih,bsjh->bsij", src, dst) / math.sqrt(src.shape[-1])
+        pair = pair + self.edge_scorer(edge_features).squeeze(-1)
+        pair = pair - torch.nn.functional.softplus(self.route_guidance_log_scale) * edge_features[..., 1]
+        active_edges = torch.arange(stages - 1, device=states.device)[None, :] < (stage_count - 1)[:, None]
+        pair = torch.where(active_edges[:, :, None, None], pair, torch.zeros_like(pair))
+        pair_mask = edge_features[..., 0] > 0.5
+        distribution = StructuredPathDistribution(unary, pair, node_mask, pair_mask)
+
+        pooling_mask = (node_mask & active_nodes[:, :, None]).to(node_emb.dtype).unsqueeze(-1)
+        pooled = (node_emb * pooling_mask).sum(dim=(1, 2)) / pooling_mask.sum(dim=(1, 2)).clamp_min(1.0)
+        values = self.critic(torch.cat([global_emb, pooled], dim=-1)).squeeze(-1)
+        return distribution, values
 
 
 class GraphAttentionNodeScoringActorCritic(nn.Module):
@@ -599,8 +784,10 @@ class PPOAgent:
         policy_kind: str = "flat",
         global_dim: int | None = None,
         node_feature_dim: int | None = None,
+        candidate_cost_feature_index: int | None = None,
         edge_feature_dim: int | None = None,
         stage_feature_dim: int | None = None,
+        max_service_stages: int | None = None,
         num_nodes: int | None = None,
         detach_critic_backbone: bool = False,
         group_balanced_updates: bool = False,
@@ -641,6 +828,7 @@ class PPOAgent:
                 node_feature_dim=node_feature_dim,
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
+                candidate_cost_feature_index=candidate_cost_feature_index,
             ).to(self.device)
         elif policy_kind == "gat_node_scorer":
             if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:
@@ -651,6 +839,23 @@ class PPOAgent:
                 edge_feature_dim=edge_feature_dim,
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
+            ).to(self.device)
+        elif policy_kind == "structured_path":
+            if (
+                global_dim is None
+                or node_feature_dim is None
+                or edge_feature_dim is None
+                or num_nodes is None
+                or max_service_stages is None
+            ):
+                raise ValueError("structured_path requires global, node, edge, and stage dimensions")
+            self.policy = StructuredPathActorCritic(
+                global_dim=global_dim,
+                node_feature_dim=node_feature_dim,
+                edge_feature_dim=edge_feature_dim,
+                num_nodes=num_nodes,
+                max_service_stages=max_service_stages,
+                hidden_dim=64,
             ).to(self.device)
         elif policy_kind in {"slow_gat_node", "slow_gat_count", "slow_gat_stage"}:
             if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:
@@ -698,7 +903,9 @@ class PPOAgent:
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
         with torch.no_grad():
             dist, value = self.policy(state_t, mask_t)
-            action_t = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
+            action_t = (
+                dist.mode() if isinstance(dist, StructuredPathDistribution) else torch.argmax(dist.probs, dim=-1)
+            ) if deterministic else dist.sample()
             logprob_t = dist.log_prob(action_t)
         return int(action_t.item()), float(logprob_t.item()), float(value.item())
 
@@ -720,7 +927,9 @@ class PPOAgent:
         mask_t = torch.as_tensor(mask_array, dtype=torch.bool, device=self.device)
         with torch.no_grad():
             dist, values = self.policy(state_t, mask_t)
-            actions = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
+            actions = (
+                dist.mode() if isinstance(dist, StructuredPathDistribution) else torch.argmax(dist.probs, dim=-1)
+            ) if deterministic else dist.sample()
             logprobs = dist.log_prob(actions)
         return (
             actions.detach().cpu().numpy().astype(np.int64),
@@ -733,6 +942,16 @@ class PPOAgent:
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
         with torch.no_grad():
             dist, value = self.policy(state_t, mask_t)
+            if isinstance(dist, StructuredPathDistribution):
+                action = int(dist.mode().item())
+                top1 = float(torch.exp(dist.log_prob(torch.as_tensor([action], device=self.device))).item())
+                return {
+                    "action": action,
+                    "entropy": float(dist.entropy().item()),
+                    "top1_prob": top1,
+                    "top1_margin": 0.0,
+                    "value": float(value.item()),
+                }
             probs = dist.probs.squeeze(0)
             sorted_probs, sorted_actions = torch.sort(probs, descending=True)
             top1 = float(sorted_probs[0].item())
@@ -752,6 +971,8 @@ class PPOAgent:
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
         with torch.no_grad():
             dist, value = self.policy(state_t, mask_t)
+            if isinstance(dist, StructuredPathDistribution):
+                raise ValueError("structured_path has no dense path-probability vector")
             probs = dist.probs.squeeze(0).detach().cpu().numpy()
         return probs, float(value.item())
 
@@ -794,10 +1015,13 @@ class PPOAgent:
                 kl_values = (ratios - 1.0) - log_ratios
                 clip_values = (torch.abs(ratios - 1.0) > self.eps_clip).float()
                 entropy_values = dist.entropy()
-                feasible_counts = masks.sum(dim=1).to(dtype=entropy_values.dtype)
-                maximum_entropy = torch.log(feasible_counts.clamp_min(1.0))
+                if isinstance(dist, StructuredPathDistribution):
+                    maximum_entropy = dist.maximum_entropy()
+                else:
+                    feasible_counts = masks.sum(dim=1).to(dtype=entropy_values.dtype)
+                    maximum_entropy = torch.log(feasible_counts.clamp_min(1.0))
                 normalized_entropy_values = torch.where(
-                    feasible_counts > 1.0,
+                    maximum_entropy > 1e-8,
                     entropy_values / maximum_entropy.clamp_min(1e-8),
                     torch.zeros_like(entropy_values),
                 ).clamp(0.0, 1.0)
@@ -1527,7 +1751,7 @@ class PPOAgent:
                 self._clip_policy_gradients()
                 self.optimizer.step()
                 with torch.no_grad():
-                    pred = torch.argmax(dist.probs, dim=-1)
+                    pred = dist.mode() if isinstance(dist, StructuredPathDistribution) else torch.argmax(dist.probs, dim=-1)
                     acc = (pred == actions_t[idx]).float().mean()
                 last_loss = float(loss.item())
                 last_acc = float(acc.item())

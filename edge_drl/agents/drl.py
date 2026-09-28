@@ -87,6 +87,27 @@ FAST_NODE_FEATURE_DIM = 9
 FAST_EDGE_FEATURE_DIM = 3
 FAST_CHAIN_GLOBAL_DIM = 16
 FAST_CHAIN_NODE_FEATURE_DIM = 13
+FAST_PATH_GLOBAL_DIM = 9
+FAST_PATH_STAGE_FEATURE_DIM = 5
+FAST_PATH_SUMMARY_DIM = 6
+FAST_STRUCT_NODE_FEATURE_DIM = 9
+FAST_STRUCT_EDGE_FEATURE_DIM = 5
+
+
+def fast_path_feature_dim(max_service_stages: int) -> int:
+    return FAST_PATH_SUMMARY_DIM + max_service_stages * FAST_PATH_STAGE_FEATURE_DIM
+
+
+def fast_path_obs_dim(max_service_stages: int, candidate_limit: int) -> int:
+    return FAST_PATH_GLOBAL_DIM + candidate_limit * fast_path_feature_dim(max_service_stages)
+
+
+def fast_structured_obs_dim(num_nodes: int, max_service_stages: int) -> int:
+    return (
+        FAST_PATH_GLOBAL_DIM
+        + max_service_stages * num_nodes * FAST_STRUCT_NODE_FEATURE_DIM
+        + (max_service_stages - 1) * num_nodes * num_nodes * FAST_STRUCT_EDGE_FEATURE_DIM
+    )
 
 
 class SlowWindowCritic(nn.Module):
@@ -1549,6 +1570,7 @@ class FastSchedulingPPOAgent:
     target_kl: float | None = 0.015
     minibatch_size: int = 512
     reservation_microbatch_size: int = 16
+    path_candidate_limit: int = 32
     load_balanced_updates: bool = True
     load_group_weights: tuple[float, ...] | None = None
     full_batch_kl_stop: bool = True
@@ -1561,10 +1583,23 @@ class FastSchedulingPPOAgent:
         init=False,
         repr=False,
     )
+    _path_selected_proxy_regrets: dict[int, list[float]] = field(default_factory=dict, init=False, repr=False)
+    _phase_sqrt_cache_key: tuple[object, ...] | None = field(default=None, init=False, repr=False)
+    _phase_sqrt_cache: np.ndarray | None = field(default=None, init=False, repr=False)
+    _phase_sqrt_cache_request_ids: set[int] = field(default_factory=set, init=False, repr=False)
+    _structured_route_cache_key: tuple[object, ...] | None = field(default=None, init=False, repr=False)
+    _structured_route_cache: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = field(
+        default=None, init=False, repr=False
+    )
+    _phase_link_sqrt_cache_key: tuple[object, ...] | None = field(default=None, init=False, repr=False)
+    _phase_link_sqrt_cache: np.ndarray | None = field(default=None, init=False, repr=False)
+    _phase_link_sqrt_by_request: dict[int, np.ndarray] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.reservation_microbatch_size < 1:
             raise ValueError("reservation_microbatch_size must be >= 1")
+        if self.path_candidate_limit < 1:
+            raise ValueError("path_candidate_limit must be >= 1")
         if self.entropy_coef < 0.0:
             raise ValueError("entropy_coef must be non-negative")
         if self.entropy_target is not None and self.entropy_target < 0.0:
@@ -1573,11 +1608,29 @@ class FastSchedulingPPOAgent:
             raise ValueError("entropy_max_coef must be at least entropy_coef")
         if self.entropy_adaptation_rate < 0.0:
             raise ValueError("entropy_adaptation_rate must be non-negative")
-        global_dim, node_feature_dim = fast_feature_dims(self.chain_context)
+        path_mode = self.policy_kind == "path_scorer"
+        structured_mode = self.policy_kind == "structured_path"
+        if structured_mode:
+            global_dim = FAST_PATH_GLOBAL_DIM
+            node_feature_dim = FAST_STRUCT_NODE_FEATURE_DIM
+        elif path_mode:
+            global_dim = FAST_PATH_GLOBAL_DIM
+            node_feature_dim = fast_path_feature_dim(self.max_service_stages)
+        else:
+            global_dim, node_feature_dim = fast_feature_dims(self.chain_context)
         self.entropy_current_coef = float(self.entropy_coef)
         self.ppo = PPOAgent(
-            obs_dim=fast_obs_dim(self.num_nodes, self.policy_kind, self.chain_context),
-            action_dim=self.num_nodes,
+            obs_dim=(
+                fast_path_obs_dim(self.max_service_stages, self.path_candidate_limit)
+                if path_mode
+                else fast_structured_obs_dim(self.num_nodes, self.max_service_stages)
+                if structured_mode
+                else fast_obs_dim(self.num_nodes, self.policy_kind, self.chain_context)
+            ),
+            action_dim=(
+                self.path_candidate_limit if path_mode else self.num_nodes ** self.max_service_stages
+                if structured_mode else self.num_nodes
+            ),
             hidden_dim=128,
             lr=self.lr,
             gamma=0.99,
@@ -1586,11 +1639,13 @@ class FastSchedulingPPOAgent:
             value_coef=self.value_coef,
             target_kl=self.target_kl,
             minibatch_size=self.minibatch_size,
-            policy_kind=self.policy_kind,
+            policy_kind="node_scorer" if path_mode else self.policy_kind,
             global_dim=global_dim,
             node_feature_dim=node_feature_dim,
-            edge_feature_dim=FAST_EDGE_FEATURE_DIM,
-            num_nodes=self.num_nodes,
+            candidate_cost_feature_index=3 if path_mode else None,
+            edge_feature_dim=FAST_STRUCT_EDGE_FEATURE_DIM if structured_mode else FAST_EDGE_FEATURE_DIM,
+            max_service_stages=self.max_service_stages if structured_mode else None,
+            num_nodes=self.path_candidate_limit if path_mode else self.num_nodes,
             group_balanced_updates=self.load_balanced_updates,
             group_weight_targets=self.load_group_weights,
             full_batch_kl_stop=self.full_batch_kl_stop,
@@ -1621,6 +1676,10 @@ class FastSchedulingPPOAgent:
         env._require_ready()
         if not requests:
             return []
+        if self.policy_kind == "structured_path":
+            return self._schedule_structured_batch(env, requests, deterministic=deterministic, record=record)
+        if self.policy_kind == "path_scorer":
+            return self._schedule_paths_batch(env, requests, deterministic=deterministic, record=record)
 
         schedules: list[list[int]] = [[] for _ in requests]
         transition_records: list[list[tuple[np.ndarray, np.ndarray, int, float, float]]] = [
@@ -1695,6 +1754,632 @@ class FastSchedulingPPOAgent:
                     )
         return schedules
 
+    def _expected_phase_sqrt_load(self, env: EdgeComputingEnv) -> np.ndarray:
+        """Expected KKT sqrt-load in each serial compute phase and node."""
+
+        env._require_ready()
+        assert env.scenario is not None and env.deployment is not None
+        key = (id(env.current_requests), float(env.current_time_minute), float(env.metrics["deployment_updates"]))
+        if key == self._phase_sqrt_cache_key and self._phase_sqrt_cache is not None:
+            return self._phase_sqrt_cache
+        capacities = np.asarray([node.compute_gcycles_per_s for node in env.scenario.nodes], dtype=np.float64)
+        sqrt_load = np.zeros((self.max_service_stages, self.num_nodes), dtype=np.float64)
+        for current in env.current_requests:
+            for stage_id, compute in enumerate(current.stage_compute_gcycles):
+                nodes = np.flatnonzero(env.deployment[current.service_id, stage_id])
+                if len(nodes):
+                    shares = capacities[nodes] / max(float(capacities[nodes].sum()), 1e-9)
+                    sqrt_load[stage_id, nodes] += float(current.request_count) * np.sqrt(max(float(compute), 0.0)) * shares
+        self._phase_sqrt_cache_key = key
+        self._phase_sqrt_cache = sqrt_load
+        self._phase_sqrt_cache_request_ids = {id(current) for current in env.current_requests}
+        return sqrt_load
+
+    def _structured_route_metrics(
+        self, env: EdgeComputingEnv
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Cache routes, their physical-link incidence, and residual capacities."""
+
+        env._require_ready()
+        assert env.scenario is not None
+        key = (id(env.current_requests), float(env.current_time_minute), float(env.metrics["deployment_updates"]))
+        if key == self._structured_route_cache_key and self._structured_route_cache is not None:
+            return self._structured_route_cache
+        bandwidth = env.scenario.bandwidth_mb_s
+        physical = np.isfinite(bandwidth) & (bandwidth > 0.0)
+        np.fill_diagonal(physical, False)
+        links = np.argwhere(physical)
+        hop_index = np.full((self.num_nodes, self.num_nodes), -1, dtype=np.int32)
+        hop_index[links[:, 0], links[:, 1]] = np.arange(len(links))
+        effective_capacity = bandwidth[links[:, 0], links[:, 1]] * np.maximum(
+            1.0 - 0.75 * env.link_load[links[:, 0], links[:, 1]], 0.10
+        )
+        incidence = np.zeros((self.num_nodes, self.num_nodes, len(links)), dtype=np.float64)
+        transfer_per_mb = np.full((self.num_nodes, self.num_nodes), np.inf, dtype=np.float64)
+        propagation = np.full_like(transfer_per_mb, np.inf)
+        for src in range(self.num_nodes):
+            for dst in range(self.num_nodes):
+                path = env.shortest_path(src, dst)
+                if path is None:
+                    continue
+                hop_ids = [hop_index[left, right] for left, right in zip(path, path[1:])]
+                if any(hop_id < 0 for hop_id in hop_ids):
+                    continue
+                incidence[src, dst, hop_ids] = 1.0
+                transfer_per_mb[src, dst] = sum(
+                    1.0 / max(float(effective_capacity[hop_id]), 1e-9) for hop_id in hop_ids
+                )
+                propagation[src, dst] = sum(
+                    float(env.scenario.propagation_ms[left, right]) / 1000.0
+                    for left, right in zip(path, path[1:])
+                )
+        self._structured_route_cache_key = key
+        self._structured_route_cache = (transfer_per_mb, propagation, incidence, effective_capacity)
+        return self._structured_route_cache
+
+    def _expected_phase_link_sqrt_load(self, env: EdgeComputingEnv) -> np.ndarray:
+        """Expected same-phase KKT link load from current requests' feasible routes.
+
+        The expectation only locates competing traffic.  A candidate route's own
+        multiplicity-weighted sqrt demand is added exactly on each of its hops.
+        """
+
+        env._require_ready()
+        assert env.scenario is not None and env.deployment is not None
+        key = (id(env.current_requests), float(env.current_time_minute), float(env.metrics["deployment_updates"]))
+        if key == self._phase_link_sqrt_cache_key and self._phase_link_sqrt_cache is not None:
+            return self._phase_link_sqrt_cache
+        _, _, incidence, _ = self._structured_route_metrics(env)
+        capacities = np.asarray([node.compute_gcycles_per_s for node in env.scenario.nodes], dtype=np.float64)
+        sqrt_load = np.zeros((2 * self.max_service_stages - 1, incidence.shape[-1]), dtype=np.float64)
+        by_request: dict[int, np.ndarray] = {}
+        for current in env.current_requests:
+            expected = np.zeros_like(sqrt_load)
+            stage_nodes = [
+                np.flatnonzero(env.deployment[current.service_id, stage_id])
+                for stage_id in range(len(current.stage_compute_gcycles))
+            ]
+            shares = [
+                capacities[nodes] / max(float(capacities[nodes].sum()), 1e-9)
+                for nodes in stage_nodes
+            ]
+            if len(stage_nodes[0]) and current.input_mb > 0.0:
+                expected[0] = (
+                    float(current.request_count)
+                    * np.sqrt(float(current.input_mb))
+                    * (shares[0] @ incidence[current.home_node, stage_nodes[0]])
+                )
+            for stage_id in range(len(stage_nodes) - 1):
+                src_nodes, dst_nodes = stage_nodes[stage_id : stage_id + 2]
+                data_mb = float(current.stage_output_mb[stage_id])
+                if not len(src_nodes) or not len(dst_nodes) or data_mb <= 0.0:
+                    continue
+                pair_shares = np.outer(shares[stage_id], shares[stage_id + 1]).reshape(-1)
+                route_hops = incidence[np.ix_(src_nodes, dst_nodes)].reshape(-1, incidence.shape[-1])
+                expected[2 * stage_id + 2] = (
+                    float(current.request_count) * np.sqrt(data_mb) * (pair_shares @ route_hops)
+                )
+            sqrt_load += expected
+            by_request[id(current)] = expected
+        self._phase_link_sqrt_cache_key = key
+        self._phase_link_sqrt_cache = sqrt_load
+        self._phase_link_sqrt_by_request = by_request
+        return sqrt_load
+
+    def _structured_link_transfer_costs(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        *,
+        phase: int,
+        data_mb: float,
+        reservation_link_sqrt_delta: np.ndarray | None,
+    ) -> np.ndarray:
+        """Predict per-request route delay using the environment's phase KKT rule."""
+
+        _, _, incidence, effective_capacity = self._structured_route_metrics(env)
+        if data_mb <= 0.0:
+            return np.zeros((self.num_nodes, self.num_nodes), dtype=np.float64)
+        baseline = self._expected_phase_link_sqrt_load(env)[phase]
+        own_expected = self._phase_link_sqrt_by_request.get(id(request))
+        competing = baseline.copy()
+        if own_expected is not None:
+            competing -= own_expected[phase]
+        if reservation_link_sqrt_delta is not None:
+            competing += reservation_link_sqrt_delta[phase]
+        own_sqrt = float(request.request_count) * np.sqrt(float(data_mb))
+        per_hop_delay = np.sqrt(float(data_mb)) * (
+            np.maximum(competing, 0.0) + own_sqrt
+        ) / np.maximum(effective_capacity, 1e-9)
+        return (incidence.reshape(-1, incidence.shape[-1]) @ per_hop_delay).reshape(
+            self.num_nodes, self.num_nodes
+        )
+
+    def _structured_path_state(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        *,
+        reservation_sqrt_delta: np.ndarray | None = None,
+        reservation_link_sqrt_delta: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Expose all deployed nodes and routable transitions; never preselect paths."""
+
+        env._require_ready()
+        assert env.scenario is not None and env.deployment is not None
+        stages = self.max_service_stages
+        stage_count = len(request.stage_compute_gcycles)
+        capacities = np.asarray([node.compute_gcycles_per_s for node in env.scenario.nodes], dtype=np.float64)
+        max_capacity = max(float(capacities.max()), 1e-9)
+        baseline_sqrt = self._expected_phase_sqrt_load(env)
+        transfer_per_mb, propagation, _, _ = self._structured_route_metrics(env)
+        ingress_transfer = self._structured_link_transfer_costs(
+            env,
+            request,
+            phase=0,
+            data_mb=float(request.input_mb),
+            reservation_link_sqrt_delta=reservation_link_sqrt_delta,
+        )
+        node_features = np.zeros((stages, self.num_nodes, FAST_STRUCT_NODE_FEATURE_DIM), dtype=np.float32)
+        edge_features = np.zeros(
+            (stages - 1, self.num_nodes, self.num_nodes, FAST_STRUCT_EDGE_FEATURE_DIM), dtype=np.float32
+        )
+        node_mask = np.zeros((stages, self.num_nodes), dtype=bool)
+        for stage_id, compute_raw in enumerate(request.stage_compute_gcycles):
+            nodes = np.flatnonzero(env.deployment[request.service_id, stage_id])
+            if not len(nodes):
+                continue
+            compute = max(float(compute_raw), 0.0)
+            own_sqrt = float(request.request_count) * np.sqrt(compute)
+            shares = capacities[nodes] / max(float(capacities[nodes].sum()), 1e-9)
+            baseline_without_own = baseline_sqrt[stage_id, nodes].copy()
+            if id(request) in self._phase_sqrt_cache_request_ids:
+                baseline_without_own -= own_sqrt * shares
+            if reservation_sqrt_delta is not None:
+                baseline_without_own += reservation_sqrt_delta[stage_id, nodes]
+            competing_sqrt = np.maximum(baseline_without_own, 0.0)
+            for offset, node_id in enumerate(nodes):
+                effective_capacity = capacities[node_id] * max(
+                    1.0 - 0.75 * float(env.node_compute_load[node_id]), 0.10
+                )
+                predicted_compute = np.sqrt(compute) * (competing_sqrt[offset] + own_sqrt) / max(effective_capacity, 1e-9)
+                externality = np.sqrt(compute) * competing_sqrt[offset] / max(effective_capacity, 1e-9)
+                ingress = 0.0
+                if stage_id == 0:
+                    per_mb = transfer_per_mb[request.home_node, node_id]
+                    if not np.isfinite(per_mb):
+                        continue
+                    ingress = ingress_transfer[request.home_node, node_id] + propagation[request.home_node, node_id]
+                node_mask[stage_id, node_id] = True
+                node_features[stage_id, node_id] = [
+                    node_id / max(self.num_nodes - 1, 1),
+                    stage_id / max(stages - 1, 1),
+                    capacities[node_id] / max_capacity,
+                    float(env.node_compute_load[node_id]),
+                    float(np.log1p(competing_sqrt[offset] / max(effective_capacity, 1e-9))),
+                    float(np.log1p(compute / max(effective_capacity, 1e-9))),
+                    float(np.log1p(predicted_compute)),
+                    float(np.log1p(externality)),
+                    float(np.log1p(ingress)),
+                ]
+        reachable = np.isfinite(transfer_per_mb)
+        finite_propagation = np.where(reachable, propagation, 0.0)
+        for stage_id in range(stage_count - 1):
+            data_mb = float(request.stage_output_mb[stage_id])
+            transfer = self._structured_link_transfer_costs(
+                env,
+                request,
+                phase=2 * stage_id + 2,
+                data_mb=data_mb,
+                reservation_link_sqrt_delta=reservation_link_sqrt_delta,
+            )
+            total = transfer + finite_propagation
+            edge_features[stage_id, ..., 0] = reachable
+            edge_features[stage_id, ..., 1] = np.log1p(total)
+            edge_features[stage_id, ..., 2] = np.log1p(transfer)
+            edge_features[stage_id, ..., 3] = np.log1p(finite_propagation)
+            edge_features[stage_id, ..., 4] = np.eye(self.num_nodes, dtype=np.float32)
+
+        possible = node_mask[0].copy()
+        for stage_id in range(1, stage_count):
+            possible = node_mask[stage_id] & (
+                (possible[:, None] & (edge_features[stage_id - 1, ..., 0] > 0.5)).any(axis=0)
+            )
+        if not possible.any():
+            # Keep a defined action so normal environment penalties report an
+            # infeasible deployment/topology, rather than producing NaN logits.
+            node_mask[:stage_count] = False
+            node_mask[:stage_count, request.home_node] = True
+            for stage_id in range(stage_count - 1):
+                edge_features[stage_id] = 0.0
+                edge_features[stage_id, request.home_node, request.home_node, 0] = 1.0
+        for stage_id in range(stage_count, stages):
+            node_mask[stage_id, 0] = True
+            edge_features[stage_id - 1, :, 0, 0] = 1.0
+
+        global_features = np.asarray(
+            [
+                request.service_id / max(env.config.num_service_types - 1, 1),
+                float(request.input_mb) / 3.0,
+                float(sum(request.stage_compute_gcycles)) / 20.0,
+                float(request.deadline_s),
+                float(request.request_count) / 100.0,
+                float(env.current_time_minute) / max(env.config.episode_minutes, 1),
+                stage_count / max(stages, 1),
+                float(np.log1p(len(env.current_requests))) / np.log1p(5_000.0),
+                float(np.mean(env.node_compute_load)),
+            ],
+            dtype=np.float32,
+        )
+        state = np.concatenate([global_features, node_features.reshape(-1), edge_features.reshape(-1)])
+        return state, node_mask.reshape(-1)
+
+    def _decode_structured_path(self, action: int, stage_count: int) -> list[int]:
+        return [int(action // (self.num_nodes ** stage_id) % self.num_nodes) for stage_id in range(stage_count)]
+
+    def _structured_proxy_regret(self, state: np.ndarray, mask: np.ndarray, path: list[int]) -> float:
+        stages = self.max_service_stages
+        count = len(path)
+        node_end = FAST_PATH_GLOBAL_DIM + stages * self.num_nodes * FAST_STRUCT_NODE_FEATURE_DIM
+        node_features = state[FAST_PATH_GLOBAL_DIM:node_end].reshape(stages, self.num_nodes, FAST_STRUCT_NODE_FEATURE_DIM)
+        edge_features = state[node_end:].reshape(
+            stages - 1, self.num_nodes, self.num_nodes, FAST_STRUCT_EDGE_FEATURE_DIM
+        )
+        node_mask = mask.reshape(stages, self.num_nodes)
+        node_cost = np.expm1(node_features[:count, :, 6]).astype(np.float64)
+        node_cost[0] += np.expm1(node_features[0, :, 8])
+        best = np.where(node_mask[0], node_cost[0], np.inf)
+        selected = float(node_cost[0, path[0]])
+        for stage_id in range(1, count):
+            route = np.expm1(edge_features[stage_id - 1, ..., 1])
+            route = np.where(edge_features[stage_id - 1, ..., 0] > 0.5, route, np.inf)
+            best = np.where(node_mask[stage_id], node_cost[stage_id] + np.min(best[:, None] + route, axis=0), np.inf)
+            selected += float(node_cost[stage_id, path[stage_id]] + route[path[stage_id - 1], path[stage_id]])
+        optimum = float(np.min(best))
+        return max(selected - optimum, 0.0) if np.isfinite(selected + optimum) else 0.0
+
+    def _schedule_structured_batch(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        *,
+        deterministic: bool,
+        record: bool,
+    ) -> list[list[int]]:
+        """Sample one masked complete path per request without a path slate."""
+
+        assert env.scenario is not None and env.deployment is not None
+        self._path_selected_proxy_regrets.clear()
+        capacities = np.asarray([node.compute_gcycles_per_s for node in env.scenario.nodes], dtype=np.float64)
+        reservation_sqrt_delta = np.zeros((self.max_service_stages, self.num_nodes), dtype=np.float64)
+        _, _, route_incidence, _ = self._structured_route_metrics(env)
+        reservation_link_sqrt_delta = np.zeros(
+            (2 * self.max_service_stages - 1, route_incidence.shape[-1]), dtype=np.float64
+        )
+        schedules: list[list[int]] = []
+        for chunk_start in range(0, len(requests), self.reservation_microbatch_size):
+            chunk = requests[chunk_start : chunk_start + self.reservation_microbatch_size]
+            observations = [
+                self._structured_path_state(
+                    env,
+                    request,
+                    reservation_sqrt_delta=reservation_sqrt_delta,
+                    reservation_link_sqrt_delta=reservation_link_sqrt_delta,
+                )
+                for request in chunk
+            ]
+            actions, logprobs, values = self.ppo.act_batch(
+                [state for state, _ in observations],
+                [mask for _, mask in observations],
+                deterministic=deterministic,
+            )
+            for local_idx, request in enumerate(chunk):
+                state, mask = observations[local_idx]
+                action = int(actions[local_idx])
+                path = self._decode_structured_path(action, len(request.stage_compute_gcycles))
+                schedules.append(path)
+                self._path_selected_proxy_regrets.setdefault(id(request), []).append(
+                    self._structured_proxy_regret(state, mask, path)
+                )
+                if record:
+                    self.ppo.buffer.states.append(state)
+                    self.ppo.buffer.masks.append(mask)
+                    self.ppo.buffer.actions.append(action)
+                    self.ppo.buffer.logprobs.append(float(logprobs[local_idx]))
+                    self.ppo.buffer.values.append(float(values[local_idx]))
+                    load_group = env.config.demand_load_group
+                    self.ppo.buffer.sample_groups.append(
+                        float(env.config.demand_load_multiplier if load_group is None else load_group)
+                    )
+            for local_idx, request in enumerate(chunk):
+                path = schedules[chunk_start + local_idx]
+                own_expected_links = self._phase_link_sqrt_by_request.get(id(request))
+                if own_expected_links is not None:
+                    reservation_link_sqrt_delta -= own_expected_links
+                if request.input_mb > 0.0:
+                    reservation_link_sqrt_delta[0] += (
+                        float(request.request_count)
+                        * np.sqrt(float(request.input_mb))
+                        * route_incidence[request.home_node, path[0]]
+                    )
+                for stage_id in range(len(path) - 1):
+                    data_mb = float(request.stage_output_mb[stage_id])
+                    if data_mb > 0.0:
+                        reservation_link_sqrt_delta[2 * stage_id + 2] += (
+                            float(request.request_count)
+                            * np.sqrt(data_mb)
+                            * route_incidence[path[stage_id], path[stage_id + 1]]
+                        )
+                for stage_id, node_id in enumerate(path):
+                    nodes = np.flatnonzero(env.deployment[request.service_id, stage_id])
+                    if not len(nodes):
+                        continue
+                    own_sqrt = float(request.request_count) * np.sqrt(max(float(request.stage_compute_gcycles[stage_id]), 0.0))
+                    shares = capacities[nodes] / max(float(capacities[nodes].sum()), 1e-9)
+                    if id(request) in self._phase_sqrt_cache_request_ids:
+                        reservation_sqrt_delta[stage_id, nodes] -= own_sqrt * shares
+                    reservation_sqrt_delta[stage_id, node_id] += own_sqrt
+        return schedules
+
+    def _schedule_paths_batch(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        *,
+        deterministic: bool,
+        record: bool,
+    ) -> list[list[int]]:
+        """Choose one complete path per request, then reserve its stage work."""
+
+        schedules: list[list[int]] = []
+        self._path_selected_proxy_regrets.clear()
+        reservation_node_delta = np.zeros(self.num_nodes, dtype=np.float64)
+        reservation_stage_delta: dict[tuple[int, int], np.ndarray] = {}
+        for chunk_start in range(0, len(requests), self.reservation_microbatch_size):
+            chunk = requests[chunk_start : chunk_start + self.reservation_microbatch_size]
+            candidate_sets = [
+                self._path_candidates(
+                    env,
+                    request,
+                    reservation_stage_delta=reservation_stage_delta,
+                )
+                for request in chunk
+            ]
+            actions, logprobs, values = self.ppo.act_batch(
+                [item[1] for item in candidate_sets],
+                [item[2] for item in candidate_sets],
+                deterministic=deterministic,
+            )
+            for local_idx, request in enumerate(chunk):
+                paths, state, mask = candidate_sets[local_idx]
+                action = int(actions[local_idx])
+                schedules.append(list(paths[action]))
+                feature_dim = fast_path_feature_dim(self.max_service_stages)
+                best_cost = float(np.expm1(state[FAST_PATH_GLOBAL_DIM]))
+                chosen_cost = float(np.expm1(state[FAST_PATH_GLOBAL_DIM + action * feature_dim]))
+                self._path_selected_proxy_regrets.setdefault(id(request), []).append(
+                    max(chosen_cost - best_cost, 0.0)
+                )
+                if record:
+                    self.ppo.buffer.states.append(state)
+                    self.ppo.buffer.masks.append(mask)
+                    self.ppo.buffer.actions.append(action)
+                    self.ppo.buffer.logprobs.append(float(logprobs[local_idx]))
+                    self.ppo.buffer.values.append(float(values[local_idx]))
+                    load_group = env.config.demand_load_group
+                    self.ppo.buffer.sample_groups.append(
+                        float(env.config.demand_load_multiplier if load_group is None else load_group)
+                    )
+            for local_idx, request in enumerate(chunk):
+                for stage_id, node_id in enumerate(schedules[chunk_start + local_idx]):
+                    self._reserve_compute_work(
+                        env,
+                        request,
+                        stage_id,
+                        node_id,
+                        reservation_node_delta,
+                        reservation_stage_delta,
+                    )
+        return schedules
+
+    def _path_candidates(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        *,
+        reservation_stage_delta: dict[tuple[int, int], np.ndarray] | None = None,
+    ) -> tuple[list[tuple[int, ...]], np.ndarray, np.ndarray]:
+        """Find the best K deployed, routed paths under a causal cost proxy.
+
+        The proxy is used only to construct a bounded candidate set. The PPO
+        actor scores every retained path and may choose any of them. Padding
+        slots are masked, so the action is a path slot rather than a node id.
+        """
+
+        env._require_ready()
+        assert env.scenario is not None and env.deployment is not None
+        stage_count = len(request.stage_compute_gcycles)
+        stage_masks = env.scheduler_candidate_mask(request)
+        stage_nodes = [np.flatnonzero(stage_masks[stage_id]).tolist() for stage_id in range(stage_count)]
+        capacities = np.asarray([node.compute_gcycles_per_s for node in env.scenario.nodes], dtype=np.float64)
+        stage_costs = np.full((stage_count, self.num_nodes), np.inf, dtype=np.float64)
+        stage_pressures = np.zeros((stage_count, self.num_nodes), dtype=np.float64)
+        _, expected_stage_work = self._expected_current_compute_workload(env)
+        for stage_id, nodes in enumerate(stage_nodes):
+            if not nodes:
+                continue
+            key = (request.service_id, stage_id)
+            # KKT settlement separates serial stages, but all services at the
+            # same stage phase compete for the same node capacity.
+            competing_work = sum(
+                (work for (_, phase), work in expected_stage_work.items() if phase == stage_id),
+                np.zeros(self.num_nodes, dtype=np.float64),
+            )
+            if reservation_stage_delta is not None:
+                competing_work += sum(
+                    (work for (_, phase), work in reservation_stage_delta.items() if phase == stage_id),
+                    np.zeros(self.num_nodes, dtype=np.float64),
+                )
+            own_work = float(request.stage_compute_gcycles[stage_id]) * float(request.request_count)
+            shares = capacities[nodes] / max(float(capacities[nodes].sum()), 1e-9)
+            competing_work[nodes] = np.maximum(competing_work[nodes] - own_work * shares, 0.0)
+            for node_id in nodes:
+                effective_capacity = capacities[node_id] * max(
+                    1.0 - 0.75 * float(env.node_compute_load[node_id]), 0.10
+                )
+                pressure = float(competing_work[node_id]) / max(effective_capacity, 1e-9)
+                stage_pressures[stage_id, node_id] = pressure
+                stage_costs[stage_id, node_id] = (
+                    float(request.stage_compute_gcycles[stage_id])
+                    / max(effective_capacity, 1e-9)
+                    * (1.0 + np.log1p(pressure))
+                )
+
+        route_cache: dict[tuple[int, int, int], float] = {}
+
+        def route_cost(stage_id: int, src_node: int, dst_node: int) -> float:
+            key = (stage_id, src_node, dst_node)
+            if key not in route_cache:
+                data_mb = (
+                    float(request.input_mb)
+                    if stage_id == 0
+                    else float(request.stage_output_mb[stage_id - 1])
+                )
+                transfer_s, propagation_s = self._route_proxy_delay(env, src_node, dst_node, data_mb)
+                route_cache[key] = transfer_s + propagation_s
+            return route_cache[key]
+
+        # Exact additive lower bounds let the bounded beam retain the K best
+        # complete paths under this proxy without enumerating every product.
+        future = np.full((stage_count, self.num_nodes), np.inf, dtype=np.float64)
+        if stage_count:
+            future[stage_count - 1, stage_nodes[-1]] = 0.0
+        for stage_id in range(stage_count - 2, -1, -1):
+            for node_id in stage_nodes[stage_id]:
+                future[stage_id, node_id] = min(
+                    (
+                        route_cost(stage_id + 1, node_id, next_node)
+                        + stage_costs[stage_id + 1, next_node]
+                        + future[stage_id + 1, next_node]
+                        for next_node in stage_nodes[stage_id + 1]
+                    ),
+                    default=float("inf"),
+                )
+        beam: list[tuple[float, float, tuple[int, ...]]] = [(0.0, 0.0, ())]
+        for stage_id, nodes in enumerate(stage_nodes):
+            expanded: list[tuple[float, float, tuple[int, ...]]] = []
+            for _, prefix_cost, prefix in beam:
+                previous = request.home_node if not prefix else prefix[-1]
+                for node_id in nodes:
+                    cost = prefix_cost + route_cost(stage_id, previous, node_id) + stage_costs[stage_id, node_id]
+                    bound = cost + future[stage_id, node_id]
+                    if np.isfinite(bound):
+                        expanded.append((bound, cost, prefix + (node_id,)))
+            expanded.sort(key=lambda item: (item[0], item[2]))
+            beam = expanded[: self.path_candidate_limit]
+            if not beam:
+                break
+
+        if beam and len(beam[0][2]) == stage_count:
+            # Keep some start-node diversity: otherwise a top-K proxy list can
+            # contain only variants of one ingress node and permanently hide
+            # another deployed replica from PPO exploration.
+            anchors: list[tuple[float, tuple[int, ...]]] = []
+            for first_node in stage_nodes[0]:
+                total = route_cost(0, request.home_node, first_node) + stage_costs[0, first_node]
+                if not np.isfinite(total + future[0, first_node]):
+                    continue
+                path = (first_node,)
+                for stage_id in range(1, stage_count):
+                    previous = path[-1]
+                    next_node = min(
+                        stage_nodes[stage_id],
+                        key=lambda node_id: (
+                            route_cost(stage_id, previous, node_id)
+                            + stage_costs[stage_id, node_id]
+                            + future[stage_id, node_id],
+                            node_id,
+                        ),
+                    )
+                    total += route_cost(stage_id, previous, next_node) + stage_costs[stage_id, next_node]
+                    path += (next_node,)
+                anchors.append((float(total), path))
+            anchors.sort(key=lambda item: (item[0], item[1]))
+            diversity_slots = min(len(anchors), self.path_candidate_limit, max(2, self.path_candidate_limit // 4))
+            retained = anchors[:diversity_slots]
+            seen = {path for _, path in retained}
+            for _, cost, path in beam:
+                if len(retained) >= self.path_candidate_limit:
+                    break
+                if path not in seen:
+                    retained.append((float(cost), path))
+                    seen.add(path)
+            retained.sort(key=lambda item: (item[0], item[1]))
+            paths = [path for _, path in retained]
+            best_cost = retained[0][0]
+        else:
+            # A broken deployment or disconnected graph has no valid path.
+            # Preserve the environment's invalid-action penalty and keep PPO's
+            # categorical distribution well-defined with one fallback slot.
+            paths = [tuple(nodes[0] if nodes else request.home_node for nodes in stage_nodes)]
+            best_cost = 0.0
+
+        global_features = np.asarray(
+            [
+                request.service_id / max(env.config.num_service_types - 1, 1),
+                float(request.input_mb) / 3.0,
+                float(sum(request.stage_compute_gcycles)) / 20.0,
+                float(request.deadline_s),
+                float(request.request_count) / 100.0,
+                float(env.current_time_minute) / max(env.config.episode_minutes, 1),
+                stage_count / max(self.max_service_stages, 1),
+                float(np.log1p(len(env.current_requests))) / np.log1p(5_000.0),
+                float(np.mean(env.node_compute_load)),
+            ],
+            dtype=np.float32,
+        )
+        feature_dim = fast_path_feature_dim(self.max_service_stages)
+        features = np.zeros((self.path_candidate_limit, feature_dim), dtype=np.float32)
+        mask = np.zeros(self.path_candidate_limit, dtype=bool)
+        for path_idx, path in enumerate(paths):
+            mask[path_idx] = True
+            compute_total = 0.0
+            route_total = 0.0
+            max_pressure = 0.0
+            per_stage: list[float] = []
+            previous = request.home_node
+            for stage_id, node_id in enumerate(path):
+                compute_s = float(stage_costs[stage_id, node_id])
+                route_s = route_cost(stage_id, previous, node_id)
+                if not np.isfinite(compute_s + route_s):
+                    compute_s, route_s = 10.0, 10.0
+                compute_total += compute_s
+                route_total += route_s
+                max_pressure = max(max_pressure, float(stage_pressures[stage_id, node_id]))
+                per_stage.extend(
+                    [
+                        node_id / max(self.num_nodes - 1, 1),
+                        capacities[node_id] / max(float(capacities.max()), 1e-9),
+                        float(env.node_compute_load[node_id]),
+                        float(np.log1p(compute_s)),
+                        float(np.log1p(route_s)),
+                    ]
+                )
+                previous = node_id
+            total = compute_total + route_total
+            cross_count = sum(left != right for left, right in zip(path, path[1:]))
+            summary = [
+                float(np.log1p(total)),
+                float(np.log1p(compute_total)),
+                float(np.log1p(route_total)),
+                float(np.log1p(max(total - best_cost, 0.0))),
+                cross_count / max(stage_count - 1, 1),
+                max_pressure / (1.0 + max_pressure),
+            ]
+            features[path_idx, : len(summary) + len(per_stage)] = summary + per_stage
+        state = np.concatenate([global_features, features.reshape(-1)])
+        return paths, state, mask
+
     def schedule_with_diagnostics(
         self,
         env: EdgeComputingEnv,
@@ -1704,6 +2389,16 @@ class FastSchedulingPPOAgent:
         if request is None:
             assert env.current_request is not None
             request = env.current_request
+
+        if self.policy_kind == "structured_path":
+            state, mask = self._structured_path_state(env, request)
+            stats = self.ppo.action_stats(state, mask)
+            return self._decode_structured_path(int(stats["action"]), len(request.stage_compute_gcycles)), [stats]
+
+        if self.policy_kind == "path_scorer":
+            candidates, state, mask = self._path_candidates(env, request)
+            stats = self.ppo.action_stats(state, mask)
+            return list(candidates[int(stats["action"])]), [stats]
 
         stage_nodes: list[int] = []
         diagnostics: list[dict[str, float | int]] = []
@@ -1721,6 +2416,12 @@ class FastSchedulingPPOAgent:
 
     def assign_schedule_rewards(self, rewards: list[float], done: bool, weight: float = 1.0) -> None:
         """Attach one additive latency reward to each stage action."""
+
+        if self.policy_kind in {"path_scorer", "structured_path"}:
+            self.ppo.buffer.rewards.append(float(sum(rewards)))
+            self.ppo.buffer.dones.append(True)
+            self.ppo.buffer.weights.append(float(weight))
+            return
 
         for stage_idx, reward in enumerate(rewards):
             self.ppo.buffer.rewards.append(float(reward))
@@ -1904,6 +2605,15 @@ class FastSchedulingPPOAgent:
         one-stage downstream lookahead.  It is deliberately independent of the
         actor logits so it remains a useful difference-reward signal.
         """
+
+        if self.policy_kind in {"path_scorer", "structured_path"}:
+            # A stage-local alternative can be worse for the complete chain.
+            # Attribute the path-level proxy gap once, not at every stage.
+            queued = self._path_selected_proxy_regrets.get(id(request), [])
+            regret = queued.pop(0) if queued else 0.0
+            return [regret] + [
+                0.0
+            ] * max(len(stage_nodes) - 1, 0)
 
         regrets: list[float] = []
         partial: list[int] = []
@@ -2407,6 +3117,7 @@ class HierarchicalPPOAgent:
         fast_policy_kind: str = "gat_node_scorer",
         fast_chain_context: str = "legacy",
         fast_reservation_microbatch_size: int = 16,
+        fast_path_candidate_limit: int = 32,
         fast_load_balanced_updates: bool = True,
         fast_load_group_weights: tuple[float, ...] | None = None,
         fast_full_batch_kl_stop: bool = True,
@@ -2487,6 +3198,7 @@ class HierarchicalPPOAgent:
                 target_kl=fast_target_kl,
                 minibatch_size=fast_minibatch_size,
                 reservation_microbatch_size=fast_reservation_microbatch_size,
+                path_candidate_limit=fast_path_candidate_limit,
                 load_balanced_updates=fast_load_balanced_updates,
                 load_group_weights=fast_load_group_weights,
                 full_batch_kl_stop=fast_full_batch_kl_stop,
