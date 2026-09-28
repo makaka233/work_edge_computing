@@ -1655,7 +1655,11 @@ class FastSchedulingPPOAgent:
             hidden_dim=128,
             lr=self.lr,
             gamma=1.0 if kkt_autoregressive_mode else 0.99,
-            gae_lambda=1.0 if kkt_autoregressive_mode else 0.95,
+            # The undiscounted batch objective still uses gamma=1. Lambda is
+            # kept below one so the centralized critic can reduce variance over
+            # the hundreds of causal request-group decisions in a one-second
+            # batch instead of always using a noisy full Monte-Carlo suffix.
+            gae_lambda=0.95,
             k_epochs=self.k_epochs,
             entropy_coef=self.entropy_current_coef,
             value_coef=self.value_coef,
@@ -2913,6 +2917,15 @@ class FastSchedulingPPOAgent:
         metrics["entropy_saturated"] = float(
             np.isclose(self.entropy_current_coef, self.entropy_max_coef)
         )
+        if self.policy_kind == "kkt_autoregressive_path":
+            policy = self.ppo.policy
+            metrics["compute_guidance_scale"] = float(
+                torch.nn.functional.softplus(policy.compute_guidance_log_scale).detach().cpu().item()
+            )
+            metrics["route_guidance_scale"] = float(
+                torch.nn.functional.softplus(policy.route_guidance_log_scale).detach().cpu().item()
+            )
+            metrics["neural_residual_scale"] = float(policy.neural_residual_scale)
         return metrics
 
     def _build_state(

@@ -420,6 +420,9 @@ class StructuredPathActorCritic(nn.Module):
         ingress_cost_feature_index: int = 8,
         route_cost_feature_index: int = 1,
         centralized_critic: bool = False,
+        normalized_cost_guidance: bool = False,
+        neural_residual_scale: float = 1.0,
+        initial_cost_guidance_scale: float = 0.3132616875,
     ):
         super().__init__()
         self.global_dim = global_dim
@@ -431,6 +434,12 @@ class StructuredPathActorCritic(nn.Module):
         self.ingress_cost_feature_index = ingress_cost_feature_index
         self.route_cost_feature_index = route_cost_feature_index
         self.centralized_critic = bool(centralized_critic)
+        self.normalized_cost_guidance = bool(normalized_cost_guidance)
+        self.neural_residual_scale = float(neural_residual_scale)
+        if self.neural_residual_scale < 0.0:
+            raise ValueError("neural_residual_scale must be non-negative")
+        if initial_cost_guidance_scale <= 0.0:
+            raise ValueError("initial_cost_guidance_scale must be positive")
         self.node_offset = global_dim
         self.edge_offset = global_dim + max_service_stages * num_nodes * node_feature_dim
         self.global_encoder = nn.Sequential(nn.Linear(global_dim, hidden_dim), nn.ReLU())
@@ -446,8 +455,36 @@ class StructuredPathActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
-        self.compute_guidance_log_scale = nn.Parameter(torch.tensor(-1.0))
-        self.route_guidance_log_scale = nn.Parameter(torch.tensor(-1.0))
+        guidance_log_scale = math.log(math.expm1(float(initial_cost_guidance_scale)))
+        self.compute_guidance_log_scale = nn.Parameter(torch.tensor(guidance_log_scale))
+        self.route_guidance_log_scale = nn.Parameter(torch.tensor(guidance_log_scale))
+        if self.normalized_cost_guidance:
+            # The causal KKT mode starts from a physical-cost policy prior. A
+            # random final scorer previously dominated the tiny log-second cost
+            # features and made the initial complete-path policy almost uniform.
+            # Zeroing only the output heads keeps the encoders trainable while
+            # making the learned network a residual correction to that prior.
+            nn.init.zeros_(self.node_scorer[-1].weight)
+            nn.init.zeros_(self.node_scorer[-1].bias)
+            nn.init.zeros_(self.edge_scorer.weight)
+            nn.init.zeros_(self.edge_scorer.bias)
+
+    @staticmethod
+    def _masked_standardize(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        dims: int | tuple[int, ...],
+    ) -> torch.Tensor:
+        """Put feasible candidate costs on a stable within-decision scale."""
+
+        mask_float = mask.to(values.dtype)
+        count = mask_float.sum(dim=dims, keepdim=True).clamp_min(1.0)
+        mean = (values * mask_float).sum(dim=dims, keepdim=True) / count
+        variance = (
+            torch.square(values - mean) * mask_float
+        ).sum(dim=dims, keepdim=True) / count
+        standardized = (values - mean) / torch.sqrt(variance + 1e-4)
+        return torch.where(mask, standardized.clamp(-5.0, 5.0), torch.zeros_like(values))
 
     def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[StructuredPathDistribution, torch.Tensor]:
         batch_size = states.shape[0]
@@ -465,26 +502,34 @@ class StructuredPathActorCritic(nn.Module):
         global_emb = self.global_encoder(global_features)
         node_emb = self.node_encoder(node_features)
         context = global_emb[:, None, None, :].expand(-1, stages, nodes, -1)
-        unary = self.node_scorer(torch.cat([context, node_emb], dim=-1)).squeeze(-1)
-        unary = unary - torch.nn.functional.softplus(self.compute_guidance_log_scale) * node_features[
-            ..., self.compute_cost_feature_index
-        ]
-        unary[:, 0] = unary[:, 0] - torch.nn.functional.softplus(self.route_guidance_log_scale) * node_features[
-            :, 0, :, self.ingress_cost_feature_index
-        ]
+        unary_residual = self.node_scorer(torch.cat([context, node_emb], dim=-1)).squeeze(-1)
+        compute_cost = node_features[..., self.compute_cost_feature_index]
+        ingress_cost = node_features[:, 0, :, self.ingress_cost_feature_index]
+        compute_scale = torch.nn.functional.softplus(self.compute_guidance_log_scale)
+        route_scale = torch.nn.functional.softplus(self.route_guidance_log_scale)
+        if self.normalized_cost_guidance:
+            compute_cost = self._masked_standardize(compute_cost, node_mask, dims=-1)
+            ingress_cost = self._masked_standardize(
+                ingress_cost,
+                node_mask[:, 0],
+                dims=-1,
+            )
+        unary = self.neural_residual_scale * unary_residual - compute_scale * compute_cost
+        unary[:, 0] = unary[:, 0] - route_scale * ingress_cost
         active_nodes = torch.arange(stages, device=states.device)[None, :] < stage_count[:, None]
         unary = torch.where(active_nodes[:, :, None], unary, torch.zeros_like(unary))
 
         src = self.src_proj(node_emb[:, :-1])
         dst = self.dst_proj(node_emb[:, 1:])
-        pair = torch.einsum("bsih,bsjh->bsij", src, dst) / math.sqrt(src.shape[-1])
-        pair = pair + self.edge_scorer(edge_features).squeeze(-1)
-        pair = pair - torch.nn.functional.softplus(self.route_guidance_log_scale) * edge_features[
-            ..., self.route_cost_feature_index
-        ]
+        pair_residual = torch.einsum("bsih,bsjh->bsij", src, dst) / math.sqrt(src.shape[-1])
+        pair_residual = pair_residual + self.edge_scorer(edge_features).squeeze(-1)
+        route_cost = edge_features[..., self.route_cost_feature_index]
+        pair_mask = edge_features[..., 0] > 0.5
+        if self.normalized_cost_guidance:
+            route_cost = self._masked_standardize(route_cost, pair_mask, dims=(-2, -1))
+        pair = self.neural_residual_scale * pair_residual - route_scale * route_cost
         active_edges = torch.arange(stages - 1, device=states.device)[None, :] < (stage_count - 1)[:, None]
         pair = torch.where(active_edges[:, :, None, None], pair, torch.zeros_like(pair))
-        pair_mask = edge_features[..., 0] > 0.5
         distribution = StructuredPathDistribution(unary, pair, node_mask, pair_mask)
 
         pooling_mask = (node_mask & active_nodes[:, :, None]).to(node_emb.dtype).unsqueeze(-1)
@@ -889,6 +934,11 @@ class PPOAgent:
                 ingress_cost_feature_index=10 if policy_kind == "kkt_autoregressive_path" else 8,
                 route_cost_feature_index=2 if policy_kind == "kkt_autoregressive_path" else 1,
                 centralized_critic=policy_kind == "kkt_autoregressive_path",
+                normalized_cost_guidance=policy_kind == "kkt_autoregressive_path",
+                neural_residual_scale=0.25 if policy_kind == "kkt_autoregressive_path" else 1.0,
+                initial_cost_guidance_scale=(
+                    2.0 if policy_kind == "kkt_autoregressive_path" else 0.3132616875
+                ),
             ).to(self.device)
         elif policy_kind in {"slow_gat_node", "slow_gat_count", "slow_gat_stage"}:
             if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:

@@ -142,15 +142,20 @@ centralized critic additionally pools the feasible node/edge state and a
 permutation-invariant summary of the remaining requests.
 
 Its dense Fast reward is the negative increment of the environment's KKT total
-weighted controllable latency. Within each one-second batch, `gamma=1` and
-`GAE lambda=1`; only the final request closes the Fast subtrajectory. A terminal
-correction compares the sum of analytical increments with the authoritative
-joint environment settlement. The rollout logs record predicted cost, actual
-cost, terminal correction, and maximum absolute credit error. KKT never chooses
-an action, supplies a teacher label, initializes a path, or provides an
-inference fallback: the PPO actor still samples every complete path directly.
-Behavior cloning is rejected for this mode. It has a distinct checkpoint
-architecture and must start a fresh run.
+weighted controllable latency. Within each one-second batch, `gamma=1` preserves
+the undiscounted latency objective and `GAE lambda=0.95` uses the centralized
+critic to reduce the variance of the long request-group suffix; only the final
+request closes the Fast subtrajectory. A terminal correction compares the sum
+of analytical increments with the authoritative joint environment settlement.
+The rollout logs record predicted cost, actual cost, terminal correction, and
+maximum absolute credit error. Candidate compute, ingress, and route costs are
+standardized only among the feasible alternatives of the current decision.
+They form a learned physical-cost logit prior, while a neural scorer learns a
+residual correction; the corresponding guidance scales are logged for
+diagnosis. KKT still never chooses an action, supplies a teacher label, or
+provides an inference fallback: the PPO actor samples every complete path
+directly and remains the sole decision maker. Behavior cloning is rejected for
+this mode. It has a distinct checkpoint architecture and must start a fresh run.
 
 For current MEC convergence experiments, one episode is a 60-minute trajectory
 with six Slow decisions and 3,600 logical one-second steps. Each update collects

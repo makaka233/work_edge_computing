@@ -5333,6 +5333,15 @@ def main() -> None:
             "fast_entropy_target": losses["fast"].get("entropy_target", args.fast_entropy_target),
             "fast_entropy_shortfall": losses["fast"].get("entropy_shortfall", 0.0),
             "fast_entropy_saturated": losses["fast"].get("entropy_saturated", 0.0),
+            "fast_compute_guidance_scale": losses["fast"].get(
+                "compute_guidance_scale", np.nan
+            ),
+            "fast_route_guidance_scale": losses["fast"].get(
+                "route_guidance_scale", np.nan
+            ),
+            "fast_neural_residual_scale": losses["fast"].get(
+                "neural_residual_scale", np.nan
+            ),
             "fast_counterfactual_credit_coef": stats[
                 "fast_counterfactual_credit_coef"
             ],

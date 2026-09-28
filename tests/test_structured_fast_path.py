@@ -13,7 +13,7 @@ from edge_drl.agents.drl import (
     fast_structured_obs_dim,
 )
 from edge_drl.comparison.checkpoint import build_proposed_agent
-from edge_drl.models.ppo import StructuredPathDistribution
+from edge_drl.models.ppo import StructuredPathActorCritic, StructuredPathDistribution
 from tests.comparison_helpers import tiny_replay_env
 
 
@@ -72,6 +72,42 @@ def test_dynamic_programming_matches_enumerated_path_distribution() -> None:
     (-dist.log_prob(actions[:1]) - 0.01 * dist.entropy()).sum().backward()
     assert torch.isfinite(unary.grad).all()
     assert torch.isfinite(pair.grad).all()
+
+
+def test_kkt_path_policy_starts_from_relative_physical_cost_prior() -> None:
+    policy = StructuredPathActorCritic(
+        global_dim=18,
+        node_feature_dim=11,
+        edge_feature_dim=9,
+        num_nodes=2,
+        max_service_stages=2,
+        compute_cost_feature_index=8,
+        ingress_cost_feature_index=10,
+        route_cost_feature_index=2,
+        normalized_cost_guidance=True,
+        neural_residual_scale=0.25,
+        initial_cost_guidance_scale=2.0,
+    )
+    global_features = torch.zeros((1, 18), dtype=torch.float32)
+    global_features[:, 6] = 1.0
+    node_features = torch.zeros((1, 2, 2, 11), dtype=torch.float32)
+    node_features[0, :, :, 8] = torch.tensor([[0.0, 1.0], [0.0, 1.0]])
+    node_features[0, 0, :, 10] = torch.tensor([0.0, 1.0])
+    edge_features = torch.zeros((1, 1, 2, 2, 9), dtype=torch.float32)
+    edge_features[..., 0] = 1.0
+    edge_features[0, 0, :, :, 2] = torch.tensor([[0.0, 2.0], [2.0, 0.0]])
+    states = torch.cat(
+        [global_features, node_features.reshape(1, -1), edge_features.reshape(1, -1)],
+        dim=1,
+    )
+    masks = torch.ones((1, 4), dtype=torch.bool)
+
+    distribution, _ = policy(states, masks)
+
+    assert int(distribution.mode().item()) == 0  # node 0 for both stages
+    assert float(distribution.entropy().item()) < float(distribution.maximum_entropy().item()) * 0.6
+    assert torch.count_nonzero(policy.node_scorer[-1].weight) == 0
+    assert torch.count_nonzero(policy.edge_scorer.weight) == 0
 
 
 def test_structured_policy_scores_all_deployed_paths_without_top_k() -> None:
@@ -266,6 +302,7 @@ def test_kkt_autoregressive_credit_telescopes_to_authoritative_batch_cost() -> N
     schedules = agent.schedule_batch(env, [request, other], deterministic=True, record=True)
     assert len(schedules) == len(agent.ppo.buffer) == 2
     assert agent.ppo.gamma == 1.0
+    assert agent.ppo.gae_lambda == 0.95
     assert agent.ppo.buffer.states[0].shape == (fast_kkt_autoregressive_obs_dim(6, 3),)
     assert not np.array_equal(agent.ppo.buffer.states[0], agent.ppo.buffer.states[1])
     infos = env.evaluate_batch_schedules([request, other], schedules)
