@@ -8,15 +8,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
+SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic", "PopularityEFT", "PopularityNearest", "HEFTFast", "PopularityDeploy")
 COLORS = {
     "Proposed": "#0072B2",
     "Monolithic": "#D55E00",
     "Hybrid": "#009E73",
     "Algorithmic": "#CC79A7",
+    "PopularityEFT": "#8C564B",
+    "PopularityNearest": "#7F7F7F",
+    "HEFTFast": "#E69F00",
+    "PopularityDeploy": "#56B4E9",
 }
 LINE_STYLES = {"Proposed": "-", "Monolithic": "--", "Hybrid": "-.", "Algorithmic": ":"}
 MARKERS = {"Proposed": "o", "Monolithic": "s", "Hybrid": "^", "Algorithmic": "D"}
+LINE_STYLES["PopularityEFT"] = "--"
+MARKERS["PopularityEFT"] = "v"
+LINE_STYLES["PopularityNearest"] = ":"
+MARKERS["PopularityNearest"] = "P"
+LINE_STYLES["HEFTFast"] = "-."
+MARKERS["HEFTFast"] = "X"
+LINE_STYLES["PopularityDeploy"] = "--"
+MARKERS["PopularityDeploy"] = "*"
 FAMILY_ORDER = (
     "request_load",
     "compute_capacity",

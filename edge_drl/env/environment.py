@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
+from edge_drl.allocators.equal_share import allocate_compute_equal_share, allocate_link_equal_share
 from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_realistic_scenario, generate_request
 
 
@@ -112,6 +113,82 @@ def _allocate_serial_link_kkt(
     return delays, externalities
 
 
+def _compute_equal_share_externality_delays(
+    demands: list[ComputeDemand], capacities: np.ndarray
+) -> dict[str, float]:
+    """Exact per-request externality under equal per-request processor sharing."""
+
+    result: dict[str, float] = {}
+    by_node: dict[int, list[ComputeDemand]] = {}
+    for demand in demands:
+        if demand.compute_gcycles <= 0.0:
+            result[demand.demand_id] = 0.0
+        else:
+            by_node.setdefault(demand.node_id, []).append(demand)
+    for node_id, grouped in by_node.items():
+        capacity = max(float(capacities[node_id]), 1e-9)
+        total_work = sum(d.multiplicity * d.compute_gcycles for d in grouped)
+        for demand in grouped:
+            result[demand.demand_id] = float(
+                max(total_work - demand.multiplicity * demand.compute_gcycles, 0.0) / capacity
+            )
+    return result
+
+
+def _link_equal_share_externality_delays(
+    demands: list[LinkDemand], capacities: np.ndarray
+) -> dict[str, float]:
+    """Exact per-request externality under equal per-request flow sharing."""
+
+    result: dict[str, float] = {}
+    by_link: dict[tuple[int, int], list[LinkDemand]] = {}
+    for demand in demands:
+        if demand.src_node == demand.dst_node or demand.data_mb <= 0.0:
+            result[demand.demand_id] = 0.0
+        else:
+            by_link.setdefault((demand.src_node, demand.dst_node), []).append(demand)
+    for (src, dst), grouped in by_link.items():
+        capacity = max(float(capacities[src, dst]), 1e-9)
+        total_data = sum(d.multiplicity * d.data_mb for d in grouped)
+        for demand in grouped:
+            result[demand.demand_id] = float(
+                max(total_data - demand.multiplicity * demand.data_mb, 0.0) / capacity
+            )
+    return result
+
+
+def _allocate_serial_compute_equal_share(
+    demands: list[ComputeDemand], capacities: np.ndarray
+) -> tuple[dict[str, float], dict[str, float]]:
+    delays: dict[str, float] = {}
+    externalities: dict[str, float] = {}
+    by_phase: dict[int, list[ComputeDemand]] = {}
+    for demand in demands:
+        by_phase.setdefault(int(demand.serial_phase), []).append(demand)
+    for phase in sorted(by_phase):
+        grouped = by_phase[phase]
+        _, phase_delays, _ = allocate_compute_equal_share(grouped, capacities)
+        delays.update(phase_delays)
+        externalities.update(_compute_equal_share_externality_delays(grouped, capacities))
+    return delays, externalities
+
+
+def _allocate_serial_link_equal_share(
+    demands: list[LinkDemand], capacities: np.ndarray
+) -> tuple[dict[str, float], dict[str, float]]:
+    delays: dict[str, float] = {}
+    externalities: dict[str, float] = {}
+    by_phase: dict[int, list[LinkDemand]] = {}
+    for demand in demands:
+        by_phase.setdefault(int(demand.serial_phase), []).append(demand)
+    for phase in sorted(by_phase):
+        grouped = by_phase[phase]
+        _, phase_delays, _ = allocate_link_equal_share(grouped, capacities)
+        delays.update(phase_delays)
+        externalities.update(_link_equal_share_externality_delays(grouped, capacities))
+    return delays, externalities
+
+
 def _daily_arrival_factor(minute_of_day: float) -> float:
     morning_peak = np.exp(-0.5 * ((minute_of_day - 9 * 60) / 105.0) ** 2)
     lunch_peak = np.exp(-0.5 * ((minute_of_day - 13 * 60) / 90.0) ** 2)
@@ -164,6 +241,8 @@ class EdgeEnvConfig:
     load_penalty_weight: float = 0.08
     migration_cost_weight: float = 0.0
     invalid_action_penalty: float = 10.0
+    compute_allocation_mode: str = "kkt"
+    link_allocation_mode: str = "kkt"
 
     def __post_init__(self) -> None:
         if not 10_000 <= self.num_users <= 15_000:
@@ -226,6 +305,10 @@ class EdgeEnvConfig:
             raise ValueError("wireless_uplink_mbps must be positive.")
         if self.radio_rtt_ms < 0:
             raise ValueError("radio_rtt_ms must be non-negative.")
+        if self.compute_allocation_mode not in {"kkt", "equal-share"}:
+            raise ValueError("compute_allocation_mode must be 'kkt' or 'equal-share'.")
+        if self.link_allocation_mode not in {"kkt", "equal-share"}:
+            raise ValueError("link_allocation_mode must be 'kkt' or 'equal-share'.")
 
 
 class EdgeComputingEnv:
@@ -548,15 +631,23 @@ class EdgeComputingEnv:
         finite = np.isfinite(link_capacity)
         link_capacity[finite] *= np.clip(1.0 - 0.75 * self.link_load[finite], 0.10, 1.0)
 
-        joint_compute_delays, joint_compute_externalities = _allocate_serial_compute_kkt(
-            all_compute_demands,
-            node_capacity,
+        compute_allocator = (
+            _allocate_serial_compute_kkt
+            if self.config.compute_allocation_mode == "kkt"
+            else _allocate_serial_compute_equal_share
+        )
+        joint_compute_delays, joint_compute_externalities = compute_allocator(
+            all_compute_demands, node_capacity
         )
         link_allocation_failed = False
         try:
-            joint_link_delays, joint_link_externalities = _allocate_serial_link_kkt(
-                all_link_demands,
-                link_capacity,
+            link_allocator = (
+                _allocate_serial_link_kkt
+                if self.config.link_allocation_mode == "kkt"
+                else _allocate_serial_link_equal_share
+            )
+            joint_link_delays, joint_link_externalities = link_allocator(
+                all_link_demands, link_capacity
             )
         except ValueError:
             joint_link_delays = {}

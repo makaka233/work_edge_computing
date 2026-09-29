@@ -4,6 +4,7 @@ import numpy as np
 
 from edge_drl.agents.hierarchical import build_baseline_agent
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
+from edge_drl.allocators.equal_share import allocate_compute_equal_share, allocate_link_equal_share
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig, _compute_kkt_externality_delays
 from edge_drl.env.scenario import TaskRequest, generate_realistic_scenario
 from tests.comparison_helpers import tiny_replay_env
@@ -40,6 +41,19 @@ def test_kkt_compute_sqrt_rule():
     assert round(total, 6) == 2.5
 
 
+def test_equal_share_compute_gives_each_request_the_same_rate():
+    demands = [
+        ComputeDemand("a", 0, 4.0, multiplicity=2.0),
+        ComputeDemand("b", 0, 9.0, multiplicity=1.0),
+    ]
+    allocations, delays, total = allocate_compute_equal_share(demands, np.array([12.0]))
+    assert np.isclose(allocations["a"], 8.0)
+    assert np.isclose(allocations["b"], 4.0)
+    assert np.isclose(delays["a"], 1.0)
+    assert np.isclose(delays["b"], 2.25)
+    assert np.isclose(total, 4.25)
+
+
 def test_kkt_externality_is_exact_difference_reward():
     demands = [ComputeDemand("a", 0, 4.0), ComputeDemand("b", 0, 9.0)]
     capacities = np.array([10.0])
@@ -65,6 +79,18 @@ def test_kkt_link_sqrt_rule():
     assert round(delays["a"], 6) == 2.5
     assert round(delays["b"], 6) == 5.0
     assert round(total, 6) == 7.5
+
+
+def test_equal_share_link_gives_each_flow_the_same_bandwidth():
+    demands = [LinkDemand("a", 0, 1, 25.0), LinkDemand("b", 0, 1, 100.0)]
+    bandwidth = np.zeros((2, 2), dtype=float)
+    bandwidth[0, 1] = 30.0
+    allocations, delays, total = allocate_link_equal_share(demands, bandwidth)
+    assert np.isclose(allocations["a"], 15.0)
+    assert np.isclose(allocations["b"], 15.0)
+    assert np.isclose(delays["a"], 25.0 / 15.0)
+    assert np.isclose(delays["b"], 100.0 / 15.0)
+    assert np.isclose(total, 125.0 / 15.0)
 
 
 def test_kkt_group_multiplicity_matches_individual_equal_tasks():

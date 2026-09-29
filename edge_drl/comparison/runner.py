@@ -15,6 +15,12 @@ import torch
 
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
 from edge_drl.comparison.algorithmic import AlgorithmicScheme, HybridScheme
+from edge_drl.comparison.heuristic import (
+    PopularityDeployScheme,
+    PopularityEFTScheme,
+    PopularityNearestScheme,
+)
+from edge_drl.comparison.classic import HEFTFastScheme
 from edge_drl.comparison.io import write_csv, write_json
 from edge_drl.comparison.metrics import evaluate_scheme_episode
 from edge_drl.comparison.monolithic import MonolithicScheme
@@ -28,6 +34,12 @@ from edge_drl.env.environment import EdgeComputingEnv
 
 
 FORMAL_SCHEMES = ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
+AVAILABLE_SCHEMES = FORMAL_SCHEMES + (
+    "PopularityEFT",
+    "PopularityNearest",
+    "HEFTFast",
+    "PopularityDeploy",
+)
 FORMAL_SCENARIO_FAMILIES = (
     "request_load",
     "compute_capacity",
@@ -107,7 +119,7 @@ def run_comparison(
             "to name one checkpoint file"
         )
     checkpoint_path, checkpoint_args, checkpoint_internal = load_checkpoint_configuration(checkpoint)
-    unknown = sorted(set(schemes) - set(FORMAL_SCHEMES))
+    unknown = sorted(set(schemes) - set(AVAILABLE_SCHEMES))
     if unknown:
         raise ValueError(f"formal comparison does not include schemes: {unknown}")
     if len(set(schemes)) != len(schemes):
@@ -186,6 +198,10 @@ def run_comparison(
             "Monolithic": "separately trained dual-scale PPO with one aggregated stage per service",
             "Hybrid": "frozen Proposed Slow PPO with causal KKT marginal-cost path scheduling",
             "Algorithmic": "demand-aware binary MILP placement with marginal replicas and the same path scheduling",
+            "PopularityEFT": "v1 demand/capacity/locality replica allocation with online work-based stage completion scheduling; project-specific heuristic",
+            "PopularityNearest": "frozen popularity/resource placement with static nearest-reachable-replica scheduling",
+            "HEFTFast": "frozen Proposed Slow PPO with HEFT-style upward-rank and earliest-finish Fast scheduling",
+            "PopularityDeploy": "fixed demand/capacity/locality placement with frozen Proposed Fast PPO and unchanged KKT settlement",
         },
     }
     write_json(output / "metadata.json", metadata)
@@ -365,6 +381,14 @@ def _make_scheme(
         return HybridScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name == "Algorithmic":
         return AlgorithmicScheme()
+    if name == "PopularityEFT":
+        return PopularityEFTScheme()
+    if name == "PopularityNearest":
+        return PopularityNearestScheme()
+    if name == "HEFTFast":
+        return HEFTFastScheme(env, checkpoint_path, checkpoint_args, device=device)
+    if name == "PopularityDeploy":
+        return PopularityDeployScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name == "Monolithic":
         assert monolithic_checkpoint is not None
         assert point is not None
