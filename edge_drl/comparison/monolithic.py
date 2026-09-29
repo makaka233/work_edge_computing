@@ -115,8 +115,16 @@ class MonolithicScheme(BaseComparisonScheme):
 
     name = "Monolithic"
 
-    def __init__(self, env: EdgeComputingEnv, checkpoint_path: str | Path, *, device: str) -> None:
+    def __init__(
+        self,
+        env: EdgeComputingEnv,
+        checkpoint_path: str | Path,
+        *,
+        device: str,
+        fast_deterministic: bool = True,
+    ) -> None:
         super().__init__()
+        self.fast_deterministic = bool(fast_deterministic)
         if env.scenario is None or env.deployment is None:
             raise RuntimeError("environment must be reset before building Monolithic")
         self.checkpoint_path, checkpoint_args, self.checkpoint_metadata = load_checkpoint_configuration(
@@ -185,7 +193,10 @@ class MonolithicScheme(BaseComparisonScheme):
         env.current_request = compact_requests[0]
         try:
             compact_schedules = self.agent.fast_agent.schedule_batch(
-                env, compact_requests, deterministic=True, record=False
+                env,
+                compact_requests,
+                deterministic=self.fast_deterministic,
+                record=False,
             )
         finally:
             env.current_requests = previous_requests

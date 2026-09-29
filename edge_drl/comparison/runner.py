@@ -97,6 +97,8 @@ def run_comparison(
     eval_seeds_override: tuple[int, ...] | None = None,
     scenario_families: tuple[str, ...] | None = None,
     sampled_seconds_per_window: int = 0,
+    learned_fast_eval_mode: str = "deterministic",
+    routing_repeats_override: int | None = None,
 ) -> Path:
     if phase == 3:
         _require_phase2_validation(phase2_validation_run, schemes=schemes)
@@ -109,6 +111,10 @@ def run_comparison(
         raise ValueError("monolithic_checkpoint_mode must be 'fixed' or 'per-point'")
     if sampled_seconds_per_window < 0:
         raise ValueError("sampled_seconds_per_window must be >= 0")
+    if learned_fast_eval_mode not in {"deterministic", "stochastic"}:
+        raise ValueError("learned_fast_eval_mode must be 'deterministic' or 'stochastic'")
+    if routing_repeats_override is not None and routing_repeats_override <= 0:
+        raise ValueError("routing_repeats_override must be positive")
     if (
         "Monolithic" in schemes
         and monolithic_checkpoint_mode == "fixed"
@@ -124,15 +130,22 @@ def run_comparison(
         raise ValueError(f"formal comparison does not include schemes: {unknown}")
     if len(set(schemes)) != len(schemes):
         raise ValueError("comparison schemes must not be repeated")
-    episode_minutes, eval_seeds, points, routing_repeats, is_standard_design = configured_phase_design(
+    episode_minutes, eval_seeds, points, default_routing_repeats, is_standard_design = configured_phase_design(
         phase,
         eval_seeds_override=eval_seeds_override,
         scenario_families=scenario_families,
+    )
+    routing_repeats = (
+        default_routing_repeats
+        if routing_repeats_override is None
+        else int(routing_repeats_override)
     )
     is_standard_design = (
         is_standard_design
         and sampled_seconds_per_window == 0
         and tuple(schemes) == FORMAL_SCHEMES
+        and learned_fast_eval_mode == "deterministic"
+        and routing_repeats_override is None
     )
     deployment_window_seconds = float(
         checkpoint_args.get("deployment_interval_minutes", 10) * 60
@@ -162,6 +175,9 @@ def run_comparison(
         "episode_minutes": episode_minutes,
         "sampled_seconds_per_window": sampled_seconds_per_window,
         "represented_seconds_per_settlement": represented_seconds,
+        "learned_fast_eval_mode": learned_fast_eval_mode,
+        "routing_repeats": routing_repeats,
+        "routing_seed_protocol": "trace_request_seed + 10000 * (routing_repeat + 1)",
         "expected_settlement_steps_per_episode": int(
             round(episode_minutes * 60 / represented_seconds)
         ),
@@ -247,91 +263,100 @@ def run_comparison(
                 }
             )
             for scheme_name in schemes:
-                repeat = 0  # Retained in result rows for historical CSV compatibility.
-                env = TraceReplayEnv(config, scenario, trace)
-                env.reset()
-                try:
-                    scheme = _make_scheme(
-                        scheme_name,
-                        env,
-                        checkpoint_path,
-                        checkpoint_args,
-                        device=device,
-                        monolithic_checkpoint=monolithic_checkpoint,
-                        monolithic_checkpoint_mode=monolithic_checkpoint_mode,
-                        point=point,
-                    )
-                    result = evaluate_scheme_episode(
-                        scheme=scheme,
-                        env=env,
-                        point=point,
-                        eval_seed=eval_seed,
-                        routing_repeat=repeat,
-                        sampled_seconds_per_window=sampled_seconds_per_window,
-                    )
-                    row = result.to_dict()
-                    row.update(
-                        {
+                for repeat in range(routing_repeats):
+                    env = TraceReplayEnv(config, scenario, trace)
+                    env.reset()
+                    routing_seed = request_seed + 10_000 * (repeat + 1)
+                    try:
+                        scheme = _make_scheme(
+                            scheme_name,
+                            env,
+                            checkpoint_path,
+                            checkpoint_args,
+                            device=device,
+                            monolithic_checkpoint=monolithic_checkpoint,
+                            monolithic_checkpoint_mode=monolithic_checkpoint_mode,
+                            point=point,
+                            learned_fast_deterministic=learned_fast_eval_mode == "deterministic",
+                        )
+                        # Checkpoint construction consumes RNG state. Reseed only after
+                        # loading so each learned scheduler receives the same explicit,
+                        # reproducible routing stream for this repeat.
+                        np.random.seed(routing_seed % (2**32))
+                        torch.manual_seed(routing_seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(routing_seed)
+                        result = evaluate_scheme_episode(
+                            scheme=scheme,
+                            env=env,
+                            point=point,
+                            eval_seed=eval_seed,
+                            routing_repeat=repeat,
+                            sampled_seconds_per_window=sampled_seconds_per_window,
+                        )
+                        row = result.to_dict()
+                        row.update(
+                            {
+                                "experiment": point.family,
+                                "parameter": point.value,
+                                "physical_seed": trace.physical_seed,
+                                "demand_seed": trace.demand_seed,
+                                "trace_seed": trace.request_seed,
+                                "routing_seed": routing_seed,
+                                "requests": result.request_count,
+                                "mean_latency": result.mean_latency_ms,
+                                "p95_latency": result.p95_latency_ms,
+                                "planning_time_ms": result.planning_time_s * 1000.0,
+                                "scheduling_time_ms": result.scheduling_time_s * 1000.0,
+                                "settlement_time_ms": result.kkt_settlement_time_s * 1000.0,
+                            }
+                        )
+                        raw_rows.append(row)
+                        for diagnostic in scheme.diagnostics.planning:
+                            solver_diagnostics.append(
+                                {
+                                    "scheme": scheme_name,
+                                    "scenario_family": point.family,
+                                    "scenario_value": point.value,
+                                    "eval_seed": eval_seed,
+                                    "routing_repeat": repeat,
+                                    **diagnostic,
+                                }
+                            )
+                        if result.failed:
+                            failure_rows.append(row)
+                    except Exception as error:
+                        failure = {
+                            "scheme": scheme_name,
+                            "scenario_family": point.family,
+                            "scenario_value": point.value,
+                            "eval_seed": eval_seed,
+                            "routing_repeat": repeat,
+                            "trace_hash": trace.trace_hash,
                             "experiment": point.family,
                             "parameter": point.value,
                             "physical_seed": trace.physical_seed,
                             "demand_seed": trace.demand_seed,
                             "trace_seed": trace.request_seed,
-                            "routing_seed": request_seed + 10_000 * (repeat + 1),
-                            "requests": result.request_count,
-                            "mean_latency": result.mean_latency_ms,
-                            "p95_latency": result.p95_latency_ms,
-                            "planning_time_ms": result.planning_time_s * 1000.0,
-                            "scheduling_time_ms": result.scheduling_time_s * 1000.0,
-                            "settlement_time_ms": result.kkt_settlement_time_s * 1000.0,
+                            "routing_seed": routing_seed,
+                            "failed": True,
+                            "failure_reason": str(error),
+                            "traceback": traceback.format_exc(),
                         }
+                        failure_rows.append(failure)
+                        raw_rows.append(failure)
+                    _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
+                    print(
+                        f"[{scheme_name}] {point.label} seed={eval_seed} repeat={repeat} "
+                        f"status={'failed' if failure_rows and failure_rows[-1].get('scheme') == scheme_name and failure_rows[-1].get('trace_hash') == trace.trace_hash else 'complete'}"
                     )
-                    raw_rows.append(row)
-                    for diagnostic in scheme.diagnostics.planning:
-                        solver_diagnostics.append(
-                            {
-                                "scheme": scheme_name,
-                                "scenario_family": point.family,
-                                "scenario_value": point.value,
-                                "eval_seed": eval_seed,
-                                "routing_repeat": repeat,
-                                **diagnostic,
-                            }
-                        )
-                    if result.failed:
-                        failure_rows.append(row)
-                except Exception as error:
-                    failure = {
-                        "scheme": scheme_name,
-                        "scenario_family": point.family,
-                        "scenario_value": point.value,
-                        "eval_seed": eval_seed,
-                        "routing_repeat": repeat,
-                        "trace_hash": trace.trace_hash,
-                        "experiment": point.family,
-                        "parameter": point.value,
-                        "physical_seed": trace.physical_seed,
-                        "demand_seed": trace.demand_seed,
-                        "trace_seed": trace.request_seed,
-                        "routing_seed": request_seed + 10_000 * (repeat + 1),
-                        "failed": True,
-                        "failure_reason": str(error),
-                        "traceback": traceback.format_exc(),
-                    }
-                    failure_rows.append(failure)
-                    raw_rows.append(failure)
-                _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
-                print(
-                    f"[{scheme_name}] {point.label} seed={eval_seed} repeat={repeat} "
-                    f"status={'failed' if failure_rows and failure_rows[-1].get('scheme') == scheme_name and failure_rows[-1].get('trace_hash') == trace.trace_hash else 'complete'}"
-                )
 
     _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
     if (
         phase == 2
         and is_standard_design
         and not failure_rows
-        and len(raw_rows) == len(points) * len(eval_seeds) * len(schemes)
+        and len(raw_rows) == len(points) * len(eval_seeds) * len(schemes) * routing_repeats
     ):
         write_json(
             output / "diagnostics" / "phase2_validated.json",
@@ -339,7 +364,7 @@ def run_comparison(
                 "validated": True,
                 "phase": 2,
                 "completed_rows": len(raw_rows),
-                "expected_rows": len(points) * len(eval_seeds) * len(schemes),
+                "expected_rows": len(points) * len(eval_seeds) * len(schemes) * routing_repeats,
                 "schemes": list(schemes),
             },
         )
@@ -374,9 +399,16 @@ def _make_scheme(
     monolithic_checkpoint: str | Path | None = None,
     monolithic_checkpoint_mode: str = "fixed",
     point: ExperimentPoint | None = None,
+    learned_fast_deterministic: bool = True,
 ):
     if name == "Proposed":
-        return ProposedScheme(env, checkpoint_path, checkpoint_args, device=device)
+        return ProposedScheme(
+            env,
+            checkpoint_path,
+            checkpoint_args,
+            device=device,
+            fast_deterministic=learned_fast_deterministic,
+        )
     if name == "Hybrid":
         return HybridScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name == "Algorithmic":
@@ -388,7 +420,13 @@ def _make_scheme(
     if name == "HEFTFast":
         return HEFTFastScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name == "PopularityDeploy":
-        return PopularityDeployScheme(env, checkpoint_path, checkpoint_args, device=device)
+        return PopularityDeployScheme(
+            env,
+            checkpoint_path,
+            checkpoint_args,
+            device=device,
+            fast_deterministic=learned_fast_deterministic,
+        )
     if name == "Monolithic":
         assert monolithic_checkpoint is not None
         assert point is not None
@@ -397,7 +435,12 @@ def _make_scheme(
             point,
             mode=monolithic_checkpoint_mode,
         )
-        return MonolithicScheme(env, resolved, device=device)
+        return MonolithicScheme(
+            env,
+            resolved,
+            device=device,
+            fast_deterministic=learned_fast_deterministic,
+        )
     raise ValueError(name)
 
 

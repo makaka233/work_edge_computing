@@ -7,6 +7,7 @@ from edge_drl.comparison.monolithic import (
     expand_monolithic_schedule,
 )
 from tests.comparison_helpers import tiny_replay_env
+from train_monolithic import _optimized_monolithic_args
 
 
 def test_monolithic_collapses_each_service_to_one_aggregated_stage() -> None:
@@ -38,3 +39,34 @@ def test_monolithic_evaluation_preserves_stage_shape_and_shared_node_projection(
     assert adapted.stage_compute_gcycles[1:] == (0.0,) * (len(original.stage_compute_gcycles) - 1)
     assert adapted.stage_output_mb == (0.0,) * len(original.stage_output_mb)
     assert expand_monolithic_schedule([4], len(adapted.stage_compute_gcycles)) == [4, 4]
+
+
+def test_monolithic_optimization_uses_strict_ledger_and_optional_full_resources() -> None:
+    base = {
+        "fast_reservation_microbatch_size": 16,
+        "fast_lr": 2e-4,
+        "fast_entropy_target": 0.18,
+        "fast_entropy_normalized_control": True,
+        "slow_deployment_memory_coef": 0.03,
+        "slow_deployment_storage_coef": 0.01,
+        "slow_idle_replica_coef": 0.05,
+        "slow_count_unused_replica_coef": 0.015,
+        "slow_placement_idle_coef": 0.02,
+    }
+    optimized = _optimized_monolithic_args(
+        base,
+        reservation_microbatch_size=1,
+        allow_full_resource_use=True,
+    )
+    assert optimized["fast_reservation_microbatch_size"] == 1
+    assert optimized["fast_lr"] == 1e-4
+    assert optimized["fast_entropy_target"] == 0.50
+    assert optimized["fast_entropy_normalized_control"] is True
+    assert optimized["monolithic_allow_full_resource_use"] is True
+    assert optimized["slow_deployment_memory_coef"] == 0.0
+    assert optimized["slow_deployment_storage_coef"] == 0.0
+    assert optimized["slow_idle_replica_coef"] == 0.01
+    assert optimized["slow_count_unused_replica_coef"] == 0.005
+    assert optimized["slow_placement_idle_coef"] == 0.005
+    assert base["fast_reservation_microbatch_size"] == 16
+    assert base["fast_lr"] == 2e-4

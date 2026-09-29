@@ -249,8 +249,10 @@ class PopularityDeployScheme(BaseComparisonScheme):
         checkpoint_args,
         *,
         device: str,
+        fast_deterministic: bool = True,
     ) -> None:
         super().__init__()
+        self.fast_deterministic = bool(fast_deterministic)
         self.planner = PopularityPlacement()
         self.agent, self.checkpoint_metadata = build_proposed_agent(
             env, checkpoint_path, checkpoint_args, device=device
@@ -275,5 +277,5 @@ class PopularityDeployScheme(BaseComparisonScheme):
             env.current_requests = requests
             env.current_request = requests[0] if requests else None
         return self.agent.fast_agent.schedule_batch(
-            env, requests, deterministic=True, record=False
+            env, requests, deterministic=self.fast_deterministic, record=False
         )

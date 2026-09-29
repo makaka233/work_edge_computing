@@ -55,6 +55,18 @@ def parse_args() -> argparse.Namespace:
             "the formal second-by-second default"
         ),
     )
+    parser.add_argument(
+        "--learned-fast-eval-mode",
+        choices=("deterministic", "stochastic"),
+        default="deterministic",
+        help="Action mode for learned Fast policies; stochastic runs use explicit routing seeds",
+    )
+    parser.add_argument(
+        "--routing-repeats",
+        type=int,
+        default=None,
+        help="Optional number of independently seeded routing repeats per trace",
+    )
     return parser.parse_args()
 
 
@@ -73,6 +85,8 @@ def main() -> None:
         eval_seeds_override=None if args.eval_seeds is None else tuple(args.eval_seeds),
         scenario_families=None if args.scenario_families is None else tuple(args.scenario_families),
         sampled_seconds_per_window=args.sampled_seconds_per_window,
+        learned_fast_eval_mode=args.learned_fast_eval_mode,
+        routing_repeats_override=args.routing_repeats,
     )
     print(f"comparison results: {output.resolve()}")
 
