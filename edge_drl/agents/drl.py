@@ -2337,6 +2337,10 @@ class HierarchicalPPOAgent:
     window_stage_node_counterfactual_weights: dict[tuple[int, int, int], float] = field(
         default_factory=dict
     )
+    window_replica_ablation_values: dict[tuple[int, int, int], float] = field(default_factory=dict)
+    window_stop_ablation_value: float = 0.0
+    window_replica_ablation_done: bool = False
+    window_replica_ablation_samples: int = 0
     slow_reward_scale: float = 1.0
     slow_tail_latency_coef: float = 0.35
     slow_colocation_coef: float = 0.05
@@ -2524,6 +2528,127 @@ class HierarchicalPPOAgent:
             self.window_deployment_memory_fraction = memory_fraction
             self.window_deployment_storage_fraction = storage_fraction
             self.window_migration_fraction = float(migration_count / possible_placements)
+
+    def observe_replica_ablation(self, env: EdgeComputingEnv, requests: list[TaskRequest]) -> None:
+        """Probe a bounded number of Slow ADD/STOP choices on one identical request tick.
+
+        Both deployments use the frozen deterministic Fast policy and the same
+        pre-step load state; KKT is settled jointly. This is a one-tick
+        estimate, not a full-window counterfactual trajectory.
+        """
+        if (
+            self.window_replica_ablation_samples <= 0
+            or self.window_replica_ablation_done
+            or not requests
+            or env.deployment is None
+            or env.scenario is None
+            or self.slow_agent.pending_window_id is None
+        ):
+            return
+        fast = self.fast_agent
+        deployment = env.deployment
+
+        def latency() -> float:
+            fast._workload_cache_key = None
+            fast._workload_cache = None
+            try:
+                schedules = fast.schedule_batch(env, requests, deterministic=True, record=False)
+                infos = env.evaluate_batch_schedules(requests, schedules)
+                if not all(bool(info["valid"]) for info in infos):
+                    return float("inf")
+                weights = np.asarray([float(request.request_count) for request in requests])
+                return float(np.average([float(info["latency_s"]) for info in infos], weights=weights))
+            finally:
+                # Fast's workload features depend on the temporary deployment.
+                fast._workload_cache_key = None
+                fast._workload_cache = None
+
+        baseline = latency()
+        if not np.isfinite(baseline):
+            return
+        pending = self.slow_agent.pending_count_stage_keys
+        nodes = self.slow_agent.pending_count_node_ids
+        candidates = sorted(set(
+            (service, stage, int(node))
+            for (service, stage), node in zip(pending, nodes)
+            if node is not None and int(deployment[service, stage].sum()) > 1
+        ))
+        if candidates:
+            windows_per_episode = max(
+                int(np.ceil(env.config.episode_minutes / env.config.deployment_interval_minutes)),
+                1,
+            )
+            global_window = (
+                self.slow_agent.critic_episode_index * windows_per_episode
+                + int(env.current_time_minute // env.config.deployment_interval_minutes)
+            )
+            # Rotate across *episodes* too: pending_window_id restarts after
+            # each optimizer update, which would repeatedly probe early IDs.
+            offset = (global_window * self.window_replica_ablation_samples) % len(candidates)
+            selected = (candidates[offset:] + candidates[:offset])[:self.window_replica_ablation_samples]
+            for service, stage, node in selected:
+                deployment[service, stage, node] = False
+                try:
+                    without = latency()
+                finally:
+                    deployment[service, stage, node] = True
+                if np.isfinite(without):
+                    # Positive: the added replica lowered jointly settled latency.
+                    self.window_replica_ablation_values[service, stage, node] = without - baseline
+
+        if (-1, -1) in pending:
+            memory = env.service_memory_capacities().copy()
+            storage = env.service_storage_capacities().copy()
+            for service in env.scenario.services:
+                for stage in service.stages:
+                    placed = deployment[service.service_id, stage.stage_id]
+                    memory -= placed * stage.memory_gb
+                    storage -= placed * stage.storage_gb
+            additions = []
+            node_demand = self.slow_agent._node_service_demand(env)
+            service_demand = node_demand.sum(axis=0)
+            for service in env.scenario.services:
+                for stage in service.stages:
+                    available = np.flatnonzero(
+                        ~deployment[service.service_id, stage.stage_id]
+                        & (memory + 1e-9 >= stage.memory_gb)
+                        & (storage + 1e-9 >= stage.storage_gb)
+                    )
+                    if available.size:
+                        additions.append(
+                            (-float(service_demand[service.service_id]), service.service_id, stage.stage_id)
+                        )
+            best_added = float("inf")
+            for _, service, stage in sorted(additions)[:self.window_replica_ablation_samples]:
+                mask = (
+                    ~deployment[service, stage]
+                    & (memory + 1e-9 >= env.scenario.services[service].stages[stage].memory_gb)
+                    & (storage + 1e-9 >= env.scenario.services[service].stages[stage].storage_gb)
+                )
+                state = self.slow_agent._build_state(
+                    env,
+                    node_demand,
+                    memory,
+                    storage,
+                    service,
+                    stage,
+                    int(deployment[service, stage].sum()),
+                    planned_deployment=deployment,
+                )
+                node, _, _ = self.slow_agent.placement_ppo.act(state, mask, deterministic=True)
+                node = int(node)
+                if not mask[node]:
+                    node = int(np.flatnonzero(mask)[0])
+                deployment[service, stage, node] = True
+                try:
+                    best_added = min(best_added, latency())
+                finally:
+                    deployment[service, stage, node] = False
+            if np.isfinite(best_added):
+                # Positive: stopping beat each probed feasible addition.
+                self.window_stop_ablation_value = best_added - baseline
+
+        self.window_replica_ablation_done = True
 
     def reset_episode_context(self) -> None:
         """Drop feedback that belongs to a completed independent episode.
@@ -2778,6 +2903,12 @@ class HierarchicalPPOAgent:
             "slow_shared_return_credit": float(shared_return_credit),
             "slow_incremental_add_actions": float(incremental_add_actions),
             "slow_incremental_stop_actions": float(incremental_stop_actions),
+            "slow_replica_ablation_samples": float(len(self.window_replica_ablation_values)),
+            "slow_replica_ablation_mean_s": (
+                float(np.mean(list(self.window_replica_ablation_values.values())))
+                if self.window_replica_ablation_values else 0.0
+            ),
+            "slow_stop_ablation_value_s": float(self.window_stop_ablation_value),
             "slow_deployment_memory_cost": float(self.slow_reward_scale * deployment_memory_cost),
             "slow_deployment_storage_cost": float(self.slow_reward_scale * deployment_storage_cost),
             "slow_migration_cost": float(self.slow_reward_scale * migration_cost),
@@ -2831,6 +2962,9 @@ class HierarchicalPPOAgent:
         self.window_stage_node_transition_data_mb.clear()
         self.window_stage_node_counterfactual_values.clear()
         self.window_stage_node_counterfactual_weights.clear()
+        self.window_replica_ablation_values.clear()
+        self.window_stop_ablation_value = 0.0
+        self.window_replica_ablation_done = False
         self.window_deployment_memory_fraction = 0.0
         self.window_deployment_storage_fraction = 0.0
         self.window_migration_fraction = 0.0
@@ -3046,8 +3180,13 @@ class HierarchicalPPOAgent:
                             if node_weight <= 0.0
                             else 0.0
                         )
+                        count_marginal_value = (
+                            self.window_replica_ablation_values.get(node_key, 0.0)
+                            if self.window_replica_ablation_samples > 0
+                            else float(marginal_value)
+                        )
                         count_returns[node_key] = self.slow_reward_scale * (
-                            self.slow_counterfactual_credit_coef * float(marginal_value)
+                            self.slow_counterfactual_credit_coef * count_marginal_value
                             - per_replica_resource_cost
                             - unused_cost
                         )
@@ -3057,9 +3196,14 @@ class HierarchicalPPOAgent:
                     else -self.slow_reward_scale * float(placement_cost)
                 )
         if self.slow_agent.allocation_mode == "global-incremental":
-            # STOP has zero local marginal utility.  The shared window return
-            # is added below just like it is for every add-replica action.
-            count_returns[(-1, -1)] = 0.0
+            # The legacy STOP local credit is zero. With ablation enabled,
+            # compare it with the best of a bounded set of feasible additions.
+            # The shared window return is added to both action types below.
+            count_returns[(-1, -1)] = (
+                self.slow_reward_scale * self.slow_counterfactual_credit_coef
+                * self.window_stop_ablation_value
+                if self.window_replica_ablation_samples > 0 else 0.0
+            )
         return count_returns, placement_returns, {
             "slow_count_effective_replicas_per_stage": (
                 float(np.mean(effective_replica_counts)) if effective_replica_counts else 0.0

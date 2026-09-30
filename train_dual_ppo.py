@@ -713,6 +713,16 @@ def parse_args() -> argparse.Namespace:
             "Count and Placement returns."
         ),
     )
+    parser.add_argument(
+        "--slow-replica-ablation-samples",
+        type=int,
+        default=0,
+        help=(
+            "For global-incremental Slow Count, test this many removable ADD "
+            "replicas on one sampled request tick with frozen Fast and joint KKT; "
+            "also probe STOP against feasible additions. Zero keeps legacy credit."
+        ),
+    )
     parser.add_argument("--fast-value-coef", type=float, default=0.5)
     parser.add_argument("--slow-target-kl", type=float, default=0.03)
     parser.add_argument("--slow-count-target-kl", type=float, default=0.015)
@@ -931,6 +941,12 @@ def parse_args() -> argparse.Namespace:
         or args.slow_counterfactual_credit_coef < 0.0
     ):
         parser.error("Slow shaping coefficients must be >= 0")
+    if args.slow_replica_ablation_samples < 0:
+        parser.error("--slow-replica-ablation-samples must be >= 0")
+    if args.slow_replica_ablation_samples > 0 and args.slow_allocation_mode != "global-incremental":
+        parser.error("--slow-replica-ablation-samples requires --slow-allocation-mode global-incremental")
+    if args.slow_replica_ablation_samples > 0 and args.slow_counterfactual_credit_coef <= 0.0:
+        parser.error("--slow-replica-ablation-samples requires positive --slow-counterfactual-credit-coef")
     if args.fast_updates_per_cycle < 1:
         parser.error("--fast-updates-per-cycle must be >= 1")
     if args.fast_warmup_updates < 0 or args.slow_warmup_updates < 0:
@@ -1829,6 +1845,8 @@ def rollout(
             and float(getattr(args, "slow_counterfactual_credit_coef", 0.0)) > 0.0
             else [None for _ in requests]
         )
+        if record_slow and getattr(args, "slow_replica_ablation_samples", 0) > 0:
+            agent.observe_replica_ablation(env, requests)
         if oracle_requests_remaining > 0:
             for request, schedule in zip(requests, actions):
                 if oracle_requests_remaining <= 0:
@@ -1995,6 +2013,9 @@ def rollout(
         "slow_shared_return_credit": float("nan"),
         "slow_incremental_add_actions": 0.0,
         "slow_incremental_stop_actions": 0.0,
+        "slow_replica_ablation_samples": 0.0,
+        "slow_replica_ablation_mean_s": 0.0,
+        "slow_stop_ablation_value_s": 0.0,
         "slow_deployment_memory_cost": float("nan"),
         "slow_deployment_storage_cost": float("nan"),
         "slow_migration_cost": float("nan"),
@@ -2434,6 +2455,9 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_shared_return_credit",
         "slow_incremental_add_actions",
         "slow_incremental_stop_actions",
+        "slow_replica_ablation_samples",
+        "slow_replica_ablation_mean_s",
+        "slow_stop_ablation_value_s",
         "slow_deployment_memory_cost",
         "slow_deployment_storage_cost",
         "slow_migration_cost",
@@ -3768,6 +3792,7 @@ def main() -> None:
         slow_allocation_mode=args.slow_allocation_mode,
         slow_counterfactual_credit_coef=args.slow_counterfactual_credit_coef,
     )
+    agent.window_replica_ablation_samples = args.slow_replica_ablation_samples
     loaded_metadata: dict[str, object] = {}
     if args.load_checkpoint:
         loaded_metadata = load_checkpoint(
@@ -3939,7 +3964,8 @@ def main() -> None:
     )
     print(
         f"  slow_allocation_mode={args.slow_allocation_mode} "
-        f"slow_counterfactual_credit_coef={args.slow_counterfactual_credit_coef:.3f}"
+        f"slow_counterfactual_credit_coef={args.slow_counterfactual_credit_coef:.3f} "
+        f"replica_ablation_samples={args.slow_replica_ablation_samples}"
     )
     print(f"  service_resource_fraction={args.service_resource_fraction:.2f} of fixed node memory/storage")
     print(
@@ -4265,6 +4291,9 @@ def main() -> None:
             "slow_shared_return_credit": np.nan,
             "slow_incremental_add_actions": 0.0,
             "slow_incremental_stop_actions": 0.0,
+            "slow_replica_ablation_samples": 0.0,
+            "slow_replica_ablation_mean_s": 0.0,
+            "slow_stop_ablation_value_s": 0.0,
             "slow_deployment_memory_cost": np.nan,
             "slow_deployment_storage_cost": np.nan,
             "slow_migration_cost": np.nan,
@@ -4988,6 +5017,9 @@ def main() -> None:
             "slow_shared_return_credit": stats["slow_shared_return_credit"],
             "slow_incremental_add_actions": stats["slow_incremental_add_actions"],
             "slow_incremental_stop_actions": stats["slow_incremental_stop_actions"],
+            "slow_replica_ablation_samples": stats["slow_replica_ablation_samples"],
+            "slow_replica_ablation_mean_s": stats["slow_replica_ablation_mean_s"],
+            "slow_stop_ablation_value_s": stats["slow_stop_ablation_value_s"],
             "slow_deployment_memory_cost": stats["slow_deployment_memory_cost"],
             "slow_deployment_storage_cost": stats["slow_deployment_storage_cost"],
             "slow_migration_cost": stats["slow_migration_cost"],

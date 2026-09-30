@@ -17,6 +17,120 @@ from edge_drl.models.ppo import (
     _stratified_minibatches,
 )
 from train_dual_ppo import _stage_congestion_externality_costs, _stage_latency_costs, rollout
+from tests.comparison_helpers import tiny_replay_env
+
+
+def test_replica_ablation_uses_same_tick_without_mutating_deployment_or_fast_buffer(monkeypatch):
+    env = tiny_replay_env()
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, slow_allocation_mode="global-incremental")
+    deployment = np.zeros_like(env.deployment)
+    for service in env.scenario.services:
+        for stage in service.stages:
+            deployment[service.service_id, stage.stage_id, 0] = True
+    deployment[0, 0, 1] = True
+    env.apply_deployment(deployment)
+    original = env.deployment.copy()
+    agent.window_replica_ablation_samples = 1
+    agent.slow_agent.pending_window_id = 0
+    agent.slow_agent.pending_count_stage_keys = [(0, 0)]
+    agent.slow_agent.pending_count_node_ids = [0]
+
+    def route(received_env, requests, *, deterministic, record):
+        assert deterministic and not record
+        return [
+            [int(np.flatnonzero(row)[0]) for row in received_env.scheduler_candidate_mask(request)]
+            for request in requests
+        ]
+
+    monkeypatch.setattr(agent.fast_agent, "schedule_batch", route)
+    before_count = len(agent.fast_agent.ppo.buffer.actions)
+    requests = list(next(slot for slot in env._comparison_trace.slots if slot))
+    env.current_requests = requests
+    env.current_request = requests[0]
+    agent.observe_replica_ablation(env, requests)
+    assert agent.window_replica_ablation_done
+    assert np.array_equal(env.deployment, original)
+    assert len(agent.fast_agent.ppo.buffer.actions) == before_count
+    assert (0, 0, 0) in agent.window_replica_ablation_values
+    assert np.isfinite(agent.window_replica_ablation_values[0, 0, 0])
+
+
+def test_incremental_count_uses_replica_ablation_instead_of_routing_proxy():
+    env = tiny_replay_env()
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env, slow_allocation_mode="global-incremental",
+        slow_counterfactual_credit_coef=1.0,
+        slow_deployment_memory_coef=0.0,
+        slow_deployment_storage_coef=0.0,
+        slow_count_unused_replica_coef=0.0,
+    )
+    deployment = np.zeros_like(env.deployment)
+    for service in env.scenario.services:
+        for stage in service.stages:
+            deployment[service.service_id, stage.stage_id, 0] = True
+    env.apply_deployment(deployment)
+    agent.window_replica_ablation_samples = 1
+    agent.window_replica_ablation_values[(0, 0, 0)] = 0.2
+    agent.window_stage_latency_samples[(0, 0)] = [(0.5, 1.0)]
+    agent.window_stage_node_weights[(0, 0)] = {0: 1.0}
+    agent.window_stage_node_latency_samples[(0, 0)] = {0: [(0.5, 1.0)]}
+    agent.window_stage_node_counterfactual_values[(0, 0, 0)] = -0.4
+    agent.window_stage_node_counterfactual_weights[(0, 0, 0)] = 1.0
+    counts, placements, _ = agent._factorized_stage_returns(env)
+    assert np.isclose(counts[(0, 0, 0)], 0.2 * agent.slow_reward_scale)
+    assert placements[(0, 0, 0)] < 0.0
+    assert counts[(-1, -1)] == 0.0
+
+
+def test_incremental_stop_uses_bounded_addition_probe_credit():
+    env = tiny_replay_env()
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env, slow_allocation_mode="global-incremental",
+        slow_counterfactual_credit_coef=1.0,
+    )
+    agent.window_replica_ablation_samples = 2
+    agent.window_stop_ablation_value = 0.12
+    counts, _, _ = agent._factorized_stage_returns(env)
+    assert np.isclose(counts[(-1, -1)], 0.12 * agent.slow_reward_scale)
+
+
+def test_stop_ablation_probes_feasible_addition_without_changing_deployment(monkeypatch):
+    env = tiny_replay_env()
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(env, slow_allocation_mode="global-incremental")
+    deployment = np.zeros_like(env.deployment)
+    for service in env.scenario.services:
+        for stage in service.stages:
+            deployment[service.service_id, stage.stage_id, 0] = True
+    env.apply_deployment(deployment)
+    original = env.deployment.copy()
+    agent.window_replica_ablation_samples = 2
+    agent.slow_agent.pending_window_id = 0
+    agent.slow_agent.pending_count_stage_keys = [(-1, -1)]
+    agent.slow_agent.pending_count_node_ids = [None]
+    route_calls = 0
+
+    def route(received_env, requests, *, deterministic, record):
+        nonlocal route_calls
+        route_calls += 1
+        assert deterministic and not record
+        return [
+            [int(np.flatnonzero(row)[0]) for row in received_env.scheduler_candidate_mask(request)]
+            for request in requests
+        ]
+
+    monkeypatch.setattr(agent.fast_agent, "schedule_batch", route)
+    requests = list(next(slot for slot in env._comparison_trace.slots if slot))
+    env.current_requests = requests
+    env.current_request = requests[0]
+    agent.observe_replica_ablation(env, requests)
+    assert agent.window_replica_ablation_done
+    assert np.array_equal(env.deployment, original)
+    assert np.isfinite(agent.window_stop_ablation_value)
+    assert route_calls >= 2
 
 
 def test_observation_dimensions():
