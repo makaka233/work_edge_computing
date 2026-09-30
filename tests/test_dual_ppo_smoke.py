@@ -137,6 +137,7 @@ def test_observation_dimensions():
     assert slow_obs_dim(16, 3) == 17 + 16 * (6 + 3) + 16 * 16 * 4
     assert fast_obs_dim(16) == 12 + 16 * 9 + 16 * 16 * 3
     assert fast_obs_dim(16, chain_context="chain-v2") == 16 + 16 * 13 + 16 * 16 * 3
+    assert fast_obs_dim(16, chain_context="chain-kkt-v3") == 18 + 16 * 18 + 16 * 16 * 3
     assert slow_incremental_obs_dim(16, 3, 3) == slow_obs_dim(16, 3) + 9 * 10
 
 
@@ -221,6 +222,139 @@ def test_global_incremental_slow_adds_one_replica_to_selected_stage():
     assert slow.pending_count_node_ids[1] is None
 
 
+def test_budget_incremental_slow_uses_one_zero_budget_action():
+    env = tiny_replay_env()
+    env.reset()
+    slow = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-incremental",
+    ).slow_agent
+    assert slow.stage_ppo is not None
+    slow.count_ppo.act = lambda state, mask, deterministic=False: (0, 0.0, 0.0)
+    slow.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+
+    deployment = slow.plan_deployment(env, deterministic=False, record=True)
+
+    active_stages = [
+        (service.service_id, stage.stage_id)
+        for service in env.scenario.services
+        for stage in service.stages
+    ]
+    assert all(deployment[service_id, stage_id].sum() == 1 for service_id, stage_id in active_stages)
+    assert slow.count_ppo.buffer.actions == [0]
+    assert slow.pending_count_stage_keys == [(-2, -2)]
+    assert slow.stage_ppo.buffer.actions == []
+    assert len(slow.placement_ppo.buffer.actions) == len(active_stages)
+
+
+def test_budget_incremental_slow_allocates_exact_stage_budget():
+    env = tiny_replay_env()
+    env.reset()
+    slow = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-incremental",
+    ).slow_agent
+    assert slow.stage_ppo is not None
+    slow.count_ppo.act = lambda state, mask, deterministic=False: (2, 0.0, 0.0)
+    slow.stage_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    slow.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+
+    deployment = slow.plan_deployment(env, deterministic=False, record=True)
+
+    mandatory = sum(len(service.stages) for service in env.scenario.services)
+    assert int(deployment.sum()) == mandatory + 2
+    assert slow.count_ppo.buffer.actions == [2]
+    assert len(slow.stage_ppo.buffer.actions) == 2
+    assert len(slow.pending_stage_keys) == 2
+    assert len(slow.pending_stage_node_ids) == 2
+    assert len(slow.placement_ppo.buffer.actions) == mandatory + 2
+
+
+def test_budget_incremental_slow_updates_all_three_actors():
+    env = tiny_replay_env()
+    env.reset()
+    slow = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-incremental",
+        slow_k_epochs=1,
+        slow_critic_k_epochs=1,
+    ).slow_agent
+    assert slow.stage_ppo is not None
+    slow.count_ppo.act = lambda state, mask, deterministic=False: (1, 0.0, 0.0)
+    slow.stage_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    slow.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    slow.plan_deployment(env, deterministic=False, record=True)
+    count_returns = {
+        (service_id, stage_id, node_id): -0.2
+        for (service_id, stage_id), node_id in zip(
+            slow.pending_stage_keys,
+            slow.pending_stage_node_ids,
+        )
+    }
+    placement_returns = {
+        (
+            service_id,
+            stage_id,
+            int(slow.placement_ppo.buffer.actions[action_index]),
+        ): -0.3
+        for action_index, (service_id, stage_id) in zip(
+            slow.pending_placement_indices,
+            slow.pending_placement_stage_keys,
+        )
+    }
+    slow.assign_pending_reward(
+        -1.0,
+        done=True,
+        count_stage_returns=count_returns,
+        placement_stage_returns=placement_returns,
+    )
+
+    metrics = slow.update()
+
+    assert np.isfinite(metrics["count_loss"])
+    assert np.isfinite(metrics["stage_loss"])
+    assert np.isfinite(metrics["placement_loss"])
+    assert slow.count_ppo.buffer.actions == []
+    assert slow.stage_ppo.buffer.actions == []
+    assert slow.placement_ppo.buffer.actions == []
+
+
+def test_legacy_slow_modes_do_not_construct_unused_stage_actor():
+    env = tiny_replay_env()
+    env.reset()
+    assert HierarchicalPPOAgent.from_env(env).slow_agent.stage_ppo is None
+    assert (
+        HierarchicalPPOAgent.from_env(
+            env,
+            slow_allocation_mode="global-incremental",
+        ).slow_agent.stage_ppo
+        is None
+    )
+
+
 def test_fast_chain_v2_state_and_bounded_oracle_are_valid():
     env = EdgeComputingEnv(
         EdgeEnvConfig(
@@ -274,6 +408,75 @@ def test_fast_chain_v2_state_and_bounded_oracle_are_valid():
     assert len(marginal_values) == len(request.stage_compute_gcycles)
     assert any(value < 0.0 for value in marginal_values)
     assert env.evaluate_schedule(request, oracle)["valid"]
+
+
+def test_fast_chain_kkt_v3_credit_telescopes_to_joint_settlement():
+    env = tiny_replay_env()
+    env.reset()
+    env.node_compute_load[:] = np.linspace(0.05, 0.35, env.config.num_edge_nodes)
+    finite_links = np.isfinite(env.scenario.bandwidth_mb_s)
+    env.link_load[finite_links] = 0.2
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        fast_chain_context="chain-kkt-v3",
+    )
+    agent.maybe_update_deployment(env, deterministic=True, record=False)
+    requests = list(next(slot for slot in env._comparison_trace.slots if slot))
+    env.current_requests = requests
+    env.current_request = requests[0]
+
+    schedules = agent.fast_agent.schedule_batch(
+        env,
+        requests,
+        deterministic=True,
+        record=True,
+    )
+    predicted_total = 0.0
+    for request in requests:
+        costs = agent.fast_agent.consume_pending_kkt_stage_costs()
+        assert costs is not None
+        assert len(costs) == len(request.stage_compute_gcycles)
+        predicted_total += float(request.request_count) * sum(costs)
+
+    infos = env.evaluate_batch_schedules(requests, schedules)
+    actual_total = sum(
+        float(request.request_count)
+        * (
+            float(info["compute_delay_s"])
+            + float(info["link_delay_s"])
+            + float(info["propagation_delay_s"])
+        )
+        for request, info in zip(requests, infos)
+    )
+    assert np.isclose(predicted_total, actual_total, rtol=1e-10, atol=1e-10)
+    assert agent.fast_agent.pending_kkt_stage_costs == []
+
+
+def test_fast_chain_kkt_v3_uses_request_major_causal_ledger():
+    env = tiny_replay_env()
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        fast_chain_context="chain-kkt-v3",
+    )
+    agent.maybe_update_deployment(env, deterministic=True, record=False)
+    request = next(slot[0] for slot in env._comparison_trace.slots if slot)
+    for stage_id in range(len(request.stage_compute_gcycles)):
+        env.deployment[request.service_id, stage_id] = True
+
+    agent.fast_agent.schedule_batch(
+        env,
+        [request, request],
+        deterministic=True,
+        record=True,
+    )
+    stage_count = len(request.stage_compute_gcycles)
+    first_state = agent.fast_agent.ppo.buffer.states[0]
+    second_state = agent.fast_agent.ppo.buffer.states[stage_count]
+    assert first_state.shape == (fast_obs_dim(env.config.num_edge_nodes, chain_context="chain-kkt-v3"),)
+    assert not np.allclose(first_state, second_state)
 
 
 def test_slow_discounted_returns_stop_at_episode_boundaries():

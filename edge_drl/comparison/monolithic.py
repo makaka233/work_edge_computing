@@ -153,6 +153,8 @@ class MonolithicScheme(BaseComparisonScheme):
         agent = HierarchicalPPOAgent.from_env(planning_env, **kwargs)
         load_checkpoint(agent, self.checkpoint_path)
         agent.slow_agent.count_ppo.policy.eval()
+        if agent.slow_agent.stage_ppo is not None:
+            agent.slow_agent.stage_ppo.policy.eval()
         agent.slow_agent.placement_ppo.policy.eval()
         agent.slow_agent.window_critic.eval()
         agent.fast_agent.ppo.policy.eval()

@@ -168,6 +168,42 @@ def test_global_incremental_checkpoint_restores_matching_architecture(tmp_path):
     assert torch.allclose(restored_parameter, torch.full_like(restored_parameter, 0.123))
 
 
+def test_budget_incremental_checkpoint_restores_stage_actor(tmp_path):
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=178,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=60,
+        )
+    )
+    env.reset()
+    source = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-incremental",
+    )
+    assert source.slow_agent.stage_ppo is not None
+    with torch.no_grad():
+        first_parameter = next(source.slow_agent.stage_ppo.policy.parameters())
+        first_parameter.fill_(0.234)
+    checkpoint_path = tmp_path / "budget.pt"
+
+    save_checkpoint(source, checkpoint_path, {"update": 5})
+    restored = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-incremental",
+    )
+    metadata = load_checkpoint(restored, checkpoint_path)
+
+    assert metadata == {"update": 5}
+    assert restored.slow_agent.stage_ppo is not None
+    restored_parameter = next(restored.slow_agent.stage_ppo.policy.parameters())
+    assert torch.allclose(restored_parameter, torch.full_like(restored_parameter, 0.234))
+
+
 def test_checkpoint_rejects_mismatched_slow_allocation_architecture(tmp_path):
     env = EdgeComputingEnv(
         EdgeEnvConfig(seed=79, num_users=10_000, num_edge_nodes=16, num_service_types=3)

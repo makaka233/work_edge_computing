@@ -67,7 +67,9 @@ def fast_feature_dims(chain_context: str = "legacy") -> tuple[int, int]:
         return FAST_GLOBAL_DIM, FAST_NODE_FEATURE_DIM
     if chain_context == "chain-v2":
         return FAST_CHAIN_GLOBAL_DIM, FAST_CHAIN_NODE_FEATURE_DIM
-    raise ValueError("fast chain context must be 'legacy' or 'chain-v2'")
+    if chain_context == "chain-kkt-v3":
+        return FAST_KKT_GLOBAL_DIM, FAST_KKT_NODE_FEATURE_DIM
+    raise ValueError("fast chain context must be 'legacy', 'chain-v2', or 'chain-kkt-v3'")
 
 
 def fast_obs_dim(
@@ -87,6 +89,8 @@ FAST_NODE_FEATURE_DIM = 9
 FAST_EDGE_FEATURE_DIM = 3
 FAST_CHAIN_GLOBAL_DIM = 16
 FAST_CHAIN_NODE_FEATURE_DIM = 13
+FAST_KKT_GLOBAL_DIM = 18
+FAST_KKT_NODE_FEATURE_DIM = 18
 
 
 class SlowWindowCritic(nn.Module):
@@ -148,6 +152,7 @@ class SlowDeploymentPPOAgent:
     counterfactual_credit_coef: float = 0.0
     device: str = "cpu"
     count_ppo: PPOAgent = field(init=False)
+    stage_ppo: PPOAgent | None = field(init=False, default=None)
     placement_ppo: PPOAgent = field(init=False)
     ppo: PPOAgent = field(init=False)
     window_critic: SlowWindowCritic = field(init=False)
@@ -156,12 +161,18 @@ class SlowDeploymentPPOAgent:
     pending_placement_indices: list[int] = field(default_factory=list)
     pending_count_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     pending_count_node_ids: list[int | None] = field(default_factory=list)
+    pending_stage_indices: list[int] = field(default_factory=list)
+    pending_stage_keys: list[tuple[int, int]] = field(default_factory=list)
+    pending_stage_node_ids: list[int] = field(default_factory=list)
     pending_placement_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     count_action_returns: list[float] = field(default_factory=list)
+    stage_action_returns: list[float] = field(default_factory=list)
     placement_action_returns: list[float] = field(default_factory=list)
     count_action_stage_keys: list[tuple[int, int]] = field(default_factory=list)
+    stage_action_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     placement_action_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     count_window_ids: list[int] = field(default_factory=list)
+    stage_window_ids: list[int] = field(default_factory=list)
     placement_window_ids: list[int] = field(default_factory=list)
     window_states: list[np.ndarray] = field(default_factory=list)
     window_old_values: list[float] = field(default_factory=list)
@@ -187,9 +198,14 @@ class SlowDeploymentPPOAgent:
             raise ValueError("tail_latency_coef must be in [0, 1]")
         if self.deterministic_count_mode not in {"expected", "mode"}:
             raise ValueError("deterministic_count_mode must be 'expected' or 'mode'")
-        if self.allocation_mode not in {"legacy-factorized", "global-incremental"}:
+        if self.allocation_mode not in {
+            "legacy-factorized",
+            "global-incremental",
+            "budget-incremental",
+        }:
             raise ValueError(
-                "allocation_mode must be 'legacy-factorized' or 'global-incremental'"
+                "allocation_mode must be 'legacy-factorized', 'global-incremental', "
+                "or 'budget-incremental'"
             )
         if self.counterfactual_credit_coef < 0.0:
             raise ValueError("counterfactual_credit_coef must be non-negative")
@@ -230,10 +246,19 @@ class SlowDeploymentPPOAgent:
         if self.critic_gradient_clip <= 0.0:
             raise ValueError("critic_gradient_clip must be positive")
         self.placement_entropy_current_coef = placement_entropy_start
-        incremental_allocation = self.allocation_mode == "global-incremental"
+        incremental_allocation = self.allocation_mode in {
+            "global-incremental",
+            "budget-incremental",
+        }
+        budget_allocation = self.allocation_mode == "budget-incremental"
+        maximum_extra_replicas = (
+            self.num_nodes * self.num_service_types * self.max_service_stages
+        )
         self.count_ppo = PPOAgent(
             obs_dim=(
-                slow_incremental_obs_dim(
+                slow_obs_dim(self.num_nodes, self.num_service_types)
+                if budget_allocation
+                else slow_incremental_obs_dim(
                     self.num_nodes,
                     self.num_service_types,
                     self.max_service_stages,
@@ -242,7 +267,9 @@ class SlowDeploymentPPOAgent:
                 else slow_obs_dim(self.num_nodes, self.num_service_types)
             ),
             action_dim=(
-                self.num_service_types * self.max_service_stages + 1
+                maximum_extra_replicas + 1
+                if budget_allocation
+                else self.num_service_types * self.max_service_stages + 1
                 if incremental_allocation
                 else self.replicas_per_stage
             ),
@@ -257,11 +284,21 @@ class SlowDeploymentPPOAgent:
             value_coef=self.count_value_coef,
             target_kl=self.count_target_kl,
             minibatch_size=self.minibatch_size,
-            policy_kind="slow_gat_stage" if incremental_allocation else "slow_gat_count",
+            policy_kind=(
+                "slow_gat_count"
+                if budget_allocation
+                else "slow_gat_stage"
+                if incremental_allocation
+                else "slow_gat_count"
+            ),
             global_dim=SLOW_GLOBAL_DIM,
             node_feature_dim=slow_node_feature_dim(self.num_service_types),
             edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
-            stage_feature_dim=SLOW_STAGE_FEATURE_DIM if incremental_allocation else None,
+            stage_feature_dim=(
+                SLOW_STAGE_FEATURE_DIM
+                if incremental_allocation and not budget_allocation
+                else None
+            ),
             num_nodes=self.num_nodes,
             detach_critic_backbone=True,
             device=self.device,
@@ -295,6 +332,38 @@ class SlowDeploymentPPOAgent:
             self.window_critic.parameters(),
             lr=self.lr if self.critic_lr is None else self.critic_lr,
         )
+        # The separate Stage actor is exclusive to the new budget mode.  Do
+        # not instantiate it for legacy modes: constructing a spare network
+        # would consume PyTorch RNG and silently change their reproducibility.
+        if budget_allocation:
+            self.stage_ppo = PPOAgent(
+                obs_dim=slow_incremental_obs_dim(
+                    self.num_nodes,
+                    self.num_service_types,
+                    self.max_service_stages,
+                ),
+                action_dim=self.num_service_types * self.max_service_stages + 1,
+                hidden_dim=128,
+                lr=self.count_lr,
+                gamma=0.99,
+                k_epochs=self.k_epochs,
+                entropy_coef=(
+                    self.entropy_coef
+                    if self.count_entropy_coef is None
+                    else self.count_entropy_coef
+                ),
+                value_coef=self.count_value_coef,
+                target_kl=self.count_target_kl,
+                minibatch_size=self.minibatch_size,
+                policy_kind="slow_gat_stage",
+                global_dim=SLOW_GLOBAL_DIM,
+                node_feature_dim=slow_node_feature_dim(self.num_service_types),
+                edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
+                stage_feature_dim=SLOW_STAGE_FEATURE_DIM,
+                num_nodes=self.num_nodes,
+                detach_critic_backbone=True,
+                device=self.device,
+            )
 
     def _placement_entropy_start(self) -> float:
         return float(self.entropy_coef if self.placement_entropy_coef is None else self.placement_entropy_coef)
@@ -358,6 +427,9 @@ class SlowDeploymentPPOAgent:
         self.pending_placement_indices.clear()
         self.pending_count_stage_keys.clear()
         self.pending_count_node_ids.clear()
+        self.pending_stage_indices.clear()
+        self.pending_stage_keys.clear()
+        self.pending_stage_node_ids.clear()
         self.pending_placement_stage_keys.clear()
         window_id: int | None = None
         if record:
@@ -373,6 +445,17 @@ class SlowDeploymentPPOAgent:
             self.window_old_values.append(old_value)
             self.pending_window_id = window_id
 
+        if self.allocation_mode == "budget-incremental":
+            return self._plan_deployment_budget(
+                env,
+                deployment=deployment,
+                remaining_memory=remaining_memory,
+                remaining_storage=remaining_storage,
+                demand=demand,
+                window_id=window_id,
+                deterministic=deterministic,
+                record=record,
+            )
         if self.allocation_mode == "global-incremental":
             return self._plan_deployment_incremental(
                 env,
@@ -499,6 +582,198 @@ class SlowDeploymentPPOAgent:
         if not feasible:
             deployment = self._repair_with_current_or_full(env, deployment)
         return deployment
+
+    def _plan_deployment_budget(
+        self,
+        env: EdgeComputingEnv,
+        *,
+        deployment: np.ndarray,
+        remaining_memory: np.ndarray,
+        remaining_storage: np.ndarray,
+        demand: np.ndarray,
+        window_id: int | None,
+        deterministic: bool,
+        record: bool,
+    ) -> np.ndarray:
+        """Choose one extra-replica budget, then allocate it with Stage/Node PPO.
+
+        Coverage remains mandatory.  Unlike global-incremental mode, termination
+        is an ordinal decision made once per window and never competes with a
+        long sequence of stage ADD logits.
+        """
+
+        assert env.scenario is not None
+        stages = [
+            (service, stage)
+            for service in env.scenario.services
+            for stage in service.stages
+        ]
+        memory_capacity = np.maximum(env.service_memory_capacities(), 1e-9)
+        storage_capacity = np.maximum(env.service_storage_capacities(), 1e-9)
+
+        def coverage_priority(item) -> tuple[float, float, int, int]:
+            service, stage = item
+            feasible = np.count_nonzero(
+                (remaining_memory >= stage.memory_gb)
+                & (remaining_storage >= stage.storage_gb)
+            )
+            pressure = max(
+                float(np.min(stage.memory_gb / memory_capacity)),
+                float(np.min(stage.storage_gb / storage_capacity)),
+            )
+            return float(feasible), -pressure, int(service.service_id), int(stage.stage_id)
+
+        for service, stage in sorted(stages, key=coverage_priority):
+            placed = self._place_slow_replica(
+                env,
+                deployment=deployment,
+                remaining_memory=remaining_memory,
+                remaining_storage=remaining_storage,
+                demand=demand,
+                service_id=int(service.service_id),
+                stage_id=int(stage.stage_id),
+                replica_idx=0,
+                window_id=window_id,
+                deterministic=deterministic,
+                record=record,
+            )
+            if placed is None:
+                break
+
+        budget_state = self._build_window_state(
+            env,
+            demand,
+            remaining_memory,
+            remaining_storage,
+            planned_deployment=deployment,
+        )
+        budget_mask = self._build_budget_mask(
+            env,
+            remaining_memory,
+            remaining_storage,
+            deployment,
+        )
+        budget_action, budget_logprob, budget_value = self.count_ppo.act(
+            budget_state,
+            budget_mask,
+            deterministic=deterministic,
+        )
+        budget_action = int(budget_action)
+        if not budget_mask[budget_action]:
+            budget_action = int(np.flatnonzero(budget_mask)[0])
+        if record:
+            self.count_ppo.buffer.states.append(budget_state)
+            self.count_ppo.buffer.masks.append(budget_mask.astype(bool))
+            self.count_ppo.buffer.actions.append(budget_action)
+            self.count_ppo.buffer.logprobs.append(float(budget_logprob))
+            self.count_ppo.buffer.values.append(float(budget_value))
+            self.pending_count_indices.append(len(self.count_ppo.buffer.actions) - 1)
+            self.pending_count_stage_keys.append((-2, -2))
+            self.pending_count_node_ids.append(None)
+            assert window_id is not None
+            self.count_window_ids.append(window_id)
+
+        stage_stop_action = self.num_service_types * self.max_service_stages
+        if self.stage_ppo is None:
+            raise RuntimeError("budget-incremental allocation requires the Slow Stage actor")
+        for _ in range(budget_action):
+            stage_state = self._build_incremental_state(
+                env,
+                demand,
+                remaining_memory,
+                remaining_storage,
+                deployment,
+            )
+            stage_mask = self._build_incremental_stage_mask(
+                env,
+                remaining_memory,
+                remaining_storage,
+                deployment,
+            )
+            stage_mask[stage_stop_action] = False
+            if not stage_mask.any():
+                break
+            stage_action, stage_logprob, stage_value = self.stage_ppo.act(
+                stage_state,
+                stage_mask,
+                deterministic=deterministic,
+            )
+            stage_action = int(stage_action)
+            if not stage_mask[stage_action]:
+                stage_action = int(np.flatnonzero(stage_mask)[0])
+            service_id, stage_id = divmod(stage_action, self.max_service_stages)
+            replica_idx = int(deployment[service_id, stage_id].sum())
+            stage_buffer_index: int | None = None
+            if record:
+                self.stage_ppo.buffer.states.append(stage_state)
+                self.stage_ppo.buffer.masks.append(stage_mask.astype(bool))
+                self.stage_ppo.buffer.actions.append(stage_action)
+                self.stage_ppo.buffer.logprobs.append(float(stage_logprob))
+                self.stage_ppo.buffer.values.append(float(stage_value))
+                stage_buffer_index = len(self.stage_ppo.buffer.actions) - 1
+                self.pending_stage_indices.append(stage_buffer_index)
+                self.pending_stage_keys.append((service_id, stage_id))
+                assert window_id is not None
+                self.stage_window_ids.append(window_id)
+            node_id = self._place_slow_replica(
+                env,
+                deployment=deployment,
+                remaining_memory=remaining_memory,
+                remaining_storage=remaining_storage,
+                demand=demand,
+                service_id=service_id,
+                stage_id=stage_id,
+                replica_idx=replica_idx,
+                window_id=window_id,
+                deterministic=deterministic,
+                record=record,
+            )
+            if node_id is None:
+                break
+            if record:
+                assert stage_buffer_index is not None
+                self.pending_stage_node_ids.append(int(node_id))
+
+        if self.coverage_repair:
+            self._coverage_repair(env, deployment, remaining_memory, remaining_storage)
+        feasible, _ = env.check_deployment_feasible(deployment)
+        if not feasible:
+            deployment = self._repair_with_current_or_full(env, deployment)
+        return deployment
+
+    def _build_budget_mask(
+        self,
+        env: EdgeComputingEnv,
+        remaining_memory: np.ndarray,
+        remaining_storage: np.ndarray,
+        deployment: np.ndarray,
+    ) -> np.ndarray:
+        """Return a conservative ordinal mask for feasible extra-replica budgets."""
+
+        assert env.scenario is not None
+        possible = 0
+        minimum_memory = float("inf")
+        minimum_storage = float("inf")
+        for service in env.scenario.services:
+            for stage in service.stages:
+                feasible = (
+                    (remaining_memory >= stage.memory_gb)
+                    & (remaining_storage >= stage.storage_gb)
+                    & ~deployment[service.service_id, stage.stage_id]
+                )
+                possible += min(
+                    int(np.count_nonzero(feasible)),
+                    max(self.replicas_per_stage - int(deployment[service.service_id, stage.stage_id].sum()), 0),
+                )
+                minimum_memory = min(minimum_memory, float(stage.memory_gb))
+                minimum_storage = min(minimum_storage, float(stage.storage_gb))
+        memory_bound = int(np.floor(float(remaining_memory.sum()) / max(minimum_memory, 1e-9)))
+        storage_bound = int(np.floor(float(remaining_storage.sum()) / max(minimum_storage, 1e-9)))
+        action_dim = int(self.count_ppo.policy.action_dim)
+        maximum = min(possible, memory_bound, storage_bound, action_dim - 1)
+        mask = np.zeros(action_dim, dtype=bool)
+        mask[: maximum + 1] = True
+        return mask
 
     def _plan_deployment_incremental(
         self,
@@ -722,6 +997,10 @@ class SlowDeploymentPPOAgent:
         count_stage_returns = stage_returns if count_stage_returns is None else count_stage_returns
         placement_stage_returns = stage_returns if placement_stage_returns is None else placement_stage_returns
         self.count_action_stage_keys.extend(self.pending_count_stage_keys)
+        if len(self.pending_stage_indices) != len(self.pending_stage_keys):
+            raise ValueError("slow stage action indices and stage keys are misaligned")
+        if len(self.pending_stage_keys) != len(self.pending_stage_node_ids):
+            raise ValueError("slow stage action keys and node ids are misaligned")
         if len(self.pending_placement_indices) != len(self.pending_placement_stage_keys):
             raise ValueError("slow placement action indices and stage keys are misaligned")
         if len(self.pending_count_indices) != len(self.pending_count_node_ids):
@@ -748,6 +1027,19 @@ class SlowDeploymentPPOAgent:
                 float(count_stage_returns.get(stage_key, reward))
                 for stage_key in self.pending_count_stage_keys
             )
+        self.stage_action_stage_keys.extend(self.pending_stage_keys)
+        self.stage_action_returns.extend(
+            float(
+                count_stage_returns.get(
+                    (stage_key[0], stage_key[1], int(node_id)),
+                    count_stage_returns.get(stage_key, reward),
+                )
+            )
+            for stage_key, node_id in zip(
+                self.pending_stage_keys,
+                self.pending_stage_node_ids,
+            )
+        )
         self.placement_action_stage_keys.extend(self.pending_placement_stage_keys)
         for action_index, stage_key in zip(
             self.pending_placement_indices,
@@ -768,6 +1060,9 @@ class SlowDeploymentPPOAgent:
         self.pending_placement_indices.clear()
         self.pending_count_stage_keys.clear()
         self.pending_count_node_ids.clear()
+        self.pending_stage_indices.clear()
+        self.pending_stage_keys.clear()
+        self.pending_stage_node_ids.clear()
         self.pending_placement_stage_keys.clear()
 
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
@@ -794,17 +1089,31 @@ class SlowDeploymentPPOAgent:
         window_advantage_std = float(window_advantages.std())
 
         count_ids = np.asarray(self.count_window_ids, dtype=np.int64)
+        stage_ids = np.asarray(self.stage_window_ids, dtype=np.int64)
         placement_ids = np.asarray(self.placement_window_ids, dtype=np.int64)
         if len(self.count_action_returns) != len(self.count_ppo.buffer.actions):
             raise ValueError("slow count action returns are misaligned")
         if len(self.count_action_stage_keys) != len(self.count_ppo.buffer.actions):
             raise ValueError("slow count action stage keys are misaligned")
+        stage_buffer_actions = (
+            self.stage_ppo.buffer.actions if self.stage_ppo is not None else []
+        )
+        if len(self.stage_action_returns) != len(stage_buffer_actions):
+            raise ValueError("slow stage action returns are misaligned")
+        if len(self.stage_action_stage_keys) != len(stage_buffer_actions):
+            raise ValueError("slow stage action keys are misaligned")
         if len(self.placement_action_returns) != len(self.placement_ppo.buffer.actions):
             raise ValueError("slow placement action returns are misaligned")
         if len(self.placement_action_stage_keys) != len(self.placement_ppo.buffer.actions):
             raise ValueError("slow placement action stage keys are misaligned")
         count_returns = np.asarray(self.count_action_returns, dtype=np.float32)
+        stage_returns = np.asarray(self.stage_action_returns, dtype=np.float32)
         placement_returns = np.asarray(self.placement_action_returns, dtype=np.float32)
+        # Stage is one categorical decision over all service stages.  Center
+        # its advantages globally so the actor can learn that choosing stage A
+        # was better than choosing stage B.  Per-selected-stage centering would
+        # erase precisely that cross-stage signal.
+        stage_group_ids = np.zeros(len(self.stage_action_stage_keys), dtype=np.int64)
         placement_group_ids = np.asarray(
             [
                 service_id * self.max_service_stages + stage_id
@@ -827,7 +1136,7 @@ class SlowDeploymentPPOAgent:
         )
         count_advantage_groups = (
             np.zeros(len(self.count_action_stage_keys), dtype=np.int64)
-            if self.allocation_mode == "global-incremental"
+            if self.allocation_mode in {"global-incremental", "budget-incremental"}
             else np.asarray(
                 [
                     service_id * self.max_service_stages + stage_id
@@ -846,6 +1155,29 @@ class SlowDeploymentPPOAgent:
             progress_label=f"{progress_label} count",
             progress_interval_seconds=progress_interval_seconds,
         )
+        if stage_returns.size:
+            if self.stage_ppo is None:
+                raise RuntimeError("Slow Stage returns exist without a Stage actor")
+            stage_metrics = self.stage_ppo.update_from_returns(
+                stage_returns,
+                sample_weights=self._equal_window_action_weights(stage_ids),
+                advantage_group_ids=stage_group_ids,
+                actor_use_value_baseline=False,
+                auxiliary_advantages=window_advantages[stage_ids],
+                auxiliary_advantage_coef=effective_count_global_coef,
+                progress_label=f"{progress_label} stage",
+                progress_interval_seconds=progress_interval_seconds,
+            )
+        else:
+            stage_metrics = {
+                "loss": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "entropy": 0.0,
+                "approx_kl": 0.0,
+                "advantage_mean": 0.0,
+                "advantage_std": 0.0,
+            }
         placement_entropy_coef = self.placement_entropy_coefficient()
         self.placement_ppo.entropy_coef = placement_entropy_coef
         placement_metrics = self.placement_ppo.update_from_returns(
@@ -869,10 +1201,13 @@ class SlowDeploymentPPOAgent:
         )
         window_count = len(self.window_returns)
         self.count_window_ids.clear()
+        self.stage_window_ids.clear()
         self.placement_window_ids.clear()
         self.count_action_returns.clear()
+        self.stage_action_returns.clear()
         self.placement_action_returns.clear()
         self.count_action_stage_keys.clear()
+        self.stage_action_stage_keys.clear()
         self.placement_action_stage_keys.clear()
         self.window_states.clear()
         self.window_old_values.clear()
@@ -880,11 +1215,15 @@ class SlowDeploymentPPOAgent:
         self.window_dones.clear()
         self.window_episode_ids.clear()
         return {
-            "loss": count_metrics["loss"] + placement_metrics["loss"] + self.value_coef * critic_metrics["value_loss"],
-            "policy_loss": count_metrics["policy_loss"] + placement_metrics["policy_loss"],
-            "value_loss": count_metrics["value_loss"] + placement_metrics["value_loss"],
-            "entropy": count_metrics["entropy"] + placement_metrics["entropy"],
-            "approx_kl": max(count_metrics.get("approx_kl", 0.0), placement_metrics.get("approx_kl", 0.0)),
+            "loss": count_metrics["loss"] + stage_metrics["loss"] + placement_metrics["loss"] + self.value_coef * critic_metrics["value_loss"],
+            "policy_loss": count_metrics["policy_loss"] + stage_metrics["policy_loss"] + placement_metrics["policy_loss"],
+            "value_loss": count_metrics["value_loss"] + stage_metrics["value_loss"] + placement_metrics["value_loss"],
+            "entropy": count_metrics["entropy"] + stage_metrics["entropy"] + placement_metrics["entropy"],
+            "approx_kl": max(
+                count_metrics.get("approx_kl", 0.0),
+                stage_metrics.get("approx_kl", 0.0),
+                placement_metrics.get("approx_kl", 0.0),
+            ),
             "window_count": float(window_count),
             "window_return_mean": float(immediate_returns.mean()),
             "window_return_std": float(immediate_returns.std()),
@@ -892,6 +1231,8 @@ class SlowDeploymentPPOAgent:
             "trajectory_return_std": float(trajectory_returns.std()),
             "count_return_mean": float(count_returns.mean()) if count_returns.size else 0.0,
             "count_return_std": float(count_returns.std()) if count_returns.size else 0.0,
+            "stage_return_mean": float(stage_returns.mean()) if stage_returns.size else 0.0,
+            "stage_return_std": float(stage_returns.std()) if stage_returns.size else 0.0,
             "placement_return_mean": float(placement_returns.mean()) if placement_returns.size else 0.0,
             "placement_return_std": float(placement_returns.std()) if placement_returns.size else 0.0,
             "advantage_mean": 0.5
@@ -936,6 +1277,13 @@ class SlowDeploymentPPOAgent:
             "count_approx_kl": count_metrics.get("approx_kl", 0.0),
             "count_explained_variance": count_metrics.get("explained_variance", 0.0),
             "count_post_explained_variance": count_metrics.get("post_explained_variance", 0.0),
+            "stage_loss": stage_metrics["loss"],
+            "stage_policy_loss": stage_metrics["policy_loss"],
+            "stage_value_loss": stage_metrics["value_loss"],
+            "stage_entropy": stage_metrics["entropy"],
+            "stage_approx_kl": stage_metrics.get("approx_kl", 0.0),
+            "stage_advantage_mean": stage_metrics.get("advantage_mean", 0.0),
+            "stage_advantage_std": stage_metrics.get("advantage_std", 0.0),
             "placement_loss": placement_metrics["loss"],
             "placement_advantage_mean": placement_metrics.get("advantage_mean", 0.0),
             "placement_advantage_std": placement_metrics.get("advantage_std", 0.0),
@@ -985,6 +1333,8 @@ class SlowDeploymentPPOAgent:
             "trajectory_return_std": 0.0,
             "count_return_mean": 0.0,
             "count_return_std": 0.0,
+            "stage_return_mean": 0.0,
+            "stage_return_std": 0.0,
             "placement_return_mean": 0.0,
             "placement_return_std": 0.0,
             "advantage_mean": 0.0,
@@ -1019,6 +1369,13 @@ class SlowDeploymentPPOAgent:
             "count_approx_kl": 0.0,
             "count_explained_variance": 0.0,
             "count_post_explained_variance": 0.0,
+            "stage_loss": 0.0,
+            "stage_policy_loss": 0.0,
+            "stage_value_loss": 0.0,
+            "stage_entropy": 0.0,
+            "stage_approx_kl": 0.0,
+            "stage_advantage_mean": 0.0,
+            "stage_advantage_std": 0.0,
             "placement_loss": 0.0,
             "placement_advantage_mean": 0.0,
             "placement_advantage_std": 0.0,
@@ -1561,6 +1918,7 @@ class FastSchedulingPPOAgent:
         init=False,
         repr=False,
     )
+    pending_kkt_stage_costs: list[list[float]] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         if self.reservation_microbatch_size < 1:
@@ -1616,11 +1974,18 @@ class FastSchedulingPPOAgent:
         deterministic: bool = False,
         record: bool = True,
     ) -> list[list[int]]:
-        """Schedule independent requests with stage-wise batched inference."""
+        """Schedule requests under the selected causal decision protocol."""
 
         env._require_ready()
         if not requests:
             return []
+        if self.chain_context == "chain-kkt-v3":
+            return self._schedule_batch_kkt_v3(
+                env,
+                requests,
+                deterministic=deterministic,
+                record=record,
+            )
 
         schedules: list[list[int]] = [[] for _ in requests]
         transition_records: list[list[tuple[np.ndarray, np.ndarray, int, float, float]]] = [
@@ -1694,6 +2059,115 @@ class FastSchedulingPPOAgent:
                         float(env.config.demand_load_multiplier if load_group is None else load_group)
                     )
         return schedules
+
+    def _schedule_batch_kkt_v3(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        *,
+        deterministic: bool,
+        record: bool,
+    ) -> list[list[int]]:
+        """Generate one complete chain at a time with an exact causal KKT ledger.
+
+        The ledger uses the same serial phases and effective capacities as the
+        environment's authoritative settlement.  A group's stored per-stage
+        cost is its incremental *total* KKT objective divided by multiplicity;
+        weighting it by request_count therefore telescopes exactly to the joint
+        compute, wired-link, and propagation objective for the batch.
+        """
+
+        assert env.scenario is not None
+        max_stages = max(len(request.stage_compute_gcycles) for request in requests)
+        compute_sqrt = np.zeros((max_stages, self.num_nodes), dtype=np.float64)
+        link_sqrt = np.zeros(
+            (max_stages, self.num_nodes, self.num_nodes),
+            dtype=np.float64,
+        )
+        schedules: list[list[int]] = []
+        transition_records: list[list[tuple[np.ndarray, np.ndarray, int, float, float]]] = []
+        batch_costs: list[list[float]] = []
+        processed_weight = 0.0
+        total_weight = max(float(sum(request.request_count for request in requests)), 1.0)
+
+        for request in requests:
+            partial: list[int] = []
+            request_records: list[tuple[np.ndarray, np.ndarray, int, float, float]] = []
+            request_costs: list[float] = []
+            for stage_id in range(len(request.stage_compute_gcycles)):
+                state = self._build_state(
+                    env,
+                    request,
+                    stage_id,
+                    partial,
+                    kkt_compute_sqrt=compute_sqrt,
+                    kkt_link_sqrt=link_sqrt,
+                    processed_request_weight=processed_weight,
+                    total_request_weight=total_weight,
+                )
+                mask = self._build_mask(env, request, stage_id, partial)
+                action, logprob, value = self.ppo.act(
+                    state,
+                    mask,
+                    deterministic=deterministic,
+                )
+                action = int(action)
+                if not mask[action]:
+                    action = int(np.flatnonzero(mask)[0])
+                marginal_cost = self._kkt_stage_marginal_cost(
+                    env,
+                    request,
+                    stage_id,
+                    action,
+                    partial,
+                    compute_sqrt,
+                    link_sqrt,
+                )
+                partial.append(action)
+                self._reserve_kkt_stage(
+                    env,
+                    request,
+                    stage_id,
+                    action,
+                    partial,
+                    compute_sqrt,
+                    link_sqrt,
+                )
+                request_costs.append(float(marginal_cost))
+                if record:
+                    request_records.append(
+                        (state, mask.astype(bool), action, float(logprob), float(value))
+                    )
+            schedules.append(partial)
+            transition_records.append(request_records)
+            batch_costs.append(request_costs)
+            processed_weight += float(request.request_count)
+
+        if record:
+            for request_records in transition_records:
+                for state, mask, action, logprob, value in request_records:
+                    self.ppo.buffer.states.append(state)
+                    self.ppo.buffer.masks.append(mask)
+                    self.ppo.buffer.actions.append(action)
+                    self.ppo.buffer.logprobs.append(logprob)
+                    self.ppo.buffer.values.append(value)
+                    load_group = env.config.demand_load_group
+                    self.ppo.buffer.sample_groups.append(
+                        float(
+                            env.config.demand_load_multiplier
+                            if load_group is None
+                            else load_group
+                        )
+                    )
+            self.pending_kkt_stage_costs.extend(batch_costs)
+        return schedules
+
+    def consume_pending_kkt_stage_costs(self) -> list[float] | None:
+        """Return the next causal KKT reward decomposition, if v3 recorded one."""
+
+        if self.chain_context != "chain-kkt-v3" or not self.pending_kkt_stage_costs:
+            return None
+        return self.pending_kkt_stage_costs.pop(0)
 
     def schedule_with_diagnostics(
         self,
@@ -1785,6 +2259,10 @@ class FastSchedulingPPOAgent:
         *,
         reservation_node_delta: np.ndarray | None = None,
         reservation_stage_delta: dict[tuple[int, int], np.ndarray] | None = None,
+        kkt_compute_sqrt: np.ndarray | None = None,
+        kkt_link_sqrt: np.ndarray | None = None,
+        processed_request_weight: float = 0.0,
+        total_request_weight: float = 1.0,
     ) -> np.ndarray:
         assert env.scenario is not None
         prev_node = request.home_node if not partial_nodes else partial_nodes[-1]
@@ -1841,7 +2319,7 @@ class FastSchedulingPPOAgent:
                         node.compute_gcycles_per_s * max(1.0 - 0.75 * env.node_compute_load[node.node_id], 0.10),
                     ),
                 ]
-            if self.chain_context == "chain-v2":
+            if self.chain_context in {"chain-v2", "chain-kkt-v3"}:
                 transfer_s, propagation_s = self._route_proxy_delay(
                     env,
                     prev_node,
@@ -1861,6 +2339,17 @@ class FastSchedulingPPOAgent:
                         next_stage_overlap,
                     ]
                 )
+            if self.chain_context == "chain-kkt-v3":
+                kkt_features = self._kkt_candidate_features(
+                    env,
+                    request,
+                    stage_id,
+                    node.node_id,
+                    partial_nodes,
+                    kkt_compute_sqrt,
+                    kkt_link_sqrt,
+                )
+                features.extend(kkt_features)
             node_features.extend(features)
         scalars = [
             request.service_id / max(env.config.num_service_types - 1, 1),
@@ -1876,7 +2365,7 @@ class FastSchedulingPPOAgent:
             tick_request_event_count / max(env.config.num_edge_nodes * env.config.num_service_types, 1),
             tick_service_count / max(tick_request_count, 1.0),
         ]
-        if self.chain_context == "chain-v2":
+        if self.chain_context in {"chain-v2", "chain-kkt-v3"}:
             total_compute = max(float(sum(request.stage_compute_gcycles)), 1e-9)
             remaining_compute = float(sum(request.stage_compute_gcycles[stage_id:]))
             remaining_output = float(sum(request.stage_output_mb[stage_id:]))
@@ -1888,9 +2377,217 @@ class FastSchedulingPPOAgent:
                     float(np.tanh(remaining_output / 4.0)),
                 ]
             )
+        if self.chain_context == "chain-kkt-v3":
+            progress = float(processed_request_weight) / max(float(total_request_weight), 1.0)
+            scalars.extend([progress, 1.0 - progress])
         if self.policy_kind == "gat_node_scorer":
             node_features += self._build_edge_features(env)
         return np.asarray(scalars + node_features, dtype=np.float32)
+
+    def _effective_kkt_capacities(
+        self,
+        env: EdgeComputingEnv,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        assert env.scenario is not None
+        compute = np.asarray(
+            [node.compute_gcycles_per_s for node in env.scenario.nodes],
+            dtype=np.float64,
+        )
+        compute *= np.clip(1.0 - 0.75 * env.node_compute_load, 0.10, 1.0)
+        bandwidth = np.asarray(env.scenario.bandwidth_mb_s, dtype=np.float64).copy()
+        finite = np.isfinite(bandwidth)
+        bandwidth[finite] *= np.clip(1.0 - 0.75 * env.link_load[finite], 0.10, 1.0)
+        return compute, bandwidth
+
+    @staticmethod
+    def _kkt_total_increment(
+        previous_sqrt: float,
+        size: float,
+        multiplicity: float,
+        capacity: float,
+    ) -> float:
+        if size <= 0.0:
+            return 0.0
+        addition = max(float(multiplicity), 0.0) * np.sqrt(max(float(size), 0.0))
+        return float(
+            (2.0 * max(float(previous_sqrt), 0.0) * addition + addition * addition)
+            / max(float(capacity), 1e-9)
+        )
+
+    def _routed_kkt_increment(
+        self,
+        env: EdgeComputingEnv,
+        *,
+        phase: int,
+        source: int,
+        target: int,
+        data_mb: float,
+        multiplicity: float,
+        link_sqrt: np.ndarray,
+    ) -> tuple[float, float]:
+        if int(source) == int(target):
+            return 0.0, 0.0
+        assert env.scenario is not None
+        path = env.shortest_path(int(source), int(target))
+        if path is None:
+            return float("inf"), float("inf")
+        _, bandwidth = self._effective_kkt_capacities(env)
+        transfer_total = 0.0
+        propagation_per_request = 0.0
+        for left, right in zip(path, path[1:]):
+            transfer_total += self._kkt_total_increment(
+                link_sqrt[phase, left, right],
+                data_mb,
+                multiplicity,
+                bandwidth[left, right],
+            )
+            propagation_per_request += float(env.scenario.propagation_ms[left, right]) / 1000.0
+        return transfer_total, propagation_per_request
+
+    def _kkt_stage_marginal_cost(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        node_id: int,
+        partial_nodes: list[int],
+        compute_sqrt: np.ndarray,
+        link_sqrt: np.ndarray,
+    ) -> float:
+        compute_capacity, _ = self._effective_kkt_capacities(env)
+        multiplicity = max(float(request.request_count), 1.0)
+        compute_total = self._kkt_total_increment(
+            compute_sqrt[stage_id, node_id],
+            float(request.stage_compute_gcycles[stage_id]),
+            multiplicity,
+            compute_capacity[node_id],
+        )
+        source = int(request.home_node) if stage_id == 0 else int(partial_nodes[-1])
+        data_mb = (
+            float(request.input_mb)
+            if stage_id == 0
+            else float(request.stage_output_mb[stage_id - 1])
+        )
+        link_total, propagation_per_request = self._routed_kkt_increment(
+            env,
+            phase=stage_id,
+            source=source,
+            target=int(node_id),
+            data_mb=data_mb,
+            multiplicity=multiplicity,
+            link_sqrt=link_sqrt,
+        )
+        return float((compute_total + link_total) / multiplicity + propagation_per_request)
+
+    def _reserve_kkt_stage(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        node_id: int,
+        partial_nodes: list[int],
+        compute_sqrt: np.ndarray,
+        link_sqrt: np.ndarray,
+    ) -> None:
+        multiplicity = max(float(request.request_count), 1.0)
+        compute_sqrt[stage_id, node_id] += multiplicity * np.sqrt(
+            max(float(request.stage_compute_gcycles[stage_id]), 0.0)
+        )
+        source = int(request.home_node) if stage_id == 0 else int(partial_nodes[-2])
+        if source == int(node_id):
+            return
+        path = env.shortest_path(source, int(node_id))
+        if path is None:
+            return
+        data_mb = (
+            float(request.input_mb)
+            if stage_id == 0
+            else float(request.stage_output_mb[stage_id - 1])
+        )
+        addition = multiplicity * np.sqrt(max(data_mb, 0.0))
+        for left, right in zip(path, path[1:]):
+            link_sqrt[stage_id, left, right] += addition
+
+    def _kkt_candidate_features(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        node_id: int,
+        partial_nodes: list[int],
+        compute_sqrt: np.ndarray | None,
+        link_sqrt: np.ndarray | None,
+    ) -> list[float]:
+        stages = len(request.stage_compute_gcycles)
+        if compute_sqrt is None:
+            compute_sqrt = np.zeros((stages, self.num_nodes), dtype=np.float64)
+        if link_sqrt is None:
+            link_sqrt = np.zeros(
+                (stages, self.num_nodes, self.num_nodes),
+                dtype=np.float64,
+            )
+        compute_capacity, _ = self._effective_kkt_capacities(env)
+        multiplicity = max(float(request.request_count), 1.0)
+        compute_total = self._kkt_total_increment(
+            compute_sqrt[stage_id, node_id],
+            float(request.stage_compute_gcycles[stage_id]),
+            multiplicity,
+            compute_capacity[node_id],
+        )
+        source = int(request.home_node) if stage_id == 0 else int(partial_nodes[-1])
+        data_mb = (
+            float(request.input_mb)
+            if stage_id == 0
+            else float(request.stage_output_mb[stage_id - 1])
+        )
+        link_total, propagation = self._routed_kkt_increment(
+            env,
+            phase=stage_id,
+            source=source,
+            target=node_id,
+            data_mb=data_mb,
+            multiplicity=multiplicity,
+            link_sqrt=link_sqrt,
+        )
+        compute_per_request = compute_total / multiplicity
+        link_per_request = link_total / multiplicity
+        ledger_delay = float(
+            compute_sqrt[stage_id, node_id] ** 2 / max(compute_capacity[node_id], 1e-9)
+        ) / multiplicity
+
+        downstream = 0.0
+        next_stage = stage_id + 1
+        if next_stage < stages and env.deployment is not None:
+            candidates = np.flatnonzero(env.deployment[request.service_id, next_stage])
+            downstream_costs: list[float] = []
+            for next_node in candidates:
+                next_node = int(next_node)
+                next_compute = self._kkt_total_increment(
+                    compute_sqrt[next_stage, next_node],
+                    float(request.stage_compute_gcycles[next_stage]),
+                    multiplicity,
+                    compute_capacity[next_node],
+                ) / multiplicity
+                next_link, next_prop = self._routed_kkt_increment(
+                    env,
+                    phase=next_stage,
+                    source=node_id,
+                    target=next_node,
+                    data_mb=float(request.stage_output_mb[stage_id]),
+                    multiplicity=multiplicity,
+                    link_sqrt=link_sqrt,
+                )
+                if np.isfinite(next_link):
+                    downstream_costs.append(next_compute + next_link / multiplicity + next_prop)
+            if downstream_costs:
+                downstream = min(downstream_costs)
+        return [
+            float(np.tanh(compute_per_request)),
+            float(np.tanh(link_per_request)) if np.isfinite(link_per_request) else 1.0,
+            float(np.tanh(propagation / 0.05)) if np.isfinite(propagation) else 1.0,
+            float(np.tanh(downstream)),
+            float(np.tanh(ledger_delay)),
+        ]
 
     def stage_counterfactual_regrets(
         self,
@@ -2566,8 +3263,12 @@ class HierarchicalPPOAgent:
         baseline = latency()
         if not np.isfinite(baseline):
             return
-        pending = self.slow_agent.pending_count_stage_keys
-        nodes = self.slow_agent.pending_count_node_ids
+        if self.slow_agent.allocation_mode == "budget-incremental":
+            pending = self.slow_agent.pending_stage_keys
+            nodes = self.slow_agent.pending_stage_node_ids
+        else:
+            pending = self.slow_agent.pending_count_stage_keys
+            nodes = self.slow_agent.pending_count_node_ids
         candidates = sorted(set(
             (service, stage, int(node))
             for (service, stage), node in zip(pending, nodes)
@@ -2659,6 +3360,7 @@ class HierarchicalPPOAgent:
 
         self.slow_agent.last_window_feedback = {}
         self.last_slow_window_metrics = {}
+        self.fast_agent.pending_kkt_stage_costs.clear()
 
     def act(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> list[int]:
         self.maybe_update_deployment(env, deterministic=deterministic, record=record)
@@ -2871,13 +3573,27 @@ class HierarchicalPPOAgent:
                 key: value + shared_return_credit
                 for key, value in placement_stage_returns.items()
             }
-        incremental_add_actions = sum(
-            node_id is not None for node_id in self.slow_agent.pending_count_node_ids
+        incremental_add_actions = (
+            len(self.slow_agent.pending_stage_node_ids)
+            if self.slow_agent.allocation_mode == "budget-incremental"
+            else sum(
+                node_id is not None for node_id in self.slow_agent.pending_count_node_ids
+            )
         )
         incremental_stop_actions = sum(
             stage_key == (-1, -1)
             for stage_key in self.slow_agent.pending_count_stage_keys
         )
+        budget_extra_replicas = 0.0
+        if (
+            self.slow_agent.allocation_mode == "budget-incremental"
+            and self.slow_agent.pending_count_indices
+        ):
+            budget_extra_replicas = float(
+                self.slow_agent.count_ppo.buffer.actions[
+                    self.slow_agent.pending_count_indices[0]
+                ]
+            )
         self.slow_agent.assign_pending_reward(
             window_return,
             done=done,
@@ -2903,6 +3619,8 @@ class HierarchicalPPOAgent:
             "slow_shared_return_credit": float(shared_return_credit),
             "slow_incremental_add_actions": float(incremental_add_actions),
             "slow_incremental_stop_actions": float(incremental_stop_actions),
+            "slow_budget_extra_replicas": budget_extra_replicas,
+            "slow_budget_allocated_replicas": float(incremental_add_actions),
             "slow_replica_ablation_samples": float(len(self.window_replica_ablation_values)),
             "slow_replica_ablation_mean_s": (
                 float(np.mean(list(self.window_replica_ablation_values.values())))
@@ -3166,7 +3884,10 @@ class HierarchicalPPOAgent:
                     )
                     placement_returns[node_key] = node_return
                     node_returns.append(node_return)
-                    if self.slow_agent.allocation_mode == "global-incremental":
+                    if self.slow_agent.allocation_mode in {
+                        "global-incremental",
+                        "budget-incremental",
+                    }:
                         per_replica_resource_cost = (
                             self.slow_deployment_memory_coef
                             * float(stage.memory_gb)

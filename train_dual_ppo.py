@@ -442,11 +442,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
     parser.add_argument(
         "--fast-chain-context",
-        choices=["auto", "legacy", "chain-v2"],
+        choices=["auto", "legacy", "chain-v2", "chain-kkt-v3"],
         default="auto",
         help=(
             "chain-v2 adds routed incoming-data cost, previous-node colocation, "
-            "remaining-chain demand, and next-stage overlap to Fast observations"
+            "remaining-chain demand, and next-stage overlap; chain-kkt-v3 additionally "
+            "uses per-request causal KKT ledgers, exact marginal features, and downstream lookahead"
         ),
     )
     parser.add_argument("--slow-lr", type=float, default=3e-4)
@@ -697,11 +698,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--slow-allocation-mode",
-        choices=["legacy-factorized", "global-incremental"],
+        choices=["legacy-factorized", "global-incremental", "budget-incremental"],
         default="legacy-factorized",
         help=(
             "Keep per-stage target counts for checkpoint compatibility, or allocate mandatory "
-            "coverage followed by globally competing add-replica/STOP actions."
+            "coverage followed by globally competing add-replica/STOP actions; budget-incremental "
+            "chooses one ordinal extra-replica budget and allocates it with separate Stage/Placement PPO heads."
         ),
     )
     parser.add_argument(
@@ -718,9 +720,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "For global-incremental Slow Count, test this many removable ADD "
-            "replicas on one sampled request tick with frozen Fast and joint KKT; "
-            "also probe STOP against feasible additions. Zero keeps legacy credit."
+            "For incremental Slow allocation, test this many removable ADD replicas "
+            "on one sampled request tick with frozen Fast and joint KKT; global mode "
+            "also probes STOP against feasible additions. Zero keeps legacy credit."
         ),
     )
     parser.add_argument("--fast-value-coef", type=float, default=0.5)
@@ -943,8 +945,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("Slow shaping coefficients must be >= 0")
     if args.slow_replica_ablation_samples < 0:
         parser.error("--slow-replica-ablation-samples must be >= 0")
-    if args.slow_replica_ablation_samples > 0 and args.slow_allocation_mode != "global-incremental":
-        parser.error("--slow-replica-ablation-samples requires --slow-allocation-mode global-incremental")
+    if args.slow_replica_ablation_samples > 0 and args.slow_allocation_mode not in {
+        "global-incremental",
+        "budget-incremental",
+    }:
+        parser.error(
+            "--slow-replica-ablation-samples requires --slow-allocation-mode "
+            "global-incremental or budget-incremental"
+        )
     if args.slow_replica_ablation_samples > 0 and args.slow_counterfactual_credit_coef <= 0.0:
         parser.error("--slow-replica-ablation-samples requires positive --slow-counterfactual-credit-coef")
     if args.fast_updates_per_cycle < 1:
@@ -1732,6 +1740,7 @@ def rollout(
     idle_deployed_node_penalties: list[float] = []
     fast_externality_costs: list[float] = []
     fast_counterfactual_regret_costs: list[float] = []
+    fast_kkt_reward_residuals: list[float] = []
     fast_oracle_latency_gaps: list[float] = []
     fast_oracle_relative_gaps: list[float] = []
     fast_oracle_weights: list[float] = []
@@ -1871,6 +1880,9 @@ def rollout(
         deployment_window = int(env.metrics["deployment_updates"])
         _, _, done, batch_info = env.step(actions, represented_seconds=step_represented_seconds)
         group_infos = batch_info["group_infos"]
+        tick_kkt_predicted_total = 0.0
+        tick_kkt_actual_total = 0.0
+        tick_has_kkt_credit = False
         for group_idx, (request, info) in enumerate(zip(requests, group_infos)):
             request_count = float(info.get("request_count", request.request_count))
             train_reward_info = _training_reward_components(info, env, args)
@@ -1889,19 +1901,38 @@ def rollout(
             fast_counterfactual_regret_costs.append(
                 float(sum(stage_counterfactual_regrets))
             )
-            fast_stage_rewards = [
-                -float(
-                    latency_cost
-                    + args.fast_congestion_credit_coef * externality_cost
-                    + fast_counterfactual_coef * counterfactual_regret
+            causal_kkt_costs = (
+                agent.fast_agent.consume_pending_kkt_stage_costs()
+                if record_fast
+                else None
+            )
+            if causal_kkt_costs is not None:
+                if len(causal_kkt_costs) != len(stage_latency_costs):
+                    raise RuntimeError("causal KKT stage costs do not match the request stage count")
+                fast_stage_rewards = [
+                    -float(cost) * reward_scale for cost in causal_kkt_costs
+                ]
+                tick_has_kkt_credit = True
+                tick_kkt_predicted_total += request_count * float(sum(causal_kkt_costs))
+                tick_kkt_actual_total += request_count * float(
+                    info["compute_delay_s"]
+                    + info["link_delay_s"]
+                    + info["propagation_delay_s"]
                 )
-                * reward_scale
-                for latency_cost, externality_cost, counterfactual_regret in zip(
-                    stage_latency_costs,
-                    stage_externality_costs,
-                    stage_counterfactual_regrets or [0.0] * len(stage_latency_costs),
-                )
-            ]
+            else:
+                fast_stage_rewards = [
+                    -float(
+                        latency_cost
+                        + args.fast_congestion_credit_coef * externality_cost
+                        + fast_counterfactual_coef * counterfactual_regret
+                    )
+                    * reward_scale
+                    for latency_cost, externality_cost, counterfactual_regret in zip(
+                        stage_latency_costs,
+                        stage_externality_costs,
+                        stage_counterfactual_regrets or [0.0] * len(stage_latency_costs),
+                    )
+                ]
             stage_transitions = float(max(len(info["stage_nodes"]) - 1, 0) * request_count)
             cross_stage_transitions = float(
                 sum(
@@ -1974,6 +2005,10 @@ def rollout(
                         cross_node_stage_transitions += request_count
             weights.append(request_count)
             window_latencies.setdefault(deployment_window, []).append((float(info["latency_s"]), request_count))
+        if tick_has_kkt_credit:
+            fast_kkt_reward_residuals.append(
+                float(tick_kkt_predicted_total - tick_kkt_actual_total)
+            )
         if record_slow and done and not group_infos:
             agent.flush_slow_window_reward(done=True, env=env)
         if progress.should_print():
@@ -2013,6 +2048,8 @@ def rollout(
         "slow_shared_return_credit": float("nan"),
         "slow_incremental_add_actions": 0.0,
         "slow_incremental_stop_actions": 0.0,
+        "slow_budget_extra_replicas": 0.0,
+        "slow_budget_allocated_replicas": 0.0,
         "slow_replica_ablation_samples": 0.0,
         "slow_replica_ablation_mean_s": 0.0,
         "slow_stop_ablation_value_s": 0.0,
@@ -2074,6 +2111,16 @@ def rollout(
         "avg_fast_counterfactual_regret_s": _weighted_mean(
             fast_counterfactual_regret_costs,
             weights,
+        ),
+        "avg_fast_kkt_reward_residual_s": (
+            float(np.mean(np.abs(fast_kkt_reward_residuals)))
+            if fast_kkt_reward_residuals
+            else 0.0
+        ),
+        "max_fast_kkt_reward_residual_s": (
+            float(np.max(np.abs(fast_kkt_reward_residuals)))
+            if fast_kkt_reward_residuals
+            else 0.0
         ),
         "fast_counterfactual_credit_coef": fast_counterfactual_coef,
         "fast_oracle_samples": float(len(fast_oracle_latency_gaps)),
@@ -2404,6 +2451,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
     valid_weighted = ["avg_valid_latency_s", "p95_valid_latency_s"]
     simple_mean = [
         "episode_fraction",
+        "avg_fast_kkt_reward_residual_s",
         "demand_expected_compute_gcycles",
         "demand_expected_data_mb",
         "demand_expected_deadline_s",
@@ -2455,6 +2503,8 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_shared_return_credit",
         "slow_incremental_add_actions",
         "slow_incremental_stop_actions",
+        "slow_budget_extra_replicas",
+        "slow_budget_allocated_replicas",
         "slow_replica_ablation_samples",
         "slow_replica_ablation_mean_s",
         "slow_stop_ablation_value_s",
@@ -2495,6 +2545,14 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "invalid_actions": float(sum(r["invalid_actions"] for r in rollouts)),
         "deployment_updates": float(deployment_updates.sum()),
         "fast_oracle_samples": float(sum(r["fast_oracle_samples"] for r in rollouts)),
+        "max_fast_kkt_reward_residual_s": float(
+            np.nanmax(
+                np.asarray(
+                    [r["max_fast_kkt_reward_residual_s"] for r in rollouts],
+                    dtype=np.float64,
+                )
+            )
+        ),
     }
     aggregated["temporal_sampling_fraction"] = float(
         aggregated["settlement_steps"] / max(aggregated["logical_steps"], 1.0)
@@ -3068,12 +3126,20 @@ def _serialize_pending_slow_collection(agent: HierarchicalPPOAgent) -> dict[str,
         raise RuntimeError("checkpoints may only be saved after the current Slow window receives feedback")
     return {
         "count_buffer": _serialize_rollout_buffer(slow.count_ppo.buffer),
+        "stage_buffer": (
+            _serialize_rollout_buffer(slow.stage_ppo.buffer)
+            if slow.stage_ppo is not None
+            else None
+        ),
         "placement_buffer": _serialize_rollout_buffer(slow.placement_ppo.buffer),
         "count_action_returns": list(slow.count_action_returns),
+        "stage_action_returns": list(slow.stage_action_returns),
         "placement_action_returns": list(slow.placement_action_returns),
         "count_action_stage_keys": [list(key) for key in slow.count_action_stage_keys],
+        "stage_action_stage_keys": [list(key) for key in slow.stage_action_stage_keys],
         "placement_action_stage_keys": [list(key) for key in slow.placement_action_stage_keys],
         "count_window_ids": list(slow.count_window_ids),
+        "stage_window_ids": list(slow.stage_window_ids),
         "placement_window_ids": list(slow.placement_window_ids),
         "window_states": torch.as_tensor(np.stack(slow.window_states), dtype=torch.float32)
         if slow.window_states
@@ -3090,14 +3156,21 @@ def _restore_pending_slow_collection(agent: HierarchicalPPOAgent, state: object)
         return
     slow = agent.slow_agent
     _restore_rollout_buffer(slow.count_ppo.buffer, state.get("count_buffer"))
+    if slow.stage_ppo is not None:
+        _restore_rollout_buffer(slow.stage_ppo.buffer, state.get("stage_buffer"))
     _restore_rollout_buffer(slow.placement_ppo.buffer, state.get("placement_buffer"))
     slow.count_action_returns = [float(value) for value in state.get("count_action_returns", [])]
+    slow.stage_action_returns = [float(value) for value in state.get("stage_action_returns", [])]
     slow.placement_action_returns = [float(value) for value in state.get("placement_action_returns", [])]
     slow.count_action_stage_keys = [tuple(map(int, key)) for key in state.get("count_action_stage_keys", [])]
+    slow.stage_action_stage_keys = [
+        tuple(map(int, key)) for key in state.get("stage_action_stage_keys", [])
+    ]
     slow.placement_action_stage_keys = [
         tuple(map(int, key)) for key in state.get("placement_action_stage_keys", [])
     ]
     slow.count_window_ids = [int(value) for value in state.get("count_window_ids", [])]
+    slow.stage_window_ids = [int(value) for value in state.get("stage_window_ids", [])]
     slow.placement_window_ids = [int(value) for value in state.get("placement_window_ids", [])]
     window_states = state.get("window_states")
     slow.window_states = (
@@ -3111,9 +3184,12 @@ def _restore_pending_slow_collection(agent: HierarchicalPPOAgent, state: object)
     slow.window_episode_ids = [int(value) for value in state.get("window_episode_ids", [])]
     slow.pending_window_id = None
     slow.pending_count_indices.clear()
+    slow.pending_stage_indices.clear()
     slow.pending_placement_indices.clear()
     slow.pending_count_stage_keys.clear()
     slow.pending_count_node_ids.clear()
+    slow.pending_stage_keys.clear()
+    slow.pending_stage_node_ids.clear()
     slow.pending_placement_stage_keys.clear()
 
 
@@ -3140,6 +3216,16 @@ def save_checkpoint(
             "slow_allocation_mode": agent.slow_agent.allocation_mode,
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
             "slow_count_optimizer": agent.slow_agent.count_ppo.optimizer.state_dict(),
+            "slow_stage_agent": (
+                agent.slow_agent.stage_ppo.policy.state_dict()
+                if agent.slow_agent.stage_ppo is not None
+                else None
+            ),
+            "slow_stage_optimizer": (
+                agent.slow_agent.stage_ppo.optimizer.state_dict()
+                if agent.slow_agent.stage_ppo is not None
+                else None
+            ),
             "slow_placement_agent": agent.slow_agent.placement_ppo.policy.state_dict(),
             "slow_placement_optimizer": agent.slow_agent.placement_ppo.optimizer.state_dict(),
             "slow_placement_updates_completed": agent.slow_agent.placement_updates_completed,
@@ -3222,6 +3308,14 @@ def load_checkpoint(
         agent.slow_agent.count_ppo.policy.load_state_dict(checkpoint["slow_count_agent"])
     if "slow_count_optimizer" in checkpoint:
         agent.slow_agent.count_ppo.optimizer.load_state_dict(checkpoint["slow_count_optimizer"])
+    if checkpoint.get("slow_stage_agent") is not None:
+        if agent.slow_agent.stage_ppo is None:
+            raise ValueError("checkpoint contains a Slow Stage actor, but this mode does not")
+        agent.slow_agent.stage_ppo.policy.load_state_dict(checkpoint["slow_stage_agent"])
+    if checkpoint.get("slow_stage_optimizer") is not None:
+        if agent.slow_agent.stage_ppo is None:
+            raise ValueError("checkpoint contains a Slow Stage optimizer, but this mode does not")
+        agent.slow_agent.stage_ppo.optimizer.load_state_dict(checkpoint["slow_stage_optimizer"])
     if "slow_placement_agent" in checkpoint:
         agent.slow_agent.placement_ppo.policy.load_state_dict(checkpoint["slow_placement_agent"])
         if "slow_placement_optimizer" in checkpoint:
@@ -3491,15 +3585,23 @@ class SlowLearningRateController:
 
         changed = False
         optimizers = {
-            "count": agent.slow_agent.count_ppo.optimizer,
-            "placement": agent.slow_agent.placement_ppo.optimizer,
+            "count": [
+                agent.slow_agent.count_ppo.optimizer,
+                *(
+                    [agent.slow_agent.stage_ppo.optimizer]
+                    if agent.slow_agent.stage_ppo is not None
+                    else []
+                ),
+            ],
+            "placement": [agent.slow_agent.placement_ppo.optimizer],
         }
-        for actor, optimizer in optimizers.items():
-            for group in optimizer.param_groups:
-                old_lr = float(group["lr"])
-                new_lr = max(old_lr, self.min_lrs[actor])
-                group["lr"] = new_lr
-                changed = changed or new_lr > old_lr + 1e-15
+        for actor, actor_optimizers in optimizers.items():
+            for optimizer in actor_optimizers:
+                for group in optimizer.param_groups:
+                    old_lr = float(group["lr"])
+                    new_lr = max(old_lr, self.min_lrs[actor])
+                    group["lr"] = new_lr
+                    changed = changed or new_lr > old_lr + 1e-15
         return changed
 
     @staticmethod
@@ -3514,6 +3616,7 @@ class SlowLearningRateController:
         slow_updated: bool,
         agent: HierarchicalPPOAgent,
         count_approx_kl: float | None = None,
+        stage_approx_kl: float | None = None,
         placement_approx_kl: float | None = None,
         count_target_kl: float | None = None,
         placement_target_kl: float | None = None,
@@ -3524,19 +3627,32 @@ class SlowLearningRateController:
         if not self.enabled or not ready or not slow_updated or not np.isfinite(score):
             return False
         changed = False
+        count_kl_values = [
+            value
+            for value in (count_approx_kl, stage_approx_kl)
+            if value is not None and np.isfinite(value)
+        ]
+        effective_count_kl = max(count_kl_values) if count_kl_values else None
         actor_inputs = {
             "count": (
-                agent.slow_agent.count_ppo.optimizer,
-                count_approx_kl,
+                [
+                    agent.slow_agent.count_ppo.optimizer,
+                    *(
+                        [agent.slow_agent.stage_ppo.optimizer]
+                        if agent.slow_agent.stage_ppo is not None
+                        else []
+                    ),
+                ],
+                effective_count_kl,
                 count_target_kl,
             ),
             "placement": (
-                agent.slow_agent.placement_ppo.optimizer,
+                [agent.slow_agent.placement_ppo.optimizer],
                 placement_approx_kl,
                 placement_target_kl,
             ),
         }
-        for actor, (optimizer, approx_kl, target_kl) in actor_inputs.items():
+        for actor, (actor_optimizers, approx_kl, target_kl) in actor_inputs.items():
             actor_state = self.actor_state[actor]
             if score < float(actor_state["best_score"]) - self.min_delta:
                 actor_state["best_score"] = float(score)
@@ -3586,14 +3702,15 @@ class SlowLearningRateController:
                 continue
 
             actor_changed = False
-            for group in optimizer.param_groups:
-                old_lr = float(group["lr"])
-                new_lr = min(
-                    old_lr,
-                    max(self.min_lrs[actor], old_lr * self.factor),
-                )
-                group["lr"] = new_lr
-                actor_changed = actor_changed or new_lr < old_lr - 1e-15
+            for optimizer in actor_optimizers:
+                for group in optimizer.param_groups:
+                    old_lr = float(group["lr"])
+                    new_lr = min(
+                        old_lr,
+                        max(self.min_lrs[actor], old_lr * self.factor),
+                    )
+                    group["lr"] = new_lr
+                    actor_changed = actor_changed or new_lr < old_lr - 1e-15
             actor_state["bad_updates"] = 0
             if actor_changed:
                 actor_state["reductions"] = int(actor_state["reductions"]) + 1
@@ -3688,14 +3805,14 @@ def resolve_eval_rollout_unit(args: argparse.Namespace) -> str:
 
 
 def resolve_fast_chain_context(args: argparse.Namespace) -> str:
-    """Use chain-v2 for new runs and preserve legacy checkpoint dimensions."""
+    """Use causal KKT chain context for new runs and preserve checkpoint dimensions."""
 
     requested = str(getattr(args, "fast_chain_context", "auto"))
     if requested != "auto":
         return requested
     checkpoint_raw = getattr(args, "load_checkpoint", None)
     if not checkpoint_raw:
-        return "chain-v2"
+        return "chain-kkt-v3"
     checkpoint_path = Path(checkpoint_raw)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     embedded_args = checkpoint.get("metadata", {}).get("args", {})
@@ -4212,6 +4329,8 @@ def main() -> None:
             "avg_train_latency_cost_s": np.nan,
             "avg_fast_externality_cost_s": np.nan,
             "avg_fast_counterfactual_regret_s": np.nan,
+            "avg_fast_kkt_reward_residual_s": np.nan,
+            "max_fast_kkt_reward_residual_s": np.nan,
             "fast_oracle_samples": 0,
             "avg_fast_oracle_latency_gap_s": np.nan,
             "avg_fast_oracle_relative_gap": np.nan,
@@ -4291,6 +4410,8 @@ def main() -> None:
             "slow_shared_return_credit": np.nan,
             "slow_incremental_add_actions": 0.0,
             "slow_incremental_stop_actions": 0.0,
+            "slow_budget_extra_replicas": 0.0,
+            "slow_budget_allocated_replicas": 0.0,
             "slow_replica_ablation_samples": 0.0,
             "slow_replica_ablation_mean_s": 0.0,
             "slow_stop_ablation_value_s": 0.0,
@@ -4323,6 +4444,13 @@ def main() -> None:
             "checkpoint_score_load_slope": np.nan,
             "slow_count_lr": SlowLearningRateController.optimizer_lr(
                 agent.slow_agent.count_ppo.optimizer
+            ),
+            "slow_stage_lr": (
+                SlowLearningRateController.optimizer_lr(
+                    agent.slow_agent.stage_ppo.optimizer
+                )
+                if agent.slow_agent.stage_ppo is not None
+                else np.nan
             ),
             "slow_placement_lr": SlowLearningRateController.optimizer_lr(
                 agent.slow_agent.placement_ppo.optimizer
@@ -4361,6 +4489,8 @@ def main() -> None:
             "slow_trajectory_return_std": np.nan,
             "slow_count_return_mean": np.nan,
             "slow_count_return_std": np.nan,
+            "slow_stage_return_mean": np.nan,
+            "slow_stage_return_std": np.nan,
             "slow_placement_return_mean": np.nan,
             "slow_placement_return_std": np.nan,
             "slow_advantage_mean": np.nan,
@@ -4394,6 +4524,13 @@ def main() -> None:
             "slow_count_post_explained_variance": np.nan,
             "slow_count_entropy": 0.0,
             "slow_count_approx_kl": 0.0,
+            "slow_stage_loss": 0.0,
+            "slow_stage_policy_loss": 0.0,
+            "slow_stage_value_loss": 0.0,
+            "slow_stage_entropy": 0.0,
+            "slow_stage_approx_kl": 0.0,
+            "slow_stage_advantage_mean": np.nan,
+            "slow_stage_advantage_std": np.nan,
             "slow_placement_loss": 0.0,
             "slow_placement_advantage_mean": np.nan,
             "slow_placement_advantage_std": np.nan,
@@ -4825,6 +4962,8 @@ def main() -> None:
         if args.train_mode == "fast-only":
             slow_metrics = agent.slow_agent.empty_update_metrics()
             agent.slow_agent.count_ppo.buffer.clear()
+            if agent.slow_agent.stage_ppo is not None:
+                agent.slow_agent.stage_ppo.buffer.clear()
             agent.slow_agent.placement_ppo.buffer.clear()
             agent.window_reward = 0.0
             agent.window_steps = 0
@@ -4856,6 +4995,7 @@ def main() -> None:
             slow_updated=slow_updated,
             agent=agent,
             count_approx_kl=slow_metrics.get("count_approx_kl"),
+            stage_approx_kl=slow_metrics.get("stage_approx_kl"),
             placement_approx_kl=slow_metrics.get("placement_approx_kl"),
             count_target_kl=args.slow_count_target_kl,
             placement_target_kl=args.slow_placement_target_kl,
@@ -4865,6 +5005,13 @@ def main() -> None:
         )
         slow_count_lr = SlowLearningRateController.optimizer_lr(
             agent.slow_agent.count_ppo.optimizer
+        )
+        slow_stage_lr = (
+            SlowLearningRateController.optimizer_lr(
+                agent.slow_agent.stage_ppo.optimizer
+            )
+            if agent.slow_agent.stage_ppo is not None
+            else np.nan
         )
         slow_placement_lr = SlowLearningRateController.optimizer_lr(
             agent.slow_agent.placement_ppo.optimizer
@@ -4931,6 +5078,12 @@ def main() -> None:
             "avg_fast_externality_cost_s": stats["avg_fast_externality_cost_s"],
             "avg_fast_counterfactual_regret_s": stats[
                 "avg_fast_counterfactual_regret_s"
+            ],
+            "avg_fast_kkt_reward_residual_s": stats[
+                "avg_fast_kkt_reward_residual_s"
+            ],
+            "max_fast_kkt_reward_residual_s": stats[
+                "max_fast_kkt_reward_residual_s"
             ],
             "fast_oracle_samples": int(stats["fast_oracle_samples"]),
             "avg_fast_oracle_latency_gap_s": stats[
@@ -5017,6 +5170,10 @@ def main() -> None:
             "slow_shared_return_credit": stats["slow_shared_return_credit"],
             "slow_incremental_add_actions": stats["slow_incremental_add_actions"],
             "slow_incremental_stop_actions": stats["slow_incremental_stop_actions"],
+            "slow_budget_extra_replicas": stats["slow_budget_extra_replicas"],
+            "slow_budget_allocated_replicas": stats[
+                "slow_budget_allocated_replicas"
+            ],
             "slow_replica_ablation_samples": stats["slow_replica_ablation_samples"],
             "slow_replica_ablation_mean_s": stats["slow_replica_ablation_mean_s"],
             "slow_stop_ablation_value_s": stats["slow_stop_ablation_value_s"],
@@ -5058,6 +5215,7 @@ def main() -> None:
             "checkpoint_score": checkpoint_score,
             "checkpoint_score_load_slope": checkpoint_load_slope,
             "slow_count_lr": slow_count_lr,
+            "slow_stage_lr": slow_stage_lr,
             "slow_placement_lr": slow_placement_lr,
             "slow_lr_bad_updates": slow_lr_controller.bad_updates,
             "slow_lr_reductions": slow_lr_controller.reductions,
@@ -5093,6 +5251,8 @@ def main() -> None:
             "slow_trajectory_return_std": losses["slow"].get("trajectory_return_std", np.nan),
             "slow_count_return_mean": losses["slow"].get("count_return_mean", np.nan),
             "slow_count_return_std": losses["slow"].get("count_return_std", np.nan),
+            "slow_stage_return_mean": losses["slow"].get("stage_return_mean", np.nan),
+            "slow_stage_return_std": losses["slow"].get("stage_return_std", np.nan),
             "slow_placement_return_mean": losses["slow"].get("placement_return_mean", np.nan),
             "slow_placement_return_std": losses["slow"].get("placement_return_std", np.nan),
             "slow_advantage_mean": losses["slow"].get("advantage_mean", np.nan),
@@ -5165,6 +5325,23 @@ def main() -> None:
             ),
             "slow_count_entropy": losses["slow"].get("count_entropy", np.nan),
             "slow_count_approx_kl": losses["slow"].get("count_approx_kl", np.nan),
+            "slow_stage_loss": losses["slow"].get("stage_loss", np.nan),
+            "slow_stage_policy_loss": losses["slow"].get(
+                "stage_policy_loss", np.nan
+            ),
+            "slow_stage_value_loss": losses["slow"].get(
+                "stage_value_loss", np.nan
+            ),
+            "slow_stage_entropy": losses["slow"].get("stage_entropy", np.nan),
+            "slow_stage_approx_kl": losses["slow"].get(
+                "stage_approx_kl", np.nan
+            ),
+            "slow_stage_advantage_mean": losses["slow"].get(
+                "stage_advantage_mean", np.nan
+            ),
+            "slow_stage_advantage_std": losses["slow"].get(
+                "stage_advantage_std", np.nan
+            ),
             "slow_placement_loss": losses["slow"].get("placement_loss", np.nan),
             "slow_placement_advantage_mean": losses["slow"].get(
                 "placement_advantage_mean", np.nan
