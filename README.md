@@ -362,3 +362,16 @@ for the Fast count in legacy experiments.
 Slow deployment exploration can also be controlled separately with
 `--slow-count-entropy-coef` and `--slow-placement-entropy-coef`; the count policy
 is especially sensitive because its action space is only the replica count.
+
+An additional deployment-only comparison is available as
+`--schemes Proposed HEFTFast FitDeploy`. It uses demand-only
+replica priority and fixed-order First-Fit placement with the frozen Proposed
+Fast policy. See [POPULARITY_FIRST_FIT.md](POPULARITY_FIRST_FIT.md) for the
+algorithm, coverage repair and evaluation protocol. The original
+`PopularityDeploy` remains separately selectable.
+
+`UniformFirstFitDeploy` is a separate demand-independent deployment baseline.
+It adds replicas to the feasible stage with the fewest replicas, with fixed
+service/stage ordering and ascending-node First-Fit placement. It reuses the
+frozen Proposed Fast PPO and public KKT settlement. See
+[UNIFORM_FIRST_FIT.md](UNIFORM_FIRST_FIT.md) for its fixed rules.

@@ -102,6 +102,120 @@ execution time. All feasible nodes participate; there is no replica cap.
                             "planning_time_s": time.perf_counter() - started}
 
 
+class PopularityFirstFitPlacement:
+    """Demand-only replica priority and fixed ascending-node First-Fit packing.
+
+    Coverage comes first. If greedy coverage fragments capacity, a binary
+    feasibility repair finds one replica per stage without latency objectives.
+    Extra replicas use demand divided by the current replica count. There is
+    no artificial replica cap and no compute, bandwidth or locality score.
+    """
+
+    planner_name = "popularity_first_fit"
+
+    def _service_priorities(self, env):
+        return DemandAwareMILPPlacement._demand(env).sum(axis=0)
+
+    def plan(self, env):
+        started = time.perf_counter()
+        assert env.scenario is not None and env.deployment is not None
+        stages = [(service, stage) for service in env.scenario.services for stage in service.stages]
+        n = env.config.num_edge_nodes
+        demand = self._service_priorities(env)
+        order = sorted(range(len(stages)), key=lambda i: (
+            -float(demand[stages[i][0].service_id]),
+            stages[i][0].service_id, stages[i][1].stage_id,
+        ))
+        memory_cap = env.service_memory_capacities().copy()
+        storage_cap = env.service_storage_capacities().copy()
+        memory, storage = memory_cap.copy(), storage_cap.copy()
+        deployment = np.zeros_like(env.deployment, dtype=bool)
+
+        def first_fit(i):
+            service, stage = stages[i]
+            feasible = np.flatnonzero(
+                ~deployment[service.service_id, stage.stage_id]
+                & (memory + 1e-9 >= stage.memory_gb)
+                & (storage + 1e-9 >= stage.storage_gb)
+            )
+            return int(feasible[0]) if feasible.size else None
+
+        def place(i, node):
+            service, stage = stages[i]
+            deployment[service.service_id, stage.stage_id, node] = True
+            memory[node] -= stage.memory_gb
+            storage[node] -= stage.storage_gb
+
+        repaired = False
+        for i in order:
+            node = first_fit(i)
+            if node is None:
+                # Pure coverage feasibility repair; not a latency optimizer.
+                matrix = np.zeros((len(stages) + 2 * n, len(stages) * n))
+                for j, (_, stage) in enumerate(stages):
+                    matrix[j, j*n:(j+1)*n] = 1
+                    for node_id in range(n):
+                        matrix[len(stages)+node_id, j*n+node_id] = stage.memory_gb
+                        matrix[len(stages)+n+node_id, j*n+node_id] = stage.storage_gb
+                result = milp(
+                    c=np.zeros(len(stages)*n), integrality=np.ones(len(stages)*n),
+                    bounds=Bounds(0, 1),
+                    constraints=LinearConstraint(
+                        matrix, np.r_[np.ones(len(stages)), np.zeros(2*n)],
+                        np.r_[np.ones(len(stages)), memory_cap, storage_cap],
+                    ),
+                    options={"time_limit": 5.0},
+                )
+                if result.x is None:
+                    raise RuntimeError(f"First-Fit coverage repair failed: {result.message}")
+                deployment.fill(False)
+                memory[:], storage[:] = memory_cap, storage_cap
+                for j in range(len(stages)):
+                    for node_id in np.flatnonzero(result.x[j*n:(j+1)*n] > 0.5):
+                        place(j, int(node_id))
+                repaired = True
+                break
+            place(i, node)
+
+        additions = 0
+        while True:
+            choices = []
+            for i in order:
+                service, stage = stages[i]
+                node = first_fit(i)
+                heat = float(demand[service.service_id])
+                if node is not None and heat > 0:
+                    count = int(deployment[service.service_id, stage.stage_id].sum())
+                    choices.append((-heat / max(count, 1), i, node))
+            if not choices:
+                break
+            _, i, node = min(choices)
+            place(i, node)
+            additions += 1
+        valid, reason = env.check_deployment_feasible(deployment)
+        if not valid:
+            raise RuntimeError(f"First-Fit deployment invalid: {reason}")
+        return deployment, {
+            "planner": self.planner_name, "coverage_repaired": repaired,
+            "replicas": int(deployment.sum()), "added_replicas": additions,
+            "planning_time_s": time.perf_counter() - started,
+        }
+
+
+class UniformFirstFitPlacement(PopularityFirstFitPlacement):
+    """Equal stage replica counts, with fixed-order First-Fit resource packing.
+
+    Constant service priorities make each next replica go to the feasible
+    stage with the fewest replicas, breaking ties by service/stage order.
+    This planner does not read demand, compute capacities or network costs.
+    """
+
+    planner_name = "uniform_first_fit"
+
+    def _service_priorities(self, env):
+        return np.ones(max(service.service_id for service in env.scenario.services) + 1)
+
+
 class StageCompletionScheduler(CausalKKTPathScheduler):
     """Myopic serial-stage earliest completion using an online work ledger.
 
@@ -241,6 +355,7 @@ class PopularityDeployScheme(BaseComparisonScheme):
     """
 
     name = "PopularityDeploy"
+    planner_label = "popularity_deploy_with_frozen_proposed_fast"
 
     def __init__(
         self,
@@ -266,7 +381,7 @@ class PopularityDeployScheme(BaseComparisonScheme):
                 {
                     "time_minute": env.current_time_minute,
                     **details,
-                    "planner": "popularity_deploy_with_frozen_proposed_fast",
+                    "planner": self.planner_label,
                 }
             )
 
@@ -279,3 +394,25 @@ class PopularityDeployScheme(BaseComparisonScheme):
         return self.agent.fast_agent.schedule_batch(
             env, requests, deterministic=self.fast_deterministic, record=False
         )
+
+
+class FitDeployScheme(PopularityDeployScheme):
+    """First-Fit placement with the same frozen Fast PPO and KKT settlement."""
+
+    name = "FitDeploy"
+    planner_label = "popularity_first_fit_with_frozen_proposed_fast"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.planner = PopularityFirstFitPlacement()
+
+
+class UniformFirstFitDeployScheme(PopularityDeployScheme):
+    """Uniform First-Fit deployment with the frozen Proposed Fast PPO."""
+
+    name = "UniformFirstFitDeploy"
+    planner_label = "uniform_first_fit_with_frozen_proposed_fast"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.planner = UniformFirstFitPlacement()

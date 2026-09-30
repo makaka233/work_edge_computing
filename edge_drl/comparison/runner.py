@@ -17,6 +17,8 @@ from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_che
 from edge_drl.comparison.algorithmic import AlgorithmicScheme, HybridScheme
 from edge_drl.comparison.heuristic import (
     PopularityDeployScheme,
+    FitDeployScheme,
+    UniformFirstFitDeployScheme,
     PopularityEFTScheme,
     PopularityNearestScheme,
 )
@@ -39,6 +41,8 @@ AVAILABLE_SCHEMES = FORMAL_SCHEMES + (
     "PopularityNearest",
     "HEFTFast",
     "PopularityDeploy",
+    "FitDeploy",
+    "UniformFirstFitDeploy",
 )
 FORMAL_SCENARIO_FAMILIES = (
     "request_load",
@@ -218,6 +222,8 @@ def run_comparison(
             "PopularityNearest": "frozen popularity/resource placement with static nearest-reachable-replica scheduling",
             "HEFTFast": "frozen Proposed Slow PPO with HEFT-style upward-rank and earliest-finish Fast scheduling",
             "PopularityDeploy": "fixed demand/capacity/locality placement with frozen Proposed Fast PPO and unchanged KKT settlement",
+            "FitDeploy": "demand-only replica priority and ascending-node First-Fit placement, with coverage feasibility repair, frozen Proposed Fast PPO and unchanged KKT settlement",
+            "UniformFirstFitDeploy": "equal-count stage replica allocation and ascending-node First-Fit placement with coverage feasibility repair, frozen Proposed Fast PPO and unchanged KKT settlement",
         },
     }
     write_json(output / "metadata.json", metadata)
@@ -419,8 +425,13 @@ def _make_scheme(
         return PopularityNearestScheme()
     if name == "HEFTFast":
         return HEFTFastScheme(env, checkpoint_path, checkpoint_args, device=device)
-    if name == "PopularityDeploy":
-        return PopularityDeployScheme(
+    if name in {"PopularityDeploy", "FitDeploy", "UniformFirstFitDeploy"}:
+        scheme_class = {
+            "PopularityDeploy": PopularityDeployScheme,
+            "FitDeploy": FitDeployScheme,
+            "UniformFirstFitDeploy": UniformFirstFitDeployScheme,
+        }[name]
+        return scheme_class(
             env,
             checkpoint_path,
             checkpoint_args,

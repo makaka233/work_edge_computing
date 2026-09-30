@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic", "PopularityEFT", "PopularityNearest", "HEFTFast", "PopularityDeploy")
+SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic", "PopularityEFT", "PopularityNearest", "HEFTFast", "PopularityDeploy", "FitDeploy", "UniformFirstFitDeploy")
 COLORS = {
     "Proposed": "#0072B2",
     "Monolithic": "#D55E00",
@@ -18,6 +18,8 @@ COLORS = {
     "PopularityNearest": "#7F7F7F",
     "HEFTFast": "#E69F00",
     "PopularityDeploy": "#56B4E9",
+    "FitDeploy": "#009E73",
+    "UniformFirstFitDeploy": "#CC79A7",
 }
 LINE_STYLES = {"Proposed": "-", "Monolithic": "--", "Hybrid": "-.", "Algorithmic": ":"}
 MARKERS = {"Proposed": "o", "Monolithic": "s", "Hybrid": "^", "Algorithmic": "D"}
@@ -29,6 +31,10 @@ LINE_STYLES["HEFTFast"] = "-."
 MARKERS["HEFTFast"] = "X"
 LINE_STYLES["PopularityDeploy"] = "--"
 MARKERS["PopularityDeploy"] = "*"
+LINE_STYLES["FitDeploy"] = ":"
+MARKERS["FitDeploy"] = "^"
+LINE_STYLES["UniformFirstFitDeploy"] = "--"
+MARKERS["UniformFirstFitDeploy"] = "D"
 FAMILY_ORDER = (
     "request_load",
     "compute_capacity",
@@ -93,6 +99,7 @@ def plot_five_scenario_overview(
     ylabel: str,
     title: str,
     output_stem: Path,
+    linear_scale: bool = False,
 ) -> list[Path]:
     figure, axes = plt.subplots(2, 3, figsize=(15.2, 8.3), constrained_layout=True)
     flat_axes = axes.ravel()
@@ -102,7 +109,8 @@ def plot_five_scenario_overview(
         axis.set_title(FAMILY_LABELS[family])
         axis.set_xlabel("Scenario multiplier")
         axis.set_ylabel(ylabel)
-        axis.set_yscale("log")
+        if not linear_scale:
+            axis.set_yscale("log")
         axis.grid(True, which="major", alpha=0.28)
         axis.grid(True, which="minor", alpha=0.10)
 
@@ -125,7 +133,7 @@ def plot_five_scenario_overview(
     return outputs
 
 
-def plot_run(run_dir: Path) -> list[Path]:
+def plot_run(run_dir: Path, *, mean_only: bool = False, linear_scale: bool = False) -> list[Path]:
     rows = load_summary(run_dir / "summary" / "summary.csv")
     plot_dir = run_dir / "plots"
     plot_dir.mkdir(exist_ok=True)
@@ -134,12 +142,14 @@ def plot_run(run_dir: Path) -> list[Path]:
         plot_five_scenario_overview(
             rows,
             metric="mean_latency_ms",
-            ylabel="Mean latency (ms, log scale)",
+            ylabel="Mean latency (ms)" if linear_scale else "Mean latency (ms, log scale)",
             title="Mean latency across five edge-computing scenarios",
             output_stem=plot_dir / "five_scenario_mean_latency_all_schemes",
+            linear_scale=linear_scale,
         )
     )
-    outputs.extend(
+    if not mean_only:
+        outputs.extend(
         plot_five_scenario_overview(
             rows,
             metric="p95_latency_ms",
@@ -147,13 +157,15 @@ def plot_run(run_dir: Path) -> list[Path]:
             title="P95 latency across five edge-computing scenarios",
             output_stem=plot_dir / "five_scenario_p95_latency_all_schemes",
         )
-    )
+        )
     families = sorted({row["scenario_family"] for row in rows})
     for family in families:
         for metric, ylabel, suffix in (
             ("mean_latency_ms", "Mean request latency (ms)", "mean_latency"),
             ("p95_latency_ms", "P95 request latency (ms)", "p95_latency"),
         ):
+            if mean_only and metric != "mean_latency_ms":
+                continue
             figure, axis = plt.subplots(figsize=(7.2, 4.6), constrained_layout=True)
             for scheme in SCHEME_ORDER:
                 _plot_series(axis, _selected_rows(rows, family, metric, scheme), scheme)
@@ -171,8 +183,10 @@ def plot_run(run_dir: Path) -> list[Path]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot formal four-scheme comparison results")
     parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--mean-only", action="store_true", help="Only plot mean latency")
+    parser.add_argument("--linear-scale", action="store_true", help="Use linear overview axes")
     args = parser.parse_args()
-    for path in plot_run(args.run_dir):
+    for path in plot_run(args.run_dir, mean_only=args.mean_only, linear_scale=args.linear_scale):
         print(path)
 
 
