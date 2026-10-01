@@ -284,6 +284,134 @@ def test_budget_incremental_slow_allocates_exact_stage_budget():
     assert len(slow.placement_ppo.buffer.actions) == mandatory + 2
 
 
+def test_continuous_budget_spends_actual_resources_without_fixed_candidates():
+    env = tiny_replay_env()
+    env.reset()
+    slow = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-continuous-v2",
+    ).slow_agent
+    assert slow.stage_ppo is not None
+    assert slow.count_ppo.continuous_actions
+    slow.count_ppo.act = lambda state, mask, deterministic=False: (0.02, 0.0, 0.0)
+    slow.stage_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    slow.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+
+    deployment = slow.plan_deployment(env, deterministic=False, record=True)
+
+    slot_upper_bound = slow.pending_budget_replica_slot_upper_bound
+    requested = slow.pending_budget_requested_replicas
+    mandatory = sum(len(service.stages) for service in env.scenario.services)
+    assert slow.pending_budget_feasible_capacity == 0
+    assert slot_upper_bound > 0
+    assert np.isclose(slow.pending_budget_fraction, 0.02)
+    assert np.isclose(slow.count_ppo.buffer.actions[0], 0.02)
+    assert np.isclose(
+        slow.pending_budget_target_memory_gb,
+        0.02 * slow.pending_budget_available_memory_gb,
+    )
+    assert np.isclose(
+        slow.pending_budget_target_storage_gb,
+        0.02 * slow.pending_budget_available_storage_gb,
+    )
+    assert slow.pending_budget_used_memory_gb <= slow.pending_budget_target_memory_gb + 1e-8
+    assert slow.pending_budget_used_storage_gb <= slow.pending_budget_target_storage_gb + 1e-8
+    assert slow.pending_budget_used_memory_gb > 0.0
+    assert slow.pending_budget_used_storage_gb > 0.0
+    assert requested == len(slow.pending_stage_node_ids)
+    assert int(deployment.sum()) == mandatory + requested
+
+    full = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-continuous-v2",
+    ).slow_agent
+    assert full.stage_ppo is not None
+    full.count_ppo.act = lambda state, mask, deterministic=False: (1.0, 0.0, 0.0)
+    full.stage_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    full.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+
+    full_deployment = full.plan_deployment(env, deterministic=False, record=True)
+
+    assert full.pending_budget_requested_replicas > requested
+    assert int(full_deployment.sum()) > int(deployment.sum())
+    assert full.pending_budget_used_memory_gb > slow.pending_budget_used_memory_gb
+
+
+def test_continuous_budget_policy_samples_and_updates_beta_action():
+    env = tiny_replay_env()
+    env.reset()
+    slow = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-continuous-v2",
+        slow_k_epochs=1,
+        slow_critic_k_epochs=1,
+    ).slow_agent
+    assert slow.stage_ppo is not None
+    slow.stage_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+    slow.placement_ppo.act = lambda state, mask, deterministic=False: (
+        int(np.flatnonzero(mask)[0]),
+        0.0,
+        0.0,
+    )
+
+    slow.plan_deployment(env, deterministic=False, record=True)
+    fraction = float(slow.count_ppo.buffer.actions[0])
+    assert 0.0 < fraction < 1.0
+    count_returns = {
+        (service_id, stage_id, node_id): -0.2
+        for (service_id, stage_id), node_id in zip(
+            slow.pending_stage_keys,
+            slow.pending_stage_node_ids,
+        )
+    }
+    placement_returns = {
+        (
+            service_id,
+            stage_id,
+            int(slow.placement_ppo.buffer.actions[action_index]),
+        ): -0.3
+        for action_index, (service_id, stage_id) in zip(
+            slow.pending_placement_indices,
+            slow.pending_placement_stage_keys,
+        )
+    }
+    slow.assign_pending_reward(
+        -1.0,
+        done=True,
+        count_stage_returns=count_returns,
+        placement_stage_returns=placement_returns,
+    )
+
+    metrics = slow.update()
+
+    assert np.isfinite(metrics["count_loss"])
+    assert np.isfinite(metrics["count_entropy"])
+    assert slow.count_ppo.buffer.actions == []
+
+
 def test_budget_incremental_slow_updates_all_three_actors():
     env = tiny_replay_env()
     env.reset()

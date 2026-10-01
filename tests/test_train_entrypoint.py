@@ -204,6 +204,66 @@ def test_budget_incremental_checkpoint_restores_stage_actor(tmp_path):
     assert torch.allclose(restored_parameter, torch.full_like(restored_parameter, 0.234))
 
 
+def test_continuous_budget_checkpoint_restores_float_action_and_architecture(tmp_path):
+    env = EdgeComputingEnv(
+        EdgeEnvConfig(
+            seed=179,
+            num_users=10_000,
+            num_edge_nodes=16,
+            num_service_types=3,
+            episode_minutes=60,
+        )
+    )
+    env.reset()
+    source = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-continuous-v2",
+    )
+    assert source.slow_agent.stage_ppo is not None
+    source.slow_agent.count_ppo.buffer.add(
+        state=np.zeros(3, dtype=np.float32),
+        mask=np.ones(1, dtype=bool),
+        action=0.375,
+        logprob=-0.25,
+        reward=-1.0,
+        done=True,
+        value=0.0,
+    )
+    source.slow_agent.count_action_returns = [-1.0]
+    source.slow_agent.count_action_stage_keys = [(-1, -1)]
+    source.slow_agent.count_window_ids = [0]
+    with torch.no_grad():
+        count_parameter = next(source.slow_agent.count_ppo.policy.parameters())
+        count_parameter.fill_(0.345)
+        stage_parameter = next(source.slow_agent.stage_ppo.policy.parameters())
+        stage_parameter.fill_(0.456)
+    checkpoint_path = tmp_path / "continuous-budget.pt"
+
+    save_checkpoint(source, checkpoint_path, {"update": 6})
+    restored = HierarchicalPPOAgent.from_env(
+        env,
+        replicas_per_stage=4,
+        slow_allocation_mode="budget-continuous-v2",
+    )
+    metadata = load_checkpoint(restored, checkpoint_path)
+
+    assert metadata == {"update": 6}
+    assert restored.slow_agent.count_ppo.continuous_actions
+    assert restored.slow_agent.count_ppo.buffer.actions == pytest.approx([0.375])
+    restored_count_parameter = next(restored.slow_agent.count_ppo.policy.parameters())
+    assert torch.allclose(
+        restored_count_parameter,
+        torch.full_like(restored_count_parameter, 0.345),
+    )
+    assert restored.slow_agent.stage_ppo is not None
+    restored_stage_parameter = next(restored.slow_agent.stage_ppo.policy.parameters())
+    assert torch.allclose(
+        restored_stage_parameter,
+        torch.full_like(restored_stage_parameter, 0.456),
+    )
+
+
 def test_checkpoint_rejects_mismatched_slow_allocation_architecture(tmp_path):
     env = EdgeComputingEnv(
         EdgeEnvConfig(seed=79, num_users=10_000, num_edge_nodes=16, num_service_types=3)

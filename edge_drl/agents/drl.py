@@ -164,6 +164,16 @@ class SlowDeploymentPPOAgent:
     pending_stage_indices: list[int] = field(default_factory=list)
     pending_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     pending_stage_node_ids: list[int] = field(default_factory=list)
+    pending_budget_fraction: float = 0.0
+    pending_budget_feasible_capacity: int = 0
+    pending_budget_replica_slot_upper_bound: int = 0
+    pending_budget_requested_replicas: int = 0
+    pending_budget_available_memory_gb: float = 0.0
+    pending_budget_available_storage_gb: float = 0.0
+    pending_budget_target_memory_gb: float = 0.0
+    pending_budget_target_storage_gb: float = 0.0
+    pending_budget_used_memory_gb: float = 0.0
+    pending_budget_used_storage_gb: float = 0.0
     pending_placement_stage_keys: list[tuple[int, int]] = field(default_factory=list)
     count_action_returns: list[float] = field(default_factory=list)
     stage_action_returns: list[float] = field(default_factory=list)
@@ -202,10 +212,11 @@ class SlowDeploymentPPOAgent:
             "legacy-factorized",
             "global-incremental",
             "budget-incremental",
+            "budget-continuous-v2",
         }:
             raise ValueError(
                 "allocation_mode must be 'legacy-factorized', 'global-incremental', "
-                "or 'budget-incremental'"
+                "'budget-incremental', or 'budget-continuous-v2'"
             )
         if self.counterfactual_credit_coef < 0.0:
             raise ValueError("counterfactual_credit_coef must be non-negative")
@@ -249,8 +260,13 @@ class SlowDeploymentPPOAgent:
         incremental_allocation = self.allocation_mode in {
             "global-incremental",
             "budget-incremental",
+            "budget-continuous-v2",
         }
-        budget_allocation = self.allocation_mode == "budget-incremental"
+        budget_allocation = self.allocation_mode in {
+            "budget-incremental",
+            "budget-continuous-v2",
+        }
+        continuous_budget = self.allocation_mode == "budget-continuous-v2"
         maximum_extra_replicas = (
             self.num_nodes * self.num_service_types * self.max_service_stages
         )
@@ -267,7 +283,9 @@ class SlowDeploymentPPOAgent:
                 else slow_obs_dim(self.num_nodes, self.num_service_types)
             ),
             action_dim=(
-                maximum_extra_replicas + 1
+                1
+                if continuous_budget
+                else maximum_extra_replicas + 1
                 if budget_allocation
                 else self.num_service_types * self.max_service_stages + 1
                 if incremental_allocation
@@ -285,7 +303,9 @@ class SlowDeploymentPPOAgent:
             target_kl=self.count_target_kl,
             minibatch_size=self.minibatch_size,
             policy_kind=(
-                "slow_gat_count"
+                "slow_gat_budget"
+                if continuous_budget
+                else "slow_gat_count"
                 if budget_allocation
                 else "slow_gat_stage"
                 if incremental_allocation
@@ -430,6 +450,16 @@ class SlowDeploymentPPOAgent:
         self.pending_stage_indices.clear()
         self.pending_stage_keys.clear()
         self.pending_stage_node_ids.clear()
+        self.pending_budget_fraction = 0.0
+        self.pending_budget_feasible_capacity = 0
+        self.pending_budget_replica_slot_upper_bound = 0
+        self.pending_budget_requested_replicas = 0
+        self.pending_budget_available_memory_gb = 0.0
+        self.pending_budget_available_storage_gb = 0.0
+        self.pending_budget_target_memory_gb = 0.0
+        self.pending_budget_target_storage_gb = 0.0
+        self.pending_budget_used_memory_gb = 0.0
+        self.pending_budget_used_storage_gb = 0.0
         self.pending_placement_stage_keys.clear()
         window_id: int | None = None
         if record:
@@ -445,7 +475,7 @@ class SlowDeploymentPPOAgent:
             self.window_old_values.append(old_value)
             self.pending_window_id = window_id
 
-        if self.allocation_mode == "budget-incremental":
+        if self.allocation_mode in {"budget-incremental", "budget-continuous-v2"}:
             return self._plan_deployment_budget(
                 env,
                 deployment=deployment,
@@ -608,6 +638,10 @@ class SlowDeploymentPPOAgent:
             for service in env.scenario.services
             for stage in service.stages
         ]
+        stage_by_key = {
+            (int(service.service_id), int(stage.stage_id)): stage
+            for service, stage in stages
+        }
         memory_capacity = np.maximum(env.service_memory_capacities(), 1e-9)
         storage_capacity = np.maximum(env.service_storage_capacities(), 1e-9)
 
@@ -647,24 +681,69 @@ class SlowDeploymentPPOAgent:
             remaining_storage,
             planned_deployment=deployment,
         )
-        budget_mask = self._build_budget_mask(
-            env,
-            remaining_memory,
-            remaining_storage,
-            deployment,
-        )
+        continuous_budget = self.allocation_mode == "budget-continuous-v2"
+        if continuous_budget:
+            # This count is diagnostic only.  It never scales or discretizes
+            # the continuous action because pair counts ignore heterogeneous
+            # resource sizes and are not an executable replica capacity.
+            replica_slot_upper_bound = self._replica_slot_upper_bound(
+                env,
+                remaining_memory,
+                remaining_storage,
+                deployment,
+            )
+            feasible_budget_capacity = 0
+            budget_mask = np.ones(1, dtype=bool)
+        else:
+            budget_mask = self._build_budget_mask(
+                env,
+                remaining_memory,
+                remaining_storage,
+                deployment,
+            )
+            feasible_budget_capacity = int(np.flatnonzero(budget_mask)[-1])
+            replica_slot_upper_bound = 0
         budget_action, budget_logprob, budget_value = self.count_ppo.act(
             budget_state,
             budget_mask,
             deterministic=deterministic,
         )
-        budget_action = int(budget_action)
-        if not budget_mask[budget_action]:
-            budget_action = int(np.flatnonzero(budget_mask)[0])
+        if continuous_budget:
+            budget_fraction = float(np.clip(float(budget_action), 0.0, 1.0))
+            available_memory_gb = float(np.maximum(remaining_memory, 0.0).sum())
+            available_storage_gb = float(np.maximum(remaining_storage, 0.0).sum())
+            target_memory_gb = budget_fraction * available_memory_gb
+            target_storage_gb = budget_fraction * available_storage_gb
+            used_memory_gb = 0.0
+            used_storage_gb = 0.0
+            requested_replicas = 0
+            stored_budget_action: int | float = budget_fraction
+        else:
+            discrete_budget = int(budget_action)
+            if not budget_mask[discrete_budget]:
+                discrete_budget = int(np.flatnonzero(budget_mask)[0])
+            budget_fraction = (
+                float(discrete_budget) / max(float(feasible_budget_capacity), 1.0)
+            )
+            requested_replicas = discrete_budget
+            stored_budget_action = discrete_budget
+            available_memory_gb = 0.0
+            available_storage_gb = 0.0
+            target_memory_gb = 0.0
+            target_storage_gb = 0.0
+            used_memory_gb = 0.0
+            used_storage_gb = 0.0
+        self.pending_budget_fraction = budget_fraction
+        self.pending_budget_feasible_capacity = feasible_budget_capacity
+        self.pending_budget_replica_slot_upper_bound = replica_slot_upper_bound
+        self.pending_budget_available_memory_gb = available_memory_gb
+        self.pending_budget_available_storage_gb = available_storage_gb
+        self.pending_budget_target_memory_gb = target_memory_gb
+        self.pending_budget_target_storage_gb = target_storage_gb
         if record:
             self.count_ppo.buffer.states.append(budget_state)
             self.count_ppo.buffer.masks.append(budget_mask.astype(bool))
-            self.count_ppo.buffer.actions.append(budget_action)
+            self.count_ppo.buffer.actions.append(stored_budget_action)
             self.count_ppo.buffer.logprobs.append(float(budget_logprob))
             self.count_ppo.buffer.values.append(float(budget_value))
             self.pending_count_indices.append(len(self.count_ppo.buffer.actions) - 1)
@@ -676,7 +755,13 @@ class SlowDeploymentPPOAgent:
         stage_stop_action = self.num_service_types * self.max_service_stages
         if self.stage_ppo is None:
             raise RuntimeError("budget-incremental allocation requires the Slow Stage actor")
-        for _ in range(budget_action):
+        maximum_expansions = (
+            self.num_nodes * len(stages)
+            if continuous_budget
+            else requested_replicas
+        )
+        allocated_replicas = 0
+        for _ in range(maximum_expansions):
             stage_state = self._build_incremental_state(
                 env,
                 demand,
@@ -691,6 +776,25 @@ class SlowDeploymentPPOAgent:
                 deployment,
             )
             stage_mask[stage_stop_action] = False
+            if continuous_budget:
+                remaining_memory_budget = max(
+                    target_memory_gb - used_memory_gb,
+                    0.0,
+                )
+                remaining_storage_budget = max(
+                    target_storage_gb - used_storage_gb,
+                    0.0,
+                )
+                for service, stage in stages:
+                    stage_action_index = (
+                        int(service.service_id) * self.max_service_stages
+                        + int(stage.stage_id)
+                    )
+                    if (
+                        float(stage.memory_gb) > remaining_memory_budget + 1e-9
+                        or float(stage.storage_gb) > remaining_storage_budget + 1e-9
+                    ):
+                        stage_mask[stage_action_index] = False
             if not stage_mask.any():
                 break
             stage_action, stage_logprob, stage_value = self.stage_ppo.act(
@@ -730,9 +834,20 @@ class SlowDeploymentPPOAgent:
             )
             if node_id is None:
                 break
+            allocated_replicas += 1
+            if continuous_budget:
+                selected_stage = stage_by_key[(service_id, stage_id)]
+                used_memory_gb += float(selected_stage.memory_gb)
+                used_storage_gb += float(selected_stage.storage_gb)
             if record:
                 assert stage_buffer_index is not None
                 self.pending_stage_node_ids.append(int(node_id))
+
+        self.pending_budget_requested_replicas = (
+            allocated_replicas if continuous_budget else requested_replicas
+        )
+        self.pending_budget_used_memory_gb = used_memory_gb
+        self.pending_budget_used_storage_gb = used_storage_gb
 
         if self.coverage_repair:
             self._coverage_repair(env, deployment, remaining_memory, remaining_storage)
@@ -740,6 +855,51 @@ class SlowDeploymentPPOAgent:
         if not feasible:
             deployment = self._repair_with_current_or_full(env, deployment)
         return deployment
+
+    def _replica_slot_upper_bound(
+        self,
+        env: EdgeComputingEnv,
+        remaining_memory: np.ndarray,
+        remaining_storage: np.ndarray,
+        deployment: np.ndarray,
+    ) -> int:
+        """Count currently feasible stage-node pairs for diagnostics only.
+
+        This is deliberately not used to scale the continuous budget action:
+        heterogeneous replica sizes make a pair count neither a safe nor an
+        exact capacity.  Resource targets are enforced against the actual
+        memory and storage cost of every Stage/Placement decision instead.
+        """
+
+        assert env.scenario is not None
+        active_stages = [
+            (service, stage)
+            for service in env.scenario.services
+            for stage in service.stages
+        ]
+        if not active_stages:
+            return 0
+        globally_available = 0
+        for service, stage in active_stages:
+            service_id = int(service.service_id)
+            stage_id = int(stage.stage_id)
+            remaining_replicas = max(
+                self.replicas_per_stage
+                - int(deployment[service_id, stage_id].sum()),
+                0,
+            )
+            if remaining_replicas <= 0:
+                continue
+            feasible_nodes = (
+                (remaining_memory >= float(stage.memory_gb))
+                & (remaining_storage >= float(stage.storage_gb))
+                & ~deployment[service_id, stage_id]
+            )
+            globally_available += min(
+                int(np.count_nonzero(feasible_nodes)),
+                remaining_replicas,
+            )
+        return max(globally_available, 0)
 
     def _build_budget_mask(
         self,
@@ -1064,6 +1224,16 @@ class SlowDeploymentPPOAgent:
         self.pending_stage_keys.clear()
         self.pending_stage_node_ids.clear()
         self.pending_placement_stage_keys.clear()
+        self.pending_budget_fraction = 0.0
+        self.pending_budget_feasible_capacity = 0
+        self.pending_budget_replica_slot_upper_bound = 0
+        self.pending_budget_requested_replicas = 0
+        self.pending_budget_available_memory_gb = 0.0
+        self.pending_budget_available_storage_gb = 0.0
+        self.pending_budget_target_memory_gb = 0.0
+        self.pending_budget_target_storage_gb = 0.0
+        self.pending_budget_used_memory_gb = 0.0
+        self.pending_budget_used_storage_gb = 0.0
 
     def update(self, *, progress_label: str = "", progress_interval_seconds: float = 0.0) -> dict[str, float]:
         if self.pending_window_id is not None:
@@ -1136,7 +1306,11 @@ class SlowDeploymentPPOAgent:
         )
         count_advantage_groups = (
             np.zeros(len(self.count_action_stage_keys), dtype=np.int64)
-            if self.allocation_mode in {"global-incremental", "budget-incremental"}
+            if self.allocation_mode in {
+                "global-incremental",
+                "budget-incremental",
+                "budget-continuous-v2",
+            }
             else np.asarray(
                 [
                     service_id * self.max_service_stages + stage_id
@@ -3263,7 +3437,10 @@ class HierarchicalPPOAgent:
         baseline = latency()
         if not np.isfinite(baseline):
             return
-        if self.slow_agent.allocation_mode == "budget-incremental":
+        if self.slow_agent.allocation_mode in {
+            "budget-incremental",
+            "budget-continuous-v2",
+        }:
             pending = self.slow_agent.pending_stage_keys
             nodes = self.slow_agent.pending_stage_node_ids
         else:
@@ -3575,7 +3752,10 @@ class HierarchicalPPOAgent:
             }
         incremental_add_actions = (
             len(self.slow_agent.pending_stage_node_ids)
-            if self.slow_agent.allocation_mode == "budget-incremental"
+            if self.slow_agent.allocation_mode in {
+                "budget-incremental",
+                "budget-continuous-v2",
+            }
             else sum(
                 node_id is not None for node_id in self.slow_agent.pending_count_node_ids
             )
@@ -3584,16 +3764,66 @@ class HierarchicalPPOAgent:
             stage_key == (-1, -1)
             for stage_key in self.slow_agent.pending_count_stage_keys
         )
+        budget_fraction = 0.0
+        budget_feasible_capacity = 0.0
+        budget_replica_slot_upper_bound = 0.0
         budget_extra_replicas = 0.0
+        budget_available_memory_gb = 0.0
+        budget_available_storage_gb = 0.0
+        budget_target_memory_gb = 0.0
+        budget_target_storage_gb = 0.0
+        budget_used_memory_gb = 0.0
+        budget_used_storage_gb = 0.0
         if (
-            self.slow_agent.allocation_mode == "budget-incremental"
+            self.slow_agent.allocation_mode in {
+                "budget-incremental",
+                "budget-continuous-v2",
+            }
             and self.slow_agent.pending_count_indices
         ):
-            budget_extra_replicas = float(
-                self.slow_agent.count_ppo.buffer.actions[
-                    self.slow_agent.pending_count_indices[0]
-                ]
+            budget_fraction = float(self.slow_agent.pending_budget_fraction)
+            budget_feasible_capacity = float(
+                self.slow_agent.pending_budget_feasible_capacity
             )
+            budget_replica_slot_upper_bound = float(
+                self.slow_agent.pending_budget_replica_slot_upper_bound
+            )
+            budget_extra_replicas = float(
+                self.slow_agent.pending_budget_requested_replicas
+            )
+            budget_available_memory_gb = float(
+                self.slow_agent.pending_budget_available_memory_gb
+            )
+            budget_available_storage_gb = float(
+                self.slow_agent.pending_budget_available_storage_gb
+            )
+            budget_target_memory_gb = float(
+                self.slow_agent.pending_budget_target_memory_gb
+            )
+            budget_target_storage_gb = float(
+                self.slow_agent.pending_budget_target_storage_gb
+            )
+            budget_used_memory_gb = float(
+                self.slow_agent.pending_budget_used_memory_gb
+            )
+            budget_used_storage_gb = float(
+                self.slow_agent.pending_budget_used_storage_gb
+            )
+        budget_execution_ratio = (
+            float(incremental_add_actions) / budget_extra_replicas
+            if budget_extra_replicas > 0.0
+            else 1.0
+        )
+        budget_memory_fill_ratio = (
+            budget_used_memory_gb / budget_target_memory_gb
+            if budget_target_memory_gb > 0.0
+            else 1.0
+        )
+        budget_storage_fill_ratio = (
+            budget_used_storage_gb / budget_target_storage_gb
+            if budget_target_storage_gb > 0.0
+            else 1.0
+        )
         self.slow_agent.assign_pending_reward(
             window_return,
             done=done,
@@ -3619,8 +3849,20 @@ class HierarchicalPPOAgent:
             "slow_shared_return_credit": float(shared_return_credit),
             "slow_incremental_add_actions": float(incremental_add_actions),
             "slow_incremental_stop_actions": float(incremental_stop_actions),
+            "slow_budget_fraction": budget_fraction,
+            "slow_budget_feasible_capacity": budget_feasible_capacity,
+            "slow_budget_replica_slot_upper_bound": budget_replica_slot_upper_bound,
             "slow_budget_extra_replicas": budget_extra_replicas,
             "slow_budget_allocated_replicas": float(incremental_add_actions),
+            "slow_budget_execution_ratio": budget_execution_ratio,
+            "slow_budget_available_memory_gb": budget_available_memory_gb,
+            "slow_budget_available_storage_gb": budget_available_storage_gb,
+            "slow_budget_target_memory_gb": budget_target_memory_gb,
+            "slow_budget_target_storage_gb": budget_target_storage_gb,
+            "slow_budget_used_memory_gb": budget_used_memory_gb,
+            "slow_budget_used_storage_gb": budget_used_storage_gb,
+            "slow_budget_memory_fill_ratio": budget_memory_fill_ratio,
+            "slow_budget_storage_fill_ratio": budget_storage_fill_ratio,
             "slow_replica_ablation_samples": float(len(self.window_replica_ablation_values)),
             "slow_replica_ablation_mean_s": (
                 float(np.mean(list(self.window_replica_ablation_values.values())))
@@ -3887,6 +4129,7 @@ class HierarchicalPPOAgent:
                     if self.slow_agent.allocation_mode in {
                         "global-incremental",
                         "budget-incremental",
+                        "budget-continuous-v2",
                     }:
                         per_replica_resource_cost = (
                             self.slow_deployment_memory_coef

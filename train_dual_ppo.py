@@ -698,12 +698,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--slow-allocation-mode",
-        choices=["legacy-factorized", "global-incremental", "budget-incremental"],
+        choices=[
+            "legacy-factorized",
+            "global-incremental",
+            "budget-incremental",
+            "budget-continuous-v2",
+        ],
         default="legacy-factorized",
         help=(
             "Keep per-stage target counts for checkpoint compatibility, or allocate mandatory "
             "coverage followed by globally competing add-replica/STOP actions; budget-incremental "
-            "chooses one ordinal extra-replica budget and allocates it with separate Stage/Placement PPO heads."
+            "chooses one ordinal extra-replica budget and allocates it with separate Stage/Placement PPO heads; "
+            "budget-continuous-v2 emits a continuous [0,1] fraction of the live remaining service-resource budget; "
+            "actual stage sizes determine how many replicas are placed."
         ),
     )
     parser.add_argument(
@@ -948,10 +955,11 @@ def parse_args() -> argparse.Namespace:
     if args.slow_replica_ablation_samples > 0 and args.slow_allocation_mode not in {
         "global-incremental",
         "budget-incremental",
+        "budget-continuous-v2",
     }:
         parser.error(
             "--slow-replica-ablation-samples requires --slow-allocation-mode "
-            "global-incremental or budget-incremental"
+            "global-incremental, budget-incremental, or budget-continuous-v2"
         )
     if args.slow_replica_ablation_samples > 0 and args.slow_counterfactual_credit_coef <= 0.0:
         parser.error("--slow-replica-ablation-samples requires positive --slow-counterfactual-credit-coef")
@@ -2048,8 +2056,20 @@ def rollout(
         "slow_shared_return_credit": float("nan"),
         "slow_incremental_add_actions": 0.0,
         "slow_incremental_stop_actions": 0.0,
+        "slow_budget_fraction": 0.0,
+        "slow_budget_feasible_capacity": 0.0,
+        "slow_budget_replica_slot_upper_bound": 0.0,
         "slow_budget_extra_replicas": 0.0,
         "slow_budget_allocated_replicas": 0.0,
+        "slow_budget_execution_ratio": 1.0,
+        "slow_budget_available_memory_gb": 0.0,
+        "slow_budget_available_storage_gb": 0.0,
+        "slow_budget_target_memory_gb": 0.0,
+        "slow_budget_target_storage_gb": 0.0,
+        "slow_budget_used_memory_gb": 0.0,
+        "slow_budget_used_storage_gb": 0.0,
+        "slow_budget_memory_fill_ratio": 1.0,
+        "slow_budget_storage_fill_ratio": 1.0,
         "slow_replica_ablation_samples": 0.0,
         "slow_replica_ablation_mean_s": 0.0,
         "slow_stop_ablation_value_s": 0.0,
@@ -2503,8 +2523,20 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_shared_return_credit",
         "slow_incremental_add_actions",
         "slow_incremental_stop_actions",
+        "slow_budget_fraction",
+        "slow_budget_feasible_capacity",
+        "slow_budget_replica_slot_upper_bound",
         "slow_budget_extra_replicas",
         "slow_budget_allocated_replicas",
+        "slow_budget_execution_ratio",
+        "slow_budget_available_memory_gb",
+        "slow_budget_available_storage_gb",
+        "slow_budget_target_memory_gb",
+        "slow_budget_target_storage_gb",
+        "slow_budget_used_memory_gb",
+        "slow_budget_used_storage_gb",
+        "slow_budget_memory_fill_ratio",
+        "slow_budget_storage_fill_ratio",
         "slow_replica_ablation_samples",
         "slow_replica_ablation_mean_s",
         "slow_stop_ablation_value_s",
@@ -3073,7 +3105,11 @@ def pretrain_fast_agent(
     return metrics
 
 
-def _serialize_rollout_buffer(buffer: object) -> dict[str, object]:
+def _serialize_rollout_buffer(
+    buffer: object,
+    *,
+    continuous_actions: bool = False,
+) -> dict[str, object]:
     """Store an on-policy buffer without binding checkpoints to CUDA tensors."""
 
     states = getattr(buffer, "states")
@@ -3085,7 +3121,10 @@ def _serialize_rollout_buffer(buffer: object) -> dict[str, object]:
         "masks": torch.as_tensor(np.stack(masks), dtype=torch.bool)
         if masks
         else torch.empty((0,), dtype=torch.bool),
-        "actions": torch.as_tensor(getattr(buffer, "actions"), dtype=torch.int64),
+        "actions": torch.as_tensor(
+            getattr(buffer, "actions"),
+            dtype=torch.float32 if continuous_actions else torch.int64,
+        ),
         "logprobs": torch.as_tensor(getattr(buffer, "logprobs"), dtype=torch.float32),
         "rewards": torch.as_tensor(getattr(buffer, "rewards"), dtype=torch.float32),
         "dones": torch.as_tensor(getattr(buffer, "dones"), dtype=torch.bool),
@@ -3095,7 +3134,12 @@ def _serialize_rollout_buffer(buffer: object) -> dict[str, object]:
     }
 
 
-def _restore_rollout_buffer(buffer: object, state: object) -> None:
+def _restore_rollout_buffer(
+    buffer: object,
+    state: object,
+    *,
+    continuous_actions: bool = False,
+) -> None:
     if not isinstance(state, dict):
         return
     buffer.clear()
@@ -3106,7 +3150,7 @@ def _restore_rollout_buffer(buffer: object, state: object) -> None:
     if torch.is_tensor(masks) and masks.numel() > 0:
         buffer.masks.extend(item.numpy().astype(bool, copy=True) for item in masks.cpu())
     tensor_fields = {
-        "actions": int,
+        "actions": float if continuous_actions else int,
         "logprobs": float,
         "rewards": float,
         "dones": bool,
@@ -3125,7 +3169,10 @@ def _serialize_pending_slow_collection(agent: HierarchicalPPOAgent) -> dict[str,
     if slow.pending_window_id is not None:
         raise RuntimeError("checkpoints may only be saved after the current Slow window receives feedback")
     return {
-        "count_buffer": _serialize_rollout_buffer(slow.count_ppo.buffer),
+        "count_buffer": _serialize_rollout_buffer(
+            slow.count_ppo.buffer,
+            continuous_actions=slow.allocation_mode == "budget-continuous-v2",
+        ),
         "stage_buffer": (
             _serialize_rollout_buffer(slow.stage_ppo.buffer)
             if slow.stage_ppo is not None
@@ -3155,7 +3202,11 @@ def _restore_pending_slow_collection(agent: HierarchicalPPOAgent, state: object)
     if not isinstance(state, dict):
         return
     slow = agent.slow_agent
-    _restore_rollout_buffer(slow.count_ppo.buffer, state.get("count_buffer"))
+    _restore_rollout_buffer(
+        slow.count_ppo.buffer,
+        state.get("count_buffer"),
+        continuous_actions=slow.allocation_mode == "budget-continuous-v2",
+    )
     if slow.stage_ppo is not None:
         _restore_rollout_buffer(slow.stage_ppo.buffer, state.get("stage_buffer"))
     _restore_rollout_buffer(slow.placement_ppo.buffer, state.get("placement_buffer"))
@@ -3191,6 +3242,16 @@ def _restore_pending_slow_collection(agent: HierarchicalPPOAgent, state: object)
     slow.pending_stage_keys.clear()
     slow.pending_stage_node_ids.clear()
     slow.pending_placement_stage_keys.clear()
+    slow.pending_budget_fraction = 0.0
+    slow.pending_budget_feasible_capacity = 0
+    slow.pending_budget_replica_slot_upper_bound = 0
+    slow.pending_budget_requested_replicas = 0
+    slow.pending_budget_available_memory_gb = 0.0
+    slow.pending_budget_available_storage_gb = 0.0
+    slow.pending_budget_target_memory_gb = 0.0
+    slow.pending_budget_target_storage_gb = 0.0
+    slow.pending_budget_used_memory_gb = 0.0
+    slow.pending_budget_used_storage_gb = 0.0
 
 
 def save_checkpoint(
@@ -4410,8 +4471,20 @@ def main() -> None:
             "slow_shared_return_credit": np.nan,
             "slow_incremental_add_actions": 0.0,
             "slow_incremental_stop_actions": 0.0,
+            "slow_budget_fraction": 0.0,
+            "slow_budget_feasible_capacity": 0.0,
+            "slow_budget_replica_slot_upper_bound": 0.0,
             "slow_budget_extra_replicas": 0.0,
             "slow_budget_allocated_replicas": 0.0,
+            "slow_budget_execution_ratio": 1.0,
+            "slow_budget_available_memory_gb": 0.0,
+            "slow_budget_available_storage_gb": 0.0,
+            "slow_budget_target_memory_gb": 0.0,
+            "slow_budget_target_storage_gb": 0.0,
+            "slow_budget_used_memory_gb": 0.0,
+            "slow_budget_used_storage_gb": 0.0,
+            "slow_budget_memory_fill_ratio": 1.0,
+            "slow_budget_storage_fill_ratio": 1.0,
             "slow_replica_ablation_samples": 0.0,
             "slow_replica_ablation_mean_s": 0.0,
             "slow_stop_ablation_value_s": 0.0,
@@ -5170,9 +5243,35 @@ def main() -> None:
             "slow_shared_return_credit": stats["slow_shared_return_credit"],
             "slow_incremental_add_actions": stats["slow_incremental_add_actions"],
             "slow_incremental_stop_actions": stats["slow_incremental_stop_actions"],
+            "slow_budget_fraction": stats["slow_budget_fraction"],
+            "slow_budget_feasible_capacity": stats[
+                "slow_budget_feasible_capacity"
+            ],
+            "slow_budget_replica_slot_upper_bound": stats[
+                "slow_budget_replica_slot_upper_bound"
+            ],
             "slow_budget_extra_replicas": stats["slow_budget_extra_replicas"],
             "slow_budget_allocated_replicas": stats[
                 "slow_budget_allocated_replicas"
+            ],
+            "slow_budget_execution_ratio": stats["slow_budget_execution_ratio"],
+            "slow_budget_available_memory_gb": stats[
+                "slow_budget_available_memory_gb"
+            ],
+            "slow_budget_available_storage_gb": stats[
+                "slow_budget_available_storage_gb"
+            ],
+            "slow_budget_target_memory_gb": stats["slow_budget_target_memory_gb"],
+            "slow_budget_target_storage_gb": stats[
+                "slow_budget_target_storage_gb"
+            ],
+            "slow_budget_used_memory_gb": stats["slow_budget_used_memory_gb"],
+            "slow_budget_used_storage_gb": stats["slow_budget_used_storage_gb"],
+            "slow_budget_memory_fill_ratio": stats[
+                "slow_budget_memory_fill_ratio"
+            ],
+            "slow_budget_storage_fill_ratio": stats[
+                "slow_budget_storage_fill_ratio"
             ],
             "slow_replica_ablation_samples": stats["slow_replica_ablation_samples"],
             "slow_replica_ablation_mean_s": stats["slow_replica_ablation_mean_s"],

@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import torch
 from torch import nn
-from torch.distributions import Categorical
+from torch.distributions import Beta, Categorical, Distribution
 try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover - only used when tqdm is unavailable.
@@ -144,7 +144,7 @@ def _stratified_minibatches(
 class RolloutBuffer:
     states: list[np.ndarray] = field(default_factory=list)
     masks: list[np.ndarray] = field(default_factory=list)
-    actions: list[int] = field(default_factory=list)
+    actions: list[int | float] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
     dones: list[bool] = field(default_factory=list)
@@ -157,7 +157,7 @@ class RolloutBuffer:
         *,
         state: np.ndarray,
         mask: np.ndarray,
-        action: int,
+        action: int | float,
         logprob: float,
         reward: float,
         done: bool,
@@ -167,7 +167,9 @@ class RolloutBuffer:
     ) -> None:
         self.states.append(np.asarray(state, dtype=np.float32))
         self.masks.append(np.asarray(mask, dtype=bool))
-        self.actions.append(int(action))
+        self.actions.append(
+            float(action) if isinstance(action, (float, np.floating)) else int(action)
+        )
         self.logprobs.append(float(logprob))
         self.rewards.append(float(reward))
         self.dones.append(bool(done))
@@ -393,7 +395,7 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
 
 
 class GraphAttentionActorCritic(nn.Module):
-    """Graph actor-critic for node, ordered-count, or stage-budget actions.
+    """Graph actor-critic for node, count, continuous-budget, or stage actions.
 
     Slow deployment has two action heads: placement scores every node, while
     replica count is represented by a discretized Gaussian over the ordered
@@ -416,8 +418,8 @@ class GraphAttentionActorCritic(nn.Module):
         detach_critic_backbone: bool = False,
     ):
         super().__init__()
-        if action_mode not in {"node", "count", "stage"}:
-            raise ValueError("action_mode must be 'node', 'count', or 'stage'")
+        if action_mode not in {"node", "count", "budget", "stage"}:
+            raise ValueError("action_mode must be 'node', 'count', 'budget', or 'stage'")
         if action_mode == "stage" and (stage_feature_dim is None or stage_feature_dim < 1):
             raise ValueError("stage action mode requires a positive stage_feature_dim")
         self.global_dim = global_dim
@@ -475,6 +477,16 @@ class GraphAttentionActorCritic(nn.Module):
                 # range.  The previous action_dim / 3 scale kept 32-count
                 # policies close to uniform and diluted the ordinal signal.
                 self.actor[-1].bias[1] = math.log(max(float(action_dim) / 6.0, 1.0))
+        elif action_mode == "budget":
+            self.actor = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                # Positive Beta concentration parameters define a genuinely
+                # continuous action in [0, 1], not a list of budget bins.
+                nn.Linear(hidden_dim, 2),
+            )
+            with torch.no_grad():
+                self.actor[-1].bias.zero_()
         else:
             self.stage_encoder = nn.Sequential(
                 nn.Linear(self.stage_feature_dim, hidden_dim),
@@ -501,7 +513,7 @@ class GraphAttentionActorCritic(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[Categorical, torch.Tensor]:
+    def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[Distribution, torch.Tensor]:
         global_features = states[:, : self.global_dim]
         node_features = states[:, self.node_offset : self.stage_offset].reshape(
             -1,
@@ -541,7 +553,7 @@ class GraphAttentionActorCritic(nn.Module):
                 device=graph_context.device,
             ).unsqueeze(0)
             logits = -0.5 * torch.square((count_indices - center.unsqueeze(1)) / scale.unsqueeze(1))
-        else:
+        elif self.action_mode == "stage":
             stage_features = states[:, self.stage_offset : self.edge_offset].reshape(
                 -1,
                 self.stage_action_count,
@@ -556,12 +568,17 @@ class GraphAttentionActorCritic(nn.Module):
             stop_logit = self.stop_actor(graph_context)
             logits = torch.cat([stage_logits, stop_logit], dim=-1)
 
-        safe_masks = masks.bool()
-        fallback = torch.zeros_like(safe_masks)
-        fallback[:, 0] = True
-        safe_masks = torch.where(safe_masks.any(dim=1, keepdim=True), safe_masks, fallback)
-        logits = logits.masked_fill(~safe_masks, -1e9)
-        dist = Categorical(logits=logits)
+        if self.action_mode == "budget":
+            budget_parameters = self.actor(graph_context)
+            concentrations = torch.nn.functional.softplus(budget_parameters) + 1.0
+            dist: Distribution = Beta(concentrations[:, 0], concentrations[:, 1])
+        else:
+            safe_masks = masks.bool()
+            fallback = torch.zeros_like(safe_masks)
+            fallback[:, 0] = True
+            safe_masks = torch.where(safe_masks.any(dim=1, keepdim=True), safe_masks, fallback)
+            logits = logits.masked_fill(~safe_masks, -1e9)
+            dist = Categorical(logits=logits)
         critic_context = graph_context.detach() if self.detach_critic_backbone else graph_context
         values = self.critic(critic_context).squeeze(-1)
         return dist, values
@@ -630,6 +647,7 @@ class PPOAgent:
             self.group_weight_targets /= float(self.group_weight_targets.sum())
         self.full_batch_kl_stop = bool(full_batch_kl_stop)
         self.device = torch.device(device)
+        self.continuous_actions = policy_kind == "slow_gat_budget"
         self.last_group_diagnostics: dict[float, dict[str, float]] = {}
         if policy_kind == "flat":
             self.policy = MaskedActorCritic(obs_dim, action_dim, hidden_dim).to(self.device)
@@ -652,7 +670,12 @@ class PPOAgent:
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
             ).to(self.device)
-        elif policy_kind in {"slow_gat_node", "slow_gat_count", "slow_gat_stage"}:
+        elif policy_kind in {
+            "slow_gat_node",
+            "slow_gat_count",
+            "slow_gat_budget",
+            "slow_gat_stage",
+        }:
             if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:
                 raise ValueError(f"{policy_kind} requires global_dim, node_feature_dim, edge_feature_dim, and num_nodes")
             self.policy = GraphAttentionActorCritic(
@@ -664,6 +687,8 @@ class PPOAgent:
                 action_mode=(
                     "node"
                     if policy_kind == "slow_gat_node"
+                    else "budget"
+                    if policy_kind == "slow_gat_budget"
                     else "stage"
                     if policy_kind == "slow_gat_stage"
                     else "count"
@@ -693,14 +718,24 @@ class PPOAgent:
         nn.utils.clip_grad_norm_(actor_parameters, max_norm)
         nn.utils.clip_grad_norm_(critic_parameters, max_norm)
 
-    def act(self, state: np.ndarray, mask: np.ndarray, deterministic: bool = False) -> tuple[int, float, float]:
+    def act(
+        self,
+        state: np.ndarray,
+        mask: np.ndarray,
+        deterministic: bool = False,
+    ) -> tuple[int | float, float, float]:
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
         with torch.no_grad():
             dist, value = self.policy(state_t, mask_t)
-            action_t = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
+            if self.continuous_actions:
+                action_t = dist.mean if deterministic else dist.sample()
+                action_t = action_t.clamp(1e-6, 1.0 - 1e-6)
+            else:
+                action_t = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
             logprob_t = dist.log_prob(action_t)
-        return int(action_t.item()), float(logprob_t.item()), float(value.item())
+        action = float(action_t.item()) if self.continuous_actions else int(action_t.item())
+        return action, float(logprob_t.item()), float(value.item())
 
     def act_batch(
         self,
@@ -720,15 +755,23 @@ class PPOAgent:
         mask_t = torch.as_tensor(mask_array, dtype=torch.bool, device=self.device)
         with torch.no_grad():
             dist, values = self.policy(state_t, mask_t)
-            actions = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
+            if self.continuous_actions:
+                actions = dist.mean if deterministic else dist.sample()
+                actions = actions.clamp(1e-6, 1.0 - 1e-6)
+            else:
+                actions = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
             logprobs = dist.log_prob(actions)
         return (
-            actions.detach().cpu().numpy().astype(np.int64),
+            actions.detach().cpu().numpy().astype(
+                np.float32 if self.continuous_actions else np.int64
+            ),
             logprobs.detach().cpu().numpy().astype(np.float32),
             values.detach().cpu().numpy().astype(np.float32),
         )
 
     def action_stats(self, state: np.ndarray, mask: np.ndarray) -> dict[str, float | int]:
+        if self.continuous_actions:
+            raise ValueError("continuous policies do not expose categorical action statistics")
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
         with torch.no_grad():
@@ -748,6 +791,8 @@ class PPOAgent:
         }
 
     def action_probabilities(self, state: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
+        if self.continuous_actions:
+            raise ValueError("continuous policies do not expose categorical probabilities")
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
         with torch.no_grad():
@@ -780,7 +825,11 @@ class PPOAgent:
                 masks = torch.as_tensor(
                     np.stack(self.buffer.masks[start:end]), dtype=torch.bool, device=self.device
                 )
-                actions = torch.as_tensor(actions_np[start:end], dtype=torch.long, device=self.device)
+                actions = torch.as_tensor(
+                    actions_np[start:end],
+                    dtype=torch.float32 if self.continuous_actions else torch.long,
+                    device=self.device,
+                )
                 old_logprobs = torch.as_tensor(
                     old_logprobs_np[start:end], dtype=torch.float32, device=self.device
                 )
@@ -794,13 +843,16 @@ class PPOAgent:
                 kl_values = (ratios - 1.0) - log_ratios
                 clip_values = (torch.abs(ratios - 1.0) > self.eps_clip).float()
                 entropy_values = dist.entropy()
-                feasible_counts = masks.sum(dim=1).to(dtype=entropy_values.dtype)
-                maximum_entropy = torch.log(feasible_counts.clamp_min(1.0))
-                normalized_entropy_values = torch.where(
-                    feasible_counts > 1.0,
-                    entropy_values / maximum_entropy.clamp_min(1e-8),
-                    torch.zeros_like(entropy_values),
-                ).clamp(0.0, 1.0)
+                if self.continuous_actions:
+                    normalized_entropy_values = entropy_values
+                else:
+                    feasible_counts = masks.sum(dim=1).to(dtype=entropy_values.dtype)
+                    maximum_entropy = torch.log(feasible_counts.clamp_min(1.0))
+                    normalized_entropy_values = torch.where(
+                        feasible_counts > 1.0,
+                        entropy_values / maximum_entropy.clamp_min(1e-8),
+                        torch.zeros_like(entropy_values),
+                    ).clamp(0.0, 1.0)
                 weighted_entropy += float((entropy_values * batch_weights).sum().item())
                 weighted_normalized_entropy += float(
                     (normalized_entropy_values * batch_weights).sum().item()
@@ -923,7 +975,10 @@ class PPOAgent:
         else:
             advantages_np = (advantages_np - advantage_mean) / (advantage_std + 1e-8)
 
-        actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
+        actions_np = np.asarray(
+            self.buffer.actions,
+            dtype=np.float32 if self.continuous_actions else np.int64,
+        )
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
         n = len(actions_np)
         minibatch_size = max(1, min(self.minibatch_size, n))
@@ -969,7 +1024,11 @@ class PPOAgent:
             for idx in epoch_batches:
                 states = torch.as_tensor(np.stack([self.buffer.states[i] for i in idx]), dtype=torch.float32, device=self.device)
                 masks = torch.as_tensor(np.stack([self.buffer.masks[i] for i in idx]), dtype=torch.bool, device=self.device)
-                actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
+                actions = torch.as_tensor(
+                    actions_np[idx],
+                    dtype=torch.float32 if self.continuous_actions else torch.long,
+                    device=self.device,
+                )
                 old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
                 advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
                 returns = torch.as_tensor(returns_np[idx], dtype=torch.float32, device=self.device)
@@ -1116,7 +1175,10 @@ class PPOAgent:
                 raise ValueError("sample_weights must be finite and non-negative")
             weights_np = weights_np / max(float(weights_np.mean()), 1e-8)
 
-        actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
+        actions_np = np.asarray(
+            self.buffer.actions,
+            dtype=np.float32 if self.continuous_actions else np.int64,
+        )
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
         minibatch_size = max(1, min(self.minibatch_size, n))
         batches_per_epoch = int(np.ceil(n / minibatch_size))
@@ -1149,7 +1211,11 @@ class PPOAgent:
                     dtype=torch.bool,
                     device=self.device,
                 )
-                actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
+                actions = torch.as_tensor(
+                    actions_np[idx],
+                    dtype=torch.float32 if self.continuous_actions else torch.long,
+                    device=self.device,
+                )
                 old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
                 batch_advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
                 batch_weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
@@ -1348,7 +1414,10 @@ class PPOAgent:
         )
         explained_variance = 0.0 if return_variance <= 1e-8 else 1.0 - residual_variance / return_variance
 
-        actions_np = np.asarray(self.buffer.actions, dtype=np.int64)
+        actions_np = np.asarray(
+            self.buffer.actions,
+            dtype=np.float32 if self.continuous_actions else np.int64,
+        )
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
         minibatch_size = max(1, min(self.minibatch_size, n))
         batches_per_epoch = int(np.ceil(n / minibatch_size))
@@ -1399,7 +1468,11 @@ class PPOAgent:
                     dtype=torch.bool,
                     device=self.device,
                 )
-                actions = torch.as_tensor(actions_np[idx], dtype=torch.long, device=self.device)
+                actions = torch.as_tensor(
+                    actions_np[idx],
+                    dtype=torch.float32 if self.continuous_actions else torch.long,
+                    device=self.device,
+                )
                 old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
                 advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
                 targets = torch.as_tensor(returns_np[idx], dtype=torch.float32, device=self.device)
@@ -1507,6 +1580,8 @@ class PPOAgent:
         epochs: int = 3,
         batch_size: int = 256,
     ) -> dict[str, float]:
+        if self.continuous_actions:
+            raise ValueError("behavior cloning is only implemented for categorical policies")
         if len(actions) == 0:
             return {"bc_loss": 0.0, "bc_accuracy": 0.0}
 
