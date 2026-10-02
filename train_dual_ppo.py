@@ -146,8 +146,14 @@ def apply_training_design(
         "fast_warmup_updates": 0,
         "slow_warmup_updates": 0,
         "slow_count_lr": 1e-4,
-        "slow_placement_lr": 7.5e-5,
+        # Count is already moving over the useful resource-budget range. Stage
+        # and Placement had much smaller KL and need independent optimization
+        # strength instead of inheriting Count's conservative settings.
+        "slow_stage_lr": 2e-4,
+        "slow_placement_lr": 1e-4,
         "slow_k_epochs": 2,
+        "slow_stage_k_epochs": 3,
+        "slow_placement_k_epochs": 3,
         "slow_placement_entropy_target": 1.10,
         # Once Placement has collapsed, the old 0.015 ceiling cannot reopen
         # exploration even though the controller is fully saturated.
@@ -458,6 +464,12 @@ def parse_args() -> argparse.Namespace:
         help="Independent Count actor learning rate; raised to use the large observed Count KL margin.",
     )
     parser.add_argument(
+        "--slow-stage-lr",
+        type=float,
+        default=None,
+        help="Independent Stage actor learning rate; defaults to --slow-count-lr when omitted.",
+    )
+    parser.add_argument(
         "--slow-placement-lr",
         type=float,
         default=1.5e-4,
@@ -465,6 +477,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fast-lr", type=float, default=2e-4)
     parser.add_argument("--slow-k-epochs", type=int, default=3)
+    parser.add_argument(
+        "--slow-stage-k-epochs",
+        type=int,
+        default=None,
+        help="Independent Stage PPO epochs; defaults to --slow-k-epochs when omitted.",
+    )
+    parser.add_argument(
+        "--slow-placement-k-epochs",
+        type=int,
+        default=None,
+        help="Independent Placement PPO epochs; defaults to --slow-k-epochs when omitted.",
+    )
     parser.add_argument("--fast-k-epochs", type=int, default=4)
     parser.add_argument("--slow-entropy-coef", type=float, default=0.001)
     parser.add_argument("--slow-count-entropy-coef", type=float, default=None)
@@ -1002,8 +1026,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-count-value-coef must be >= 0")
     if args.slow_count_lr <= 0.0 or args.slow_count_target_kl <= 0.0:
         parser.error("--slow-count-lr and --slow-count-target-kl must be positive")
+    if args.slow_stage_lr is not None and args.slow_stage_lr <= 0.0:
+        parser.error("--slow-stage-lr must be positive when provided")
     if args.slow_placement_lr <= 0.0 or args.slow_placement_target_kl <= 0.0:
         parser.error("--slow-placement-lr and --slow-placement-target-kl must be positive")
+    if args.slow_stage_k_epochs is not None and args.slow_stage_k_epochs < 1:
+        parser.error("--slow-stage-k-epochs must be >= 1 when provided")
+    if args.slow_placement_k_epochs is not None and args.slow_placement_k_epochs < 1:
+        parser.error("--slow-placement-k-epochs must be >= 1 when provided")
     if args.slow_placement_entropy_coef < 0.0 or args.slow_placement_entropy_final_coef < 0.0:
         parser.error("Placement entropy coefficients must be non-negative")
     if args.slow_placement_entropy_final_coef > args.slow_placement_entropy_coef:
@@ -2091,6 +2121,9 @@ def rollout(
         "slow_placement_node_compute_cost": float("nan"),
         "slow_counterfactual_marginal_value": float("nan"),
         "slow_counterfactual_samples": 0.0,
+        "slow_stage_ablation_covered_stages": 0.0,
+        "slow_stage_ablation_credit_actions": 0.0,
+        "slow_stage_ablation_credit_fraction": 0.0,
         "slow_deployment_memory_fraction": float("nan"),
         "slow_deployment_storage_fraction": float("nan"),
         "slow_migration_fraction": float("nan"),
@@ -2558,6 +2591,9 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "slow_placement_node_compute_cost",
         "slow_counterfactual_marginal_value",
         "slow_counterfactual_samples",
+        "slow_stage_ablation_covered_stages",
+        "slow_stage_ablation_credit_actions",
+        "slow_stage_ablation_credit_fraction",
         "slow_deployment_memory_fraction",
         "slow_deployment_storage_fraction",
         "slow_migration_fraction",
@@ -3904,9 +3940,12 @@ def main() -> None:
         replicas_per_stage=replica_action_dim,
         slow_lr=args.slow_lr,
         slow_count_lr=args.slow_count_lr,
+        slow_stage_lr=args.slow_stage_lr,
         slow_placement_lr=args.slow_placement_lr,
         fast_lr=args.fast_lr,
         slow_k_epochs=args.slow_k_epochs,
+        slow_stage_k_epochs=args.slow_stage_k_epochs,
+        slow_placement_k_epochs=args.slow_placement_k_epochs,
         fast_k_epochs=args.fast_k_epochs,
         slow_entropy_coef=args.slow_entropy_coef,
         slow_count_entropy_coef=args.slow_count_entropy_coef,
@@ -4180,11 +4219,15 @@ def main() -> None:
     )
     print(f"  slow_deterministic_count_mode={args.slow_deterministic_count_mode}")
     print(
-        "  ppo slow_lr={} count_lr={} placement_lr={} fast_lr={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={}->{} hold={} decay={} fast_entropy={} slow_value_coef={}".format(
+        "  ppo slow_lr={} count_lr={} stage_lr={} placement_lr={} fast_lr={} slow_epochs={} stage_epochs={} placement_epochs={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={}->{} hold={} decay={} fast_entropy={} slow_value_coef={}".format(
             args.slow_lr,
             args.slow_count_lr,
+            args.slow_stage_lr if args.slow_stage_lr is not None else args.slow_count_lr,
             args.slow_placement_lr,
             args.fast_lr,
+            args.slow_k_epochs,
+            args.slow_stage_k_epochs if args.slow_stage_k_epochs is not None else args.slow_k_epochs,
+            args.slow_placement_k_epochs if args.slow_placement_k_epochs is not None else args.slow_k_epochs,
             args.slow_entropy_coef,
             args.slow_count_entropy_coef if args.slow_count_entropy_coef is not None else args.slow_entropy_coef,
             args.slow_placement_entropy_coef if args.slow_placement_entropy_coef is not None else args.slow_entropy_coef,
@@ -4506,6 +4549,9 @@ def main() -> None:
             "slow_placement_node_compute_cost": np.nan,
             "slow_counterfactual_marginal_value": np.nan,
             "slow_counterfactual_samples": 0.0,
+            "slow_stage_ablation_covered_stages": 0.0,
+            "slow_stage_ablation_credit_actions": 0.0,
+            "slow_stage_ablation_credit_fraction": 0.0,
             "slow_deployment_memory_fraction": np.nan,
             "slow_deployment_storage_fraction": np.nan,
             "slow_migration_fraction": np.nan,
@@ -4597,11 +4643,17 @@ def main() -> None:
             "slow_count_post_explained_variance": np.nan,
             "slow_count_entropy": 0.0,
             "slow_count_approx_kl": 0.0,
+            "slow_count_epochs_completed": 0.0,
+            "slow_count_kl_early_stop": 0.0,
+            "slow_count_optimizer_steps": 0.0,
             "slow_stage_loss": 0.0,
             "slow_stage_policy_loss": 0.0,
             "slow_stage_value_loss": 0.0,
             "slow_stage_entropy": 0.0,
             "slow_stage_approx_kl": 0.0,
+            "slow_stage_epochs_completed": 0.0,
+            "slow_stage_kl_early_stop": 0.0,
+            "slow_stage_optimizer_steps": 0.0,
             "slow_stage_advantage_mean": np.nan,
             "slow_stage_advantage_std": np.nan,
             "slow_placement_loss": 0.0,
@@ -4626,6 +4678,9 @@ def main() -> None:
             "slow_placement_entropy_saturated": 0,
             "slow_placement_updates_completed": 0,
             "slow_placement_approx_kl": 0.0,
+            "slow_placement_epochs_completed": 0.0,
+            "slow_placement_kl_early_stop": 0.0,
+            "slow_placement_optimizer_steps": 0.0,
             "fast_loss": 0.0,
             "fast_policy_loss": 0.0,
             "fast_value_loss": 0.0,
@@ -5304,6 +5359,15 @@ def main() -> None:
                 "slow_counterfactual_marginal_value"
             ],
             "slow_counterfactual_samples": stats["slow_counterfactual_samples"],
+            "slow_stage_ablation_covered_stages": stats[
+                "slow_stage_ablation_covered_stages"
+            ],
+            "slow_stage_ablation_credit_actions": stats[
+                "slow_stage_ablation_credit_actions"
+            ],
+            "slow_stage_ablation_credit_fraction": stats[
+                "slow_stage_ablation_credit_fraction"
+            ],
             "slow_deployment_memory_fraction": stats["slow_deployment_memory_fraction"],
             "slow_deployment_storage_fraction": stats["slow_deployment_storage_fraction"],
             "slow_migration_fraction": stats["slow_migration_fraction"],
@@ -5424,6 +5488,15 @@ def main() -> None:
             ),
             "slow_count_entropy": losses["slow"].get("count_entropy", np.nan),
             "slow_count_approx_kl": losses["slow"].get("count_approx_kl", np.nan),
+            "slow_count_epochs_completed": losses["slow"].get(
+                "count_epochs_completed", 0.0
+            ),
+            "slow_count_kl_early_stop": losses["slow"].get(
+                "count_kl_early_stop", 0.0
+            ),
+            "slow_count_optimizer_steps": losses["slow"].get(
+                "count_optimizer_steps", 0.0
+            ),
             "slow_stage_loss": losses["slow"].get("stage_loss", np.nan),
             "slow_stage_policy_loss": losses["slow"].get(
                 "stage_policy_loss", np.nan
@@ -5434,6 +5507,15 @@ def main() -> None:
             "slow_stage_entropy": losses["slow"].get("stage_entropy", np.nan),
             "slow_stage_approx_kl": losses["slow"].get(
                 "stage_approx_kl", np.nan
+            ),
+            "slow_stage_epochs_completed": losses["slow"].get(
+                "stage_epochs_completed", 0.0
+            ),
+            "slow_stage_kl_early_stop": losses["slow"].get(
+                "stage_kl_early_stop", 0.0
+            ),
+            "slow_stage_optimizer_steps": losses["slow"].get(
+                "stage_optimizer_steps", 0.0
             ),
             "slow_stage_advantage_mean": losses["slow"].get(
                 "stage_advantage_mean", np.nan
@@ -5499,6 +5581,15 @@ def main() -> None:
                 losses["slow"].get("placement_updates_completed", 0.0)
             ),
             "slow_placement_approx_kl": losses["slow"].get("placement_approx_kl", np.nan),
+            "slow_placement_epochs_completed": losses["slow"].get(
+                "placement_epochs_completed", 0.0
+            ),
+            "slow_placement_kl_early_stop": losses["slow"].get(
+                "placement_kl_early_stop", 0.0
+            ),
+            "slow_placement_optimizer_steps": losses["slow"].get(
+                "placement_optimizer_steps", 0.0
+            ),
             "fast_loss": losses["fast"]["loss"],
             "fast_policy_loss": losses["fast"]["policy_loss"],
             "fast_value_loss": losses["fast"]["value_loss"],

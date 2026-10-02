@@ -117,8 +117,11 @@ class SlowDeploymentPPOAgent:
     coverage_repair: bool = True
     lr: float = 3e-4
     count_lr: float = 2e-4
+    stage_lr: float | None = None
     placement_lr: float | None = None
     k_epochs: int = 3
+    stage_k_epochs: int | None = None
+    placement_k_epochs: int | None = None
     entropy_coef: float = 0.001
     count_entropy_coef: float | None = None
     placement_entropy_coef: float | None = 0.005
@@ -220,6 +223,14 @@ class SlowDeploymentPPOAgent:
             )
         if self.counterfactual_credit_coef < 0.0:
             raise ValueError("counterfactual_credit_coef must be non-negative")
+        if self.stage_lr is not None and self.stage_lr <= 0.0:
+            raise ValueError("stage_lr must be positive when provided")
+        if self.placement_lr is not None and self.placement_lr <= 0.0:
+            raise ValueError("placement_lr must be positive when provided")
+        if self.stage_k_epochs is not None and self.stage_k_epochs < 1:
+            raise ValueError("stage_k_epochs must be positive when provided")
+        if self.placement_k_epochs is not None and self.placement_k_epochs < 1:
+            raise ValueError("placement_k_epochs must be positive when provided")
         placement_entropy_start = self._placement_entropy_start()
         placement_entropy_final = self._placement_entropy_final()
         if placement_entropy_start < 0.0 or placement_entropy_final < 0.0:
@@ -329,7 +340,11 @@ class SlowDeploymentPPOAgent:
             hidden_dim=128,
             lr=self.lr if self.placement_lr is None else self.placement_lr,
             gamma=0.99,
-            k_epochs=self.k_epochs,
+            k_epochs=(
+                self.k_epochs
+                if self.placement_k_epochs is None
+                else self.placement_k_epochs
+            ),
             entropy_coef=self.placement_entropy_coefficient(),
             value_coef=self.value_coef,
             target_kl=self.target_kl if self.placement_target_kl is None else self.placement_target_kl,
@@ -364,9 +379,13 @@ class SlowDeploymentPPOAgent:
                 ),
                 action_dim=self.num_service_types * self.max_service_stages + 1,
                 hidden_dim=128,
-                lr=self.count_lr,
+                lr=self.count_lr if self.stage_lr is None else self.stage_lr,
                 gamma=0.99,
-                k_epochs=self.k_epochs,
+                k_epochs=(
+                    self.k_epochs
+                    if self.stage_k_epochs is None
+                    else self.stage_k_epochs
+                ),
                 entropy_coef=(
                     self.entropy_coef
                     if self.count_entropy_coef is None
@@ -1351,6 +1370,9 @@ class SlowDeploymentPPOAgent:
                 "approx_kl": 0.0,
                 "advantage_mean": 0.0,
                 "advantage_std": 0.0,
+                "epochs_completed": 0.0,
+                "kl_early_stop": 0.0,
+                "optimizer_steps": 0.0,
             }
         placement_entropy_coef = self.placement_entropy_coefficient()
         self.placement_ppo.entropy_coef = placement_entropy_coef
@@ -1449,6 +1471,9 @@ class SlowDeploymentPPOAgent:
             "count_value_loss": count_metrics["value_loss"],
             "count_entropy": count_metrics["entropy"],
             "count_approx_kl": count_metrics.get("approx_kl", 0.0),
+            "count_epochs_completed": count_metrics.get("epochs_completed", 0.0),
+            "count_kl_early_stop": count_metrics.get("kl_early_stop", 0.0),
+            "count_optimizer_steps": count_metrics.get("optimizer_steps", 0.0),
             "count_explained_variance": count_metrics.get("explained_variance", 0.0),
             "count_post_explained_variance": count_metrics.get("post_explained_variance", 0.0),
             "stage_loss": stage_metrics["loss"],
@@ -1456,6 +1481,9 @@ class SlowDeploymentPPOAgent:
             "stage_value_loss": stage_metrics["value_loss"],
             "stage_entropy": stage_metrics["entropy"],
             "stage_approx_kl": stage_metrics.get("approx_kl", 0.0),
+            "stage_epochs_completed": stage_metrics.get("epochs_completed", 0.0),
+            "stage_kl_early_stop": stage_metrics.get("kl_early_stop", 0.0),
+            "stage_optimizer_steps": stage_metrics.get("optimizer_steps", 0.0),
             "stage_advantage_mean": stage_metrics.get("advantage_mean", 0.0),
             "stage_advantage_std": stage_metrics.get("advantage_std", 0.0),
             "placement_loss": placement_metrics["loss"],
@@ -1489,6 +1517,9 @@ class SlowDeploymentPPOAgent:
             ),
             "placement_updates_completed": float(self.placement_updates_completed),
             "placement_approx_kl": placement_metrics.get("approx_kl", 0.0),
+            "placement_epochs_completed": placement_metrics.get("epochs_completed", 0.0),
+            "placement_kl_early_stop": placement_metrics.get("kl_early_stop", 0.0),
+            "placement_optimizer_steps": placement_metrics.get("optimizer_steps", 0.0),
             "placement_explained_variance": placement_metrics.get("explained_variance", 0.0),
             "placement_post_explained_variance": placement_metrics.get("post_explained_variance", 0.0),
         }
@@ -1541,6 +1572,9 @@ class SlowDeploymentPPOAgent:
             "count_value_loss": 0.0,
             "count_entropy": 0.0,
             "count_approx_kl": 0.0,
+            "count_epochs_completed": 0.0,
+            "count_kl_early_stop": 0.0,
+            "count_optimizer_steps": 0.0,
             "count_explained_variance": 0.0,
             "count_post_explained_variance": 0.0,
             "stage_loss": 0.0,
@@ -1548,6 +1582,9 @@ class SlowDeploymentPPOAgent:
             "stage_value_loss": 0.0,
             "stage_entropy": 0.0,
             "stage_approx_kl": 0.0,
+            "stage_epochs_completed": 0.0,
+            "stage_kl_early_stop": 0.0,
+            "stage_optimizer_steps": 0.0,
             "stage_advantage_mean": 0.0,
             "stage_advantage_std": 0.0,
             "placement_loss": 0.0,
@@ -1575,6 +1612,9 @@ class SlowDeploymentPPOAgent:
             ),
             "placement_updates_completed": float(self.placement_updates_completed),
             "placement_approx_kl": 0.0,
+            "placement_epochs_completed": 0.0,
+            "placement_kl_early_stop": 0.0,
+            "placement_optimizer_steps": 0.0,
             "placement_explained_variance": 0.0,
             "placement_post_explained_variance": 0.0,
         }
@@ -3240,9 +3280,12 @@ class HierarchicalPPOAgent:
         replicas_per_stage: int = 5,
         slow_lr: float = 3e-4,
         slow_count_lr: float = 2e-4,
+        slow_stage_lr: float | None = None,
         slow_placement_lr: float = 1.5e-4,
         fast_lr: float = 2e-4,
         slow_k_epochs: int = 3,
+        slow_stage_k_epochs: int | None = None,
+        slow_placement_k_epochs: int | None = None,
         fast_k_epochs: int = 4,
         slow_entropy_coef: float = 0.001,
         slow_count_entropy_coef: float | None = None,
@@ -3311,8 +3354,11 @@ class HierarchicalPPOAgent:
                 replicas_per_stage=replicas_per_stage,
                 lr=slow_lr,
                 count_lr=slow_count_lr,
+                stage_lr=slow_stage_lr,
                 placement_lr=slow_placement_lr,
                 k_epochs=slow_k_epochs,
+                stage_k_epochs=slow_stage_k_epochs,
+                placement_k_epochs=slow_placement_k_epochs,
                 entropy_coef=slow_entropy_coef,
                 count_entropy_coef=slow_count_entropy_coef,
                 placement_entropy_coef=slow_placement_entropy_coef,
@@ -3947,7 +3993,30 @@ class HierarchicalPPOAgent:
                 "slow_placement_node_compute_cost": 0.0,
                 "slow_counterfactual_marginal_value": 0.0,
                 "slow_counterfactual_samples": 0.0,
+                "slow_stage_ablation_covered_stages": 0.0,
+                "slow_stage_ablation_credit_actions": 0.0,
+                "slow_stage_ablation_credit_fraction": 0.0,
             }
+        # Replica-removal probes measure whether another replica of a service
+        # stage was useful. That is Stage credit, not node-selection credit.
+        # The bounded probe budget is far smaller than the number of Stage
+        # actions, so share each measured value with every action for the same
+        # service stage. Keep the exact node value where it exists; Placement
+        # continues to receive its separate node-local routing credit below.
+        stage_ablation_samples: dict[tuple[int, int], list[float]] = {}
+        for (service_id, stage_id, _), value in self.window_replica_ablation_values.items():
+            stage_ablation_samples.setdefault((service_id, stage_id), []).append(
+                float(value)
+            )
+        stage_ablation_means = {
+            stage_key: float(np.mean(values))
+            for stage_key, values in stage_ablation_samples.items()
+        }
+        pending_stage_action_count = len(self.slow_agent.pending_stage_keys)
+        stage_ablation_credit_actions = sum(
+            stage_key in stage_ablation_means
+            for stage_key in self.slow_agent.pending_stage_keys
+        )
         memory_capacity = max(float(env.service_memory_capacities().sum()), 1e-9)
         storage_capacity = max(float(env.service_storage_capacities().sum()), 1e-9)
         count_returns: dict[tuple[int, ...], float] = {}
@@ -4145,7 +4214,10 @@ class HierarchicalPPOAgent:
                             else 0.0
                         )
                         count_marginal_value = (
-                            self.window_replica_ablation_values.get(node_key, 0.0)
+                            self.window_replica_ablation_values.get(
+                                node_key,
+                                stage_ablation_means.get(stage_key, 0.0),
+                            )
                             if self.window_replica_ablation_samples > 0
                             else float(marginal_value)
                         )
@@ -4225,6 +4297,18 @@ class HierarchicalPPOAgent:
                 float(np.mean(counterfactual_values)) if counterfactual_values else 0.0
             ),
             "slow_counterfactual_samples": float(len(counterfactual_values)),
+            "slow_stage_ablation_covered_stages": float(
+                len(stage_ablation_means)
+            ),
+            "slow_stage_ablation_credit_actions": float(
+                stage_ablation_credit_actions
+            ),
+            "slow_stage_ablation_credit_fraction": (
+                float(stage_ablation_credit_actions)
+                / float(pending_stage_action_count)
+                if pending_stage_action_count > 0
+                else 0.0
+            ),
         }
 
     def _deployment_resource_fractions(self, env: EdgeComputingEnv) -> tuple[float, float]:

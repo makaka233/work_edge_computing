@@ -84,6 +84,75 @@ def test_incremental_count_uses_replica_ablation_instead_of_routing_proxy():
     assert counts[(-1, -1)] == 0.0
 
 
+def test_stage_ablation_credit_propagates_within_stage_without_using_routing_proxy():
+    env = tiny_replay_env()
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        slow_allocation_mode="budget-continuous-v2",
+        slow_counterfactual_credit_coef=1.0,
+        slow_deployment_memory_coef=0.0,
+        slow_deployment_storage_coef=0.0,
+        slow_count_unused_replica_coef=0.0,
+    )
+    deployment = np.zeros_like(env.deployment)
+    for service in env.scenario.services:
+        for stage in service.stages:
+            deployment[service.service_id, stage.stage_id, 0] = True
+    deployment[0, 0, 1] = True
+    env.apply_deployment(deployment)
+
+    agent.window_replica_ablation_samples = 1
+    agent.window_replica_ablation_values[(0, 0, 0)] = 0.2
+    agent.slow_agent.pending_stage_keys = [(0, 0), (0, 0), (0, 1)]
+    agent.window_stage_latency_samples[(0, 0)] = [(0.5, 1.0)]
+    agent.window_stage_node_weights[(0, 0)] = {0: 1.0, 1: 1.0}
+    agent.window_stage_node_latency_samples[(0, 0)] = {
+        0: [(0.5, 1.0)],
+        1: [(0.5, 1.0)],
+    }
+    agent.window_stage_latency_samples[(0, 1)] = [(0.5, 1.0)]
+    agent.window_stage_node_weights[(0, 1)] = {0: 1.0}
+    agent.window_stage_node_latency_samples[(0, 1)] = {0: [(0.5, 1.0)]}
+    # This dense routing marginal belongs to Placement and must not leak into
+    # Stage when exact replica-ablation probing is enabled.
+    agent.window_stage_node_counterfactual_values[(0, 1, 0)] = 0.7
+    agent.window_stage_node_counterfactual_weights[(0, 1, 0)] = 1.0
+
+    counts, _, metrics = agent._factorized_stage_returns(env)
+
+    expected_credit = 0.2 * agent.slow_reward_scale
+    assert np.isclose(counts[(0, 0, 0)], expected_credit)
+    assert np.isclose(counts[(0, 0, 1)], expected_credit)
+    assert np.isclose(counts[(0, 1, 0)], 0.0)
+    assert metrics["slow_stage_ablation_covered_stages"] == 1.0
+    assert metrics["slow_stage_ablation_credit_actions"] == 2.0
+    assert np.isclose(metrics["slow_stage_ablation_credit_fraction"], 2.0 / 3.0)
+
+
+def test_stage_and_placement_accept_independent_optimizer_strength():
+    env = tiny_replay_env()
+    env.reset()
+    agent = HierarchicalPPOAgent.from_env(
+        env,
+        slow_allocation_mode="budget-continuous-v2",
+        slow_count_lr=1e-4,
+        slow_stage_lr=2e-4,
+        slow_placement_lr=1e-4,
+        slow_k_epochs=2,
+        slow_stage_k_epochs=3,
+        slow_placement_k_epochs=4,
+    )
+
+    assert agent.slow_agent.stage_ppo is not None
+    assert np.isclose(agent.slow_agent.count_ppo.optimizer.param_groups[0]["lr"], 1e-4)
+    assert np.isclose(agent.slow_agent.stage_ppo.optimizer.param_groups[0]["lr"], 2e-4)
+    assert np.isclose(agent.slow_agent.placement_ppo.optimizer.param_groups[0]["lr"], 1e-4)
+    assert agent.slow_agent.count_ppo.k_epochs == 2
+    assert agent.slow_agent.stage_ppo.k_epochs == 3
+    assert agent.slow_agent.placement_ppo.k_epochs == 4
+
+
 def test_incremental_stop_uses_bounded_addition_probe_credit():
     env = tiny_replay_env()
     env.reset()

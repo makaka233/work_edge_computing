@@ -300,6 +300,9 @@ def test_policy_stability_defaults_reach_the_training_entrypoint(monkeypatch):
     assert args.slow_colocation_decay_updates == 1
     assert args.slow_count_unused_replica_coef == 0.0
     assert args.slow_count_lr == 2e-4
+    assert args.slow_stage_lr is None
+    assert args.slow_stage_k_epochs is None
+    assert args.slow_placement_k_epochs is None
     assert args.slow_placement_entropy_coef == 0.005
     assert args.slow_placement_entropy_final_coef == 0.0035
     assert args.slow_placement_entropy_hold_updates == 64
@@ -461,8 +464,11 @@ def test_trajectory_training_design_builds_complete_multi_window_batches():
     assert args.fast_warmup_updates == 0
     assert args.slow_warmup_updates == 0
     assert args.slow_count_lr == 1e-4
-    assert args.slow_placement_lr == 7.5e-5
+    assert args.slow_stage_lr == 2e-4
+    assert args.slow_placement_lr == 1e-4
     assert args.slow_k_epochs == 2
+    assert args.slow_stage_k_epochs == 3
+    assert args.slow_placement_k_epochs == 3
     assert args.fast_entropy_target == 0.18
     assert args.fast_entropy_max_coef == 0.02
     assert args.fast_entropy_normalized_control is True
