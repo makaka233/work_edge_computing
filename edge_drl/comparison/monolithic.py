@@ -7,13 +7,262 @@ from typing import Any
 
 import numpy as np
 
-from edge_drl.agents.drl import HierarchicalPPOAgent
+from edge_drl.agents.drl import (
+    FastSchedulingPPOAgent,
+    HierarchicalPPOAgent,
+    fast_obs_dim,
+)
 from edge_drl.comparison.checkpoint import load_checkpoint_configuration
 from edge_drl.comparison.scheme import BaseComparisonScheme
 from edge_drl.comparison.trace import ComparisonTrace, rehash_trace
 from edge_drl.env.environment import EdgeComputingEnv
 from edge_drl.env.scenario import EdgeScenario, Service, TaskRequest
 from train_dual_ppo import load_checkpoint
+
+
+MONOLITHIC_FAST_DESIGN = "aggregate-kkt-v2"
+
+
+class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
+    """Fast PPO observation specialized for one aggregated service stage.
+
+    The actor, critic, PPO optimizer, causal KKT ledger, action mask, and reward
+    path remain the shared implementation.  Only the interpretation of the
+    fixed-size ``chain-kkt-v3`` observation changes: fields that describe a
+    non-existent downstream stage are replaced with aggregate-service demand,
+    residual path capacity, and the exact candidate KKT marginal cost.
+
+    Keeping the tensor shape unchanged makes checkpoints use the normal shared
+    serialization path while keeping this behavior opt-in for Monolithic runs.
+    """
+
+    def _build_state(
+        self,
+        env: EdgeComputingEnv,
+        request: TaskRequest,
+        stage_id: int,
+        partial_nodes: list[int],
+        *,
+        reservation_node_delta: np.ndarray | None = None,
+        reservation_stage_delta: dict[tuple[int, int], np.ndarray] | None = None,
+        kkt_compute_sqrt: np.ndarray | None = None,
+        kkt_link_sqrt: np.ndarray | None = None,
+        processed_request_weight: float = 0.0,
+        total_request_weight: float = 1.0,
+    ) -> np.ndarray:
+        if self.chain_context != "chain-kkt-v3":
+            raise ValueError(
+                f"{MONOLITHIC_FAST_DESIGN} requires fast_chain_context=chain-kkt-v3"
+            )
+        if stage_id != 0 or len(request.stage_compute_gcycles) != 1:
+            raise ValueError(
+                "Monolithic Fast expects one aggregated stage per request"
+            )
+        env._require_ready()
+        assert env.scenario is not None
+
+        nodes = env.scenario.nodes
+        max_compute = max(float(node.compute_gcycles_per_s) for node in nodes)
+        finite_bandwidth = np.where(
+            np.isfinite(env.scenario.bandwidth_mb_s),
+            env.scenario.bandwidth_mb_s,
+            0.0,
+        )
+        max_bandwidth = max(float(np.max(finite_bandwidth)), 1e-9)
+        tick_weight = float(sum(item.request_count for item in env.current_requests))
+        tick_events = float(len(env.current_requests))
+        service_weight = float(
+            sum(
+                item.request_count
+                for item in env.current_requests
+                if item.service_id == request.service_id
+            )
+        )
+        home_weight = np.zeros(self.num_nodes, dtype=np.float64)
+        for item in env.current_requests:
+            home_weight[int(item.home_node)] += float(item.request_count)
+
+        expected_node_work, _ = self._expected_current_compute_workload(env)
+        if reservation_node_delta is not None:
+            expected_node_work = np.maximum(
+                expected_node_work + reservation_node_delta,
+                0.0,
+            )
+        candidate_post_work = self._candidate_post_compute_workload(
+            env,
+            request,
+            stage_id,
+            expected_node_work,
+        )
+        compute_capacity, _ = self._effective_kkt_capacities(env)
+        deployed = (
+            env.deployment[request.service_id, 0]
+            if env.deployment is not None
+            else np.zeros(self.num_nodes, dtype=bool)
+        )
+        mask = self._build_mask(env, request, stage_id, partial_nodes)
+
+        stages = len(request.stage_compute_gcycles)
+        if kkt_compute_sqrt is None:
+            kkt_compute_sqrt = np.zeros((stages, self.num_nodes), dtype=np.float64)
+        if kkt_link_sqrt is None:
+            kkt_link_sqrt = np.zeros(
+                (stages, self.num_nodes, self.num_nodes),
+                dtype=np.float64,
+            )
+
+        multiplicity = max(float(request.request_count), 1.0)
+        candidate_components: list[tuple[float, float, float, float]] = []
+        for node_id in range(self.num_nodes):
+            compute_cost = self._kkt_total_increment(
+                kkt_compute_sqrt[stage_id, node_id],
+                float(request.stage_compute_gcycles[stage_id]),
+                multiplicity,
+                compute_capacity[node_id],
+            ) / multiplicity
+            link_total, propagation_cost = self._routed_kkt_increment(
+                env,
+                phase=stage_id,
+                source=int(request.home_node),
+                target=node_id,
+                data_mb=float(request.input_mb),
+                multiplicity=multiplicity,
+                link_sqrt=kkt_link_sqrt,
+            )
+            link_cost = link_total / multiplicity
+            total_cost = compute_cost + link_cost + propagation_cost
+            candidate_components.append(
+                (
+                    float(np.tanh(compute_cost)),
+                    float(np.tanh(link_cost)) if np.isfinite(link_cost) else 1.0,
+                    float(np.tanh(propagation_cost / 0.05))
+                    if np.isfinite(propagation_cost)
+                    else 1.0,
+                    float(total_cost),
+                )
+            )
+        finite_feasible_costs = [
+            candidate_components[node_id][3]
+            for node_id in np.flatnonzero(mask)
+            if np.isfinite(candidate_components[node_id][3])
+        ]
+        best_cost = min(finite_feasible_costs) if finite_feasible_costs else 0.0
+
+        node_features: list[float] = []
+        for node in nodes:
+            node_id = int(node.node_id)
+            path = env.shortest_path(int(request.home_node), node_id)
+            reachable = path is not None
+            transfer_s, propagation_s = self._route_proxy_delay(
+                env,
+                int(request.home_node),
+                node_id,
+                float(request.input_mb),
+            )
+            if path is None or len(path) < 2:
+                residual_bottleneck = max_bandwidth if node_id == request.home_node else 0.0
+                hop_fraction = 0.0 if node_id == request.home_node else 1.0
+            else:
+                residual_bandwidths = [
+                    float(env.scenario.bandwidth_mb_s[left, right])
+                    * max(1.0 - 0.75 * float(env.link_load[left, right]), 0.10)
+                    for left, right in zip(path, path[1:])
+                ]
+                residual_bottleneck = min(residual_bandwidths)
+                hop_fraction = (len(path) - 1) / max(self.num_nodes - 1, 1)
+
+            compute_feature, link_feature, propagation_feature, total_cost = (
+                candidate_components[node_id]
+            )
+            relative_excess = (
+                max(total_cost - best_cost, 0.0)
+                if np.isfinite(total_cost)
+                else 10.0
+            )
+            residual_compute = float(compute_capacity[node_id]) / max_compute
+            node_features.extend(
+                [
+                    float(deployed[node_id]),
+                    float(reachable),
+                    float(node.compute_gcycles_per_s) / max_compute,
+                    float(env.node_compute_load[node_id]),
+                    residual_compute,
+                    float(node_id == request.home_node),
+                    residual_bottleneck / max_bandwidth,
+                    float(hop_fraction),
+                    float(np.tanh(transfer_s / 0.25)) if np.isfinite(transfer_s) else 1.0,
+                    float(np.tanh(propagation_s / 0.05)) if np.isfinite(propagation_s) else 1.0,
+                    home_weight[node_id] / max(tick_weight, 1.0),
+                    self._normalize_compute_pressure(
+                        expected_node_work[node_id],
+                        compute_capacity[node_id],
+                    ),
+                    self._normalize_compute_pressure(
+                        candidate_post_work[node_id],
+                        compute_capacity[node_id],
+                    ),
+                    compute_feature,
+                    link_feature,
+                    propagation_feature,
+                    float(np.tanh(total_cost)) if np.isfinite(total_cost) else 1.0,
+                    float(np.tanh(relative_excess)),
+                ]
+            )
+
+        finite_link_load = env.link_load[np.isfinite(env.link_load)]
+        progress = float(processed_request_weight) / max(float(total_request_weight), 1.0)
+        global_features = [
+            request.service_id / max(env.config.num_service_types - 1, 1),
+            request.home_node / max(self.num_nodes - 1, 1),
+            float(np.tanh(float(request.input_mb) / 2.0)),
+            float(np.tanh(float(request.stage_compute_gcycles[0]) / 8.0)),
+            float(np.tanh(float(request.deadline_s) / 0.6)),
+            np.log1p(float(request.request_count)) / np.log1p(5_000.0),
+            env.current_time_minute / max(env.config.episode_minutes, 1),
+            np.log1p(tick_weight) / np.log1p(5_000.0),
+            tick_events / max(env.config.num_edge_nodes * env.config.num_service_types, 1),
+            service_weight / max(tick_weight, 1.0),
+            float(np.mean(env.node_compute_load)),
+            float(np.max(env.node_compute_load)),
+            float(np.mean(finite_link_load)) if finite_link_load.size else 0.0,
+            float(np.max(finite_link_load)) if finite_link_load.size else 0.0,
+            float(np.count_nonzero(mask)) / max(self.num_nodes, 1),
+            progress,
+            1.0 - progress,
+            1.0,
+        ]
+        if self.policy_kind == "gat_node_scorer":
+            node_features.extend(self._build_edge_features(env))
+        state = np.asarray(global_features + node_features, dtype=np.float32)
+        expected_dim = fast_obs_dim(
+            self.num_nodes,
+            self.policy_kind,
+            self.chain_context,
+        )
+        if state.shape != (expected_dim,):
+            raise RuntimeError(
+                f"Monolithic Fast state shape changed from {(expected_dim,)} to {state.shape}"
+            )
+        return state
+
+
+def specialize_monolithic_fast_agent(
+    agent: HierarchicalPPOAgent,
+    design: str | None,
+) -> HierarchicalPPOAgent:
+    """Enable the opt-in Monolithic observation without rebuilding PPO state."""
+
+    if design != MONOLITHIC_FAST_DESIGN:
+        return agent
+    if agent.fast_agent.chain_context != "chain-kkt-v3":
+        raise ValueError(
+            f"{MONOLITHIC_FAST_DESIGN} requires fast_chain_context=chain-kkt-v3"
+        )
+    # The specialization adds methods but no fields.  Retaining the same
+    # instance preserves initialization, optimizer references, and checkpoint
+    # serialization while changing behavior only for explicitly tagged runs.
+    agent.fast_agent.__class__ = MonolithicFastSchedulingPPOAgent
+    return agent
 
 
 def collapse_scenario(base: EdgeScenario) -> EdgeScenario:
@@ -151,6 +400,10 @@ class MonolithicScheme(BaseComparisonScheme):
         replicas = int(checkpoint_args.get("replicas_per_stage", 0))
         kwargs["replicas_per_stage"] = planning_env.config.num_edge_nodes if replicas <= 0 else replicas
         agent = HierarchicalPPOAgent.from_env(planning_env, **kwargs)
+        specialize_monolithic_fast_agent(
+            agent,
+            str(checkpoint_args.get("monolithic_fast_design", "")) or None,
+        )
         load_checkpoint(agent, self.checkpoint_path)
         agent.slow_agent.count_ppo.policy.eval()
         if agent.slow_agent.stage_ppo is not None:

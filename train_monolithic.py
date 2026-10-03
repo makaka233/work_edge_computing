@@ -13,7 +13,12 @@ import torch
 
 from edge_drl.agents.drl import HierarchicalPPOAgent
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
-from edge_drl.comparison.monolithic import collapse_scenario, collapse_trace
+from edge_drl.comparison.monolithic import (
+    MONOLITHIC_FAST_DESIGN,
+    collapse_scenario,
+    collapse_trace,
+    specialize_monolithic_fast_agent,
+)
 from edge_drl.comparison.replay_env import TraceReplayEnv
 from edge_drl.comparison.scenario_transforms import transform_scenario, transform_trace
 from edge_drl.comparison.trace import ComparisonTrace, generate_comparison_trace
@@ -39,12 +44,13 @@ from train_dual_ppo import (
 
 
 # Monolithic concentrates the work of an entire service chain into one Fast
-# action.  With a strict per-request reservation ledger, the source Proposed
-# learning rate changes the policy too far before the full-batch KL check.  Use
-# a comparison-local conservative optimizer/entropy guard without changing the
-# Proposed defaults or the shared PPO implementation.
-MONOLITHIC_FAST_LR = 1e-4
-MONOLITHIC_FAST_ENTROPY_TARGET = 0.50
+# action.  Keep the source Proposed optimizer settings for a fair comparison,
+# while using a comparison-local normalized entropy guard suited to the much
+# smaller one-stage action problem.  The Proposed defaults and shared PPO
+# implementation remain unchanged.
+MONOLITHIC_FAST_ENTROPY_TARGET = 0.35
+MONOLITHIC_FAST_ENTROPY_MAX_COEF = 0.08
+MONOLITHIC_FAST_ENTROPY_ADAPTATION_RATE = 0.005
 
 # Full feasible resource use should not be confused with reward-free waste.
 # Capacity occupancy itself remains free, while these small coefficients retain
@@ -211,7 +217,11 @@ def _agent_from_config(env: TraceReplayEnv, args: dict[str, object], device: str
     # slow_reward_scale. Keep the mapping local to this comparison trainer.
     if "reward_scale" in args:
         kwargs["slow_reward_scale"] = args["reward_scale"]
-    return HierarchicalPPOAgent.from_env(env, **kwargs)
+    agent = HierarchicalPPOAgent.from_env(env, **kwargs)
+    return specialize_monolithic_fast_agent(
+        agent,
+        str(args.get("monolithic_fast_design", "")) or None,
+    )
 
 
 def _optimized_monolithic_args(
@@ -225,8 +235,8 @@ def _optimized_monolithic_args(
     A one-stage request concentrates all service work in one decision, so its
     reservation ledger is updated after every request rather than after the
     Proposed controller's larger stage-wise microbatch.  The concentrated
-    action also uses a lower Fast learning rate and an earlier normalized
-    entropy guard.  Resource-use tuning removes capacity-occupancy costs but
+    action uses a Monolithic-specific normalized entropy guard while retaining
+    the Proposed optimizer settings.  Resource-use tuning removes capacity-occupancy costs but
     retains weak credit for unused replicas; hard memory/storage feasibility
     checks are unchanged.
     """
@@ -235,9 +245,13 @@ def _optimized_monolithic_args(
         raise ValueError("fast-reservation-microbatch-size must be positive")
     values = dict(base_args)
     values["fast_reservation_microbatch_size"] = int(reservation_microbatch_size)
-    values["fast_lr"] = MONOLITHIC_FAST_LR
     values["fast_entropy_normalized_control"] = True
     values["fast_entropy_target"] = MONOLITHIC_FAST_ENTROPY_TARGET
+    values["fast_entropy_max_coef"] = MONOLITHIC_FAST_ENTROPY_MAX_COEF
+    values["fast_entropy_adaptation_rate"] = (
+        MONOLITHIC_FAST_ENTROPY_ADAPTATION_RATE
+    )
+    values["monolithic_fast_design"] = MONOLITHIC_FAST_DESIGN
     values["monolithic_allow_full_resource_use"] = bool(allow_full_resource_use)
     if allow_full_resource_use:
         values["slow_deployment_memory_coef"] = 0.0
@@ -509,6 +523,11 @@ def main() -> None:
             "fast_reservation_microbatch_size": cli.fast_reservation_microbatch_size,
             "fast_lr": float(base_args["fast_lr"]),
             "fast_entropy_target": float(base_args["fast_entropy_target"]),
+            "fast_entropy_max_coef": float(base_args["fast_entropy_max_coef"]),
+            "fast_entropy_adaptation_rate": float(
+                base_args["fast_entropy_adaptation_rate"]
+            ),
+            "monolithic_fast_design": base_args["monolithic_fast_design"],
             "monolithic_allow_full_resource_use": cli.allow_full_resource_use,
             "comparison_scenario_family": cli.scenario_family,
         }
@@ -633,6 +652,7 @@ def main() -> None:
         "inherited_best_checkpoint": inherited_best_checkpoint,
         "request_trace_rng": "Proposed environment_seed stream",
         "structural_difference": "Monolithic stage collapse only",
+        "monolithic_fast_design": base_args["monolithic_fast_design"],
     }
     training_manifest: dict[str, object] = {
         "source_proposed_checkpoint": str(base_path),
@@ -656,6 +676,8 @@ def main() -> None:
         f"fast_reservation_microbatch={cli.fast_reservation_microbatch_size} "
         f"fast_lr={float(base_args['fast_lr']):g} "
         f"fast_entropy_target={float(base_args['fast_entropy_target']):g} "
+        f"fast_entropy_max={float(base_args['fast_entropy_max_coef']):g} "
+        f"fast_design={base_args['monolithic_fast_design']} "
         f"allow_full_resource_use={cli.allow_full_resource_use} "
         f"slow_counterfactual_credit={float(base_args.get('slow_counterfactual_credit_coef', 0.0) or 0.0):g} "
         f"run_episodes={run_episodes} device={cli.device}",
