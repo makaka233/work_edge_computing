@@ -6,12 +6,15 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
+from torch.distributions import Categorical
 
 from edge_drl.agents.drl import (
     FastSchedulingPPOAgent,
     HierarchicalPPOAgent,
     fast_obs_dim,
 )
+from edge_drl.models.ppo import GraphAttentionNodeScoringActorCritic
 from edge_drl.comparison.checkpoint import load_checkpoint_configuration
 from edge_drl.comparison.scheme import BaseComparisonScheme
 from edge_drl.comparison.trace import ComparisonTrace, rehash_trace
@@ -20,7 +23,58 @@ from edge_drl.env.scenario import EdgeScenario, Service, TaskRequest
 from train_dual_ppo import load_checkpoint
 
 
-MONOLITHIC_FAST_DESIGN = "aggregate-kkt-v2"
+MONOLITHIC_FAST_DESIGN_V2 = "aggregate-kkt-v2"
+MONOLITHIC_FAST_DESIGN = "aggregate-kkt-v3"
+
+
+class MonolithicTemperatureGATPolicy(GraphAttentionNodeScoringActorCritic):
+    """GAT node scorer with an externally controlled behavior temperature."""
+
+    logit_temperature: float = 1.0
+
+    def forward(
+        self,
+        states: torch.Tensor,
+        masks: torch.Tensor,
+    ) -> tuple[Categorical, torch.Tensor]:
+        global_features = states[:, : self.global_dim]
+        node_features = states[:, self.node_offset : self.edge_offset].reshape(
+            -1,
+            self.num_nodes,
+            self.node_feature_dim,
+        )
+        edge_features = states[:, self.edge_offset :].reshape(
+            -1,
+            self.num_nodes,
+            self.num_nodes,
+            self.edge_feature_dim,
+        )
+
+        global_emb = self.global_encoder(global_features)
+        node_emb = self.node_encoder(node_features)
+        graph_emb = self._graph_attention(node_emb, edge_features)
+        expanded_global = global_emb.unsqueeze(1).expand(-1, self.num_nodes, -1)
+        pair_emb = torch.cat([expanded_global, graph_emb], dim=-1)
+        temperature = max(float(self.logit_temperature), 1.0)
+        logits = self.scorer(pair_emb).squeeze(-1) / temperature
+
+        safe_masks = masks.bool()
+        fallback = torch.zeros_like(safe_masks)
+        fallback[:, 0] = True
+        safe_masks = torch.where(
+            safe_masks.any(dim=1, keepdim=True),
+            safe_masks,
+            fallback,
+        )
+        logits = logits.masked_fill(~safe_masks, -1e9)
+        dist = Categorical(logits=logits)
+
+        mask_float = safe_masks.float().unsqueeze(-1)
+        pooled_nodes = (graph_emb * mask_float).sum(dim=1) / mask_float.sum(
+            dim=1
+        ).clamp_min(1.0)
+        values = self.critic(torch.cat([global_emb, pooled_nodes], dim=-1)).squeeze(-1)
+        return dist, values
 
 
 class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
@@ -246,13 +300,77 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
         return state
 
 
+class StableMonolithicFastSchedulingPPOAgent(MonolithicFastSchedulingPPOAgent):
+    """Monolithic Fast with PPO-consistent adaptive logit temperature.
+
+    Temperature changes only between PPO updates.  A rollout and its following
+    optimization therefore use the exact same policy distribution, preserving
+    the behavior log-probability contract required by PPO.
+    """
+
+    logit_temperature_max: float = 3.0
+
+    def _temperature_from_entropy_coefficient(self) -> float:
+        lower = float(self.entropy_coef)
+        upper = max(float(self.entropy_max_coef), lower + 1e-9)
+        fraction = np.clip(
+            (float(self.entropy_current_coef) - lower) / (upper - lower),
+            0.0,
+            1.0,
+        )
+        return float(
+            np.exp(np.log(max(float(self.logit_temperature_max), 1.0)) * fraction)
+        )
+
+    def _sync_logit_temperature(self) -> float:
+        if not isinstance(self.ppo.policy, MonolithicTemperatureGATPolicy):
+            raise TypeError("stable Monolithic Fast requires the temperature GAT policy")
+        temperature = self._temperature_from_entropy_coefficient()
+        self.ppo.policy.logit_temperature = temperature
+        return temperature
+
+    def schedule_batch(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        deterministic: bool = False,
+        record: bool = True,
+    ) -> list[list[int]]:
+        self._sync_logit_temperature()
+        return super().schedule_batch(
+            env,
+            requests,
+            deterministic=deterministic,
+            record=record,
+        )
+
+    def update(
+        self,
+        *,
+        progress_label: str = "",
+        progress_interval_seconds: float = 0.0,
+    ) -> dict[str, float]:
+        temperature = self._sync_logit_temperature()
+        metrics = super().update(
+            progress_label=progress_label,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+        next_temperature = self._sync_logit_temperature()
+        metrics["logit_temperature"] = temperature
+        metrics["logit_temperature_next"] = next_temperature
+        metrics["logit_temperature_max"] = float(self.logit_temperature_max)
+        return metrics
+
+
 def specialize_monolithic_fast_agent(
     agent: HierarchicalPPOAgent,
     design: str | None,
+    *,
+    logit_temperature_max: float = 3.0,
 ) -> HierarchicalPPOAgent:
     """Enable the opt-in Monolithic observation without rebuilding PPO state."""
 
-    if design != MONOLITHIC_FAST_DESIGN:
+    if design not in {MONOLITHIC_FAST_DESIGN_V2, MONOLITHIC_FAST_DESIGN}:
         return agent
     if agent.fast_agent.chain_context != "chain-kkt-v3":
         raise ValueError(
@@ -261,7 +379,23 @@ def specialize_monolithic_fast_agent(
     # The specialization adds methods but no fields.  Retaining the same
     # instance preserves initialization, optimizer references, and checkpoint
     # serialization while changing behavior only for explicitly tagged runs.
-    agent.fast_agent.__class__ = MonolithicFastSchedulingPPOAgent
+    if design == MONOLITHIC_FAST_DESIGN:
+        if not isinstance(
+            agent.fast_agent.ppo.policy,
+            GraphAttentionNodeScoringActorCritic,
+        ):
+            raise ValueError(
+                f"{MONOLITHIC_FAST_DESIGN} requires fast_policy_kind=gat_node_scorer"
+            )
+        agent.fast_agent.__class__ = StableMonolithicFastSchedulingPPOAgent
+        agent.fast_agent.logit_temperature_max = max(
+            float(logit_temperature_max),
+            1.0,
+        )
+        agent.fast_agent.ppo.policy.__class__ = MonolithicTemperatureGATPolicy
+        agent.fast_agent._sync_logit_temperature()
+    else:
+        agent.fast_agent.__class__ = MonolithicFastSchedulingPPOAgent
     return agent
 
 
@@ -403,6 +537,9 @@ class MonolithicScheme(BaseComparisonScheme):
         specialize_monolithic_fast_agent(
             agent,
             str(checkpoint_args.get("monolithic_fast_design", "")) or None,
+            logit_temperature_max=float(
+                checkpoint_args.get("monolithic_fast_logit_temperature_max", 3.0)
+            ),
         )
         load_checkpoint(agent, self.checkpoint_path)
         agent.slow_agent.count_ppo.policy.eval()

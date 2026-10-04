@@ -44,13 +44,15 @@ from train_dual_ppo import (
 
 
 # Monolithic concentrates the work of an entire service chain into one Fast
-# action.  Keep the source Proposed optimizer settings for a fair comparison,
-# while using a comparison-local normalized entropy guard suited to the much
-# smaller one-stage action problem.  The Proposed defaults and shared PPO
-# implementation remain unchanged.
-MONOLITHIC_FAST_ENTROPY_TARGET = 0.35
-MONOLITHIC_FAST_ENTROPY_MAX_COEF = 0.08
-MONOLITHIC_FAST_ENTROPY_ADAPTATION_RATE = 0.005
+# action.  Use a comparison-local conservative learning rate and normalized
+# entropy/temperature guard suited to the much smaller one-stage action
+# problem.  The Proposed defaults and shared PPO implementation remain
+# unchanged.
+MONOLITHIC_FAST_LR = 1e-4
+MONOLITHIC_FAST_ENTROPY_TARGET = 0.30
+MONOLITHIC_FAST_ENTROPY_MAX_COEF = 0.04
+MONOLITHIC_FAST_ENTROPY_ADAPTATION_RATE = 0.003
+MONOLITHIC_FAST_LOGIT_TEMPERATURE_MAX = 3.0
 
 # Full feasible resource use should not be confused with reward-free waste.
 # Capacity occupancy itself remains free, while these small coefficients retain
@@ -221,6 +223,12 @@ def _agent_from_config(env: TraceReplayEnv, args: dict[str, object], device: str
     return specialize_monolithic_fast_agent(
         agent,
         str(args.get("monolithic_fast_design", "")) or None,
+        logit_temperature_max=float(
+            args.get(
+                "monolithic_fast_logit_temperature_max",
+                MONOLITHIC_FAST_LOGIT_TEMPERATURE_MAX,
+            )
+        ),
     )
 
 
@@ -235,8 +243,8 @@ def _optimized_monolithic_args(
     A one-stage request concentrates all service work in one decision, so its
     reservation ledger is updated after every request rather than after the
     Proposed controller's larger stage-wise microbatch.  The concentrated
-    action uses a Monolithic-specific normalized entropy guard while retaining
-    the Proposed optimizer settings.  Resource-use tuning removes capacity-occupancy costs but
+    action uses a Monolithic-specific conservative learning rate and normalized
+    entropy/temperature guard. Resource-use tuning removes capacity-occupancy costs but
     retains weak credit for unused replicas; hard memory/storage feasibility
     checks are unchanged.
     """
@@ -245,6 +253,7 @@ def _optimized_monolithic_args(
         raise ValueError("fast-reservation-microbatch-size must be positive")
     values = dict(base_args)
     values["fast_reservation_microbatch_size"] = int(reservation_microbatch_size)
+    values["fast_lr"] = MONOLITHIC_FAST_LR
     values["fast_entropy_normalized_control"] = True
     values["fast_entropy_target"] = MONOLITHIC_FAST_ENTROPY_TARGET
     values["fast_entropy_max_coef"] = MONOLITHIC_FAST_ENTROPY_MAX_COEF
@@ -252,6 +261,9 @@ def _optimized_monolithic_args(
         MONOLITHIC_FAST_ENTROPY_ADAPTATION_RATE
     )
     values["monolithic_fast_design"] = MONOLITHIC_FAST_DESIGN
+    values["monolithic_fast_logit_temperature_max"] = (
+        MONOLITHIC_FAST_LOGIT_TEMPERATURE_MAX
+    )
     values["monolithic_allow_full_resource_use"] = bool(allow_full_resource_use)
     if allow_full_resource_use:
         values["slow_deployment_memory_coef"] = 0.0
@@ -528,6 +540,9 @@ def main() -> None:
                 base_args["fast_entropy_adaptation_rate"]
             ),
             "monolithic_fast_design": base_args["monolithic_fast_design"],
+            "monolithic_fast_logit_temperature_max": float(
+                base_args["monolithic_fast_logit_temperature_max"]
+            ),
             "monolithic_allow_full_resource_use": cli.allow_full_resource_use,
             "comparison_scenario_family": cli.scenario_family,
         }
@@ -653,6 +668,9 @@ def main() -> None:
         "request_trace_rng": "Proposed environment_seed stream",
         "structural_difference": "Monolithic stage collapse only",
         "monolithic_fast_design": base_args["monolithic_fast_design"],
+        "monolithic_fast_logit_temperature_max": float(
+            base_args["monolithic_fast_logit_temperature_max"]
+        ),
     }
     training_manifest: dict[str, object] = {
         "source_proposed_checkpoint": str(base_path),
@@ -678,6 +696,7 @@ def main() -> None:
         f"fast_entropy_target={float(base_args['fast_entropy_target']):g} "
         f"fast_entropy_max={float(base_args['fast_entropy_max_coef']):g} "
         f"fast_design={base_args['monolithic_fast_design']} "
+        f"fast_temperature_max={float(base_args['monolithic_fast_logit_temperature_max']):g} "
         f"allow_full_resource_use={cli.allow_full_resource_use} "
         f"slow_counterfactual_credit={float(base_args.get('slow_counterfactual_credit_coef', 0.0) or 0.0):g} "
         f"run_episodes={run_episodes} device={cli.device}",
