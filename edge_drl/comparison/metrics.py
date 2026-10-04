@@ -72,6 +72,7 @@ def evaluate_scheme_episode(
             represented_seconds=step_represented_seconds,
         )
         settlement_time += time.perf_counter() - settlement_start
+        scheme.observe_step(env, requests, schedules, info)
 
         slot_used_nodes: set[int] = set()
         slot_used_replicas: set[tuple[int, int, int]] = set()

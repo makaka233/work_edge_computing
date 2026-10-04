@@ -26,6 +26,8 @@ from edge_drl.comparison.types import ExperimentPoint
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
 from edge_drl.env.scenario import EdgeScenario
 from train_dual_ppo import (
+    _load_probabilities_for_args,
+    _load_strata_for_args,
     SlowLearningRateController,
     TrainingRandomStreams,
     aggregate_rollout_stats,
@@ -43,15 +45,8 @@ from train_dual_ppo import (
 )
 
 
-# Monolithic concentrates the work of an entire service chain into one Fast
-# action.  Use a comparison-local conservative learning rate and normalized
-# entropy/temperature guard suited to the much smaller one-stage action
-# problem.  The Proposed defaults and shared PPO implementation remain
-# unchanged.
-MONOLITHIC_FAST_LR = 1e-4
-MONOLITHIC_FAST_ENTROPY_TARGET = 0.30
-MONOLITHIC_FAST_ENTROPY_MAX_COEF = 0.04
-MONOLITHIC_FAST_ENTROPY_ADAPTATION_RATE = 0.003
+# This field is retained for legacy V3 checkpoint compatibility. V4 inherits
+# Proposed's PPO hyperparameters and does not use temperature scaling.
 MONOLITHIC_FAST_LOGIT_TEMPERATURE_MAX = 3.0
 
 # Full feasible resource use should not be confused with reward-free waste.
@@ -219,7 +214,16 @@ def _agent_from_config(env: TraceReplayEnv, args: dict[str, object], device: str
     # slow_reward_scale. Keep the mapping local to this comparison trainer.
     if "reward_scale" in args:
         kwargs["slow_reward_scale"] = args["reward_scale"]
+    if bool(args.get("fast_load_balanced_updates", False)):
+        sampling_args = argparse.Namespace(**args)
+        kwargs["fast_load_group_weights"] = _load_probabilities_for_args(
+            sampling_args,
+            len(_load_strata_for_args(sampling_args)),
+        )
     agent = HierarchicalPPOAgent.from_env(env, **kwargs)
+    agent.window_replica_ablation_samples = int(
+        args.get("slow_replica_ablation_samples", 0) or 0
+    )
     return specialize_monolithic_fast_agent(
         agent,
         str(args.get("monolithic_fast_design", "")) or None,
@@ -242,27 +246,22 @@ def _optimized_monolithic_args(
 
     A one-stage request concentrates all service work in one decision, so its
     reservation ledger is updated after every request rather than after the
-    Proposed controller's larger stage-wise microbatch.  The concentrated
-    action uses a Monolithic-specific conservative learning rate and normalized
-    entropy/temperature guard. Resource-use tuning removes capacity-occupancy costs but
-    retains weak credit for unused replicas; hard memory/storage feasibility
-    checks are unchanged.
+    Proposed controller's larger stage-wise microbatch. PPO learning and
+    entropy controls are inherited from Proposed for an auditable comparison.
+    Resource-use tuning removes capacity-occupancy costs only when explicitly
+    requested, while hard memory/storage feasibility checks remain unchanged.
     """
 
     if reservation_microbatch_size <= 0:
         raise ValueError("fast-reservation-microbatch-size must be positive")
     values = dict(base_args)
     values["fast_reservation_microbatch_size"] = int(reservation_microbatch_size)
-    values["fast_lr"] = MONOLITHIC_FAST_LR
-    values["fast_entropy_normalized_control"] = True
-    values["fast_entropy_target"] = MONOLITHIC_FAST_ENTROPY_TARGET
-    values["fast_entropy_max_coef"] = MONOLITHIC_FAST_ENTROPY_MAX_COEF
-    values["fast_entropy_adaptation_rate"] = (
-        MONOLITHIC_FAST_ENTROPY_ADAPTATION_RATE
-    )
     values["monolithic_fast_design"] = MONOLITHIC_FAST_DESIGN
-    values["monolithic_fast_logit_temperature_max"] = (
-        MONOLITHIC_FAST_LOGIT_TEMPERATURE_MAX
+    # Retain the field for checkpoint schema compatibility. V4 does not use a
+    # temperature-scaled policy; only V3 checkpoint loading consumes it.
+    values.setdefault(
+        "monolithic_fast_logit_temperature_max",
+        MONOLITHIC_FAST_LOGIT_TEMPERATURE_MAX,
     )
     values["monolithic_allow_full_resource_use"] = bool(allow_full_resource_use)
     if allow_full_resource_use:
@@ -327,6 +326,9 @@ def _monolithic_rollout_args(
         fast_counterfactual_credit_coef=float(fast_counterfactual_credit_coef),
         slow_counterfactual_credit_coef=float(
             0.0 if slow_counterfactual_coef is None else slow_counterfactual_coef
+        ),
+        slow_replica_ablation_samples=int(
+            base_args.get("slow_replica_ablation_samples", 0) or 0
         ),
         fast_controllable_latency_credit=bool(
             base_args.get("fast_controllable_latency_credit", False)
@@ -460,6 +462,11 @@ def main() -> None:
         )
         if resume_args.get("training_scheme") != "Monolithic":
             raise ValueError("--load-checkpoint must be a Monolithic training checkpoint")
+        if resume_internal.get("resumable") is False:
+            raise ValueError(
+                "this Monolithic checkpoint is evaluation-only; resume from latest.pt, "
+                "last.pt, or a periodic update checkpoint"
+            )
     effective_episode_minutes = int(
         base_args.get("episode_minutes", 60) if cli.episode_minutes is None else cli.episode_minutes
     )
@@ -666,7 +673,10 @@ def main() -> None:
         "resume_rollout_offset": training_rollout_idx,
         "inherited_best_checkpoint": inherited_best_checkpoint,
         "request_trace_rng": "Proposed environment_seed stream",
-        "structural_difference": "Monolithic stage collapse only",
+        "structural_difference": (
+            "Monolithic complete-service stage collapse with batch-trajectory "
+            "Fast credit and remaining-demand observation"
+        ),
         "monolithic_fast_design": base_args["monolithic_fast_design"],
         "monolithic_fast_logit_temperature_max": float(
             base_args["monolithic_fast_logit_temperature_max"]
@@ -696,7 +706,7 @@ def main() -> None:
         f"fast_entropy_target={float(base_args['fast_entropy_target']):g} "
         f"fast_entropy_max={float(base_args['fast_entropy_max_coef']):g} "
         f"fast_design={base_args['monolithic_fast_design']} "
-        f"fast_temperature_max={float(base_args['monolithic_fast_logit_temperature_max']):g} "
+        f"fast_temperature=disabled-v4 "
         f"allow_full_resource_use={cli.allow_full_resource_use} "
         f"slow_counterfactual_credit={float(base_args.get('slow_counterfactual_credit_coef', 0.0) or 0.0):g} "
         f"run_episodes={run_episodes} device={cli.device}",
@@ -854,21 +864,6 @@ def main() -> None:
             encoding="utf-8",
         )
         stats = aggregate_rollout_stats(episode_stats_for_update)
-        fast_metrics = agent.update_fast(
-            progress_label=f"monolithic update {update} fast PPO",
-            progress_interval_seconds=cli.progress_interval_seconds,
-        )
-        slow_windows_available = agent.completed_slow_windows
-        if slow_windows_available < windows_this_update:
-            raise RuntimeError(
-                "Monolithic 1:1 update expected "
-                f"{windows_this_update} completed Slow windows, got {slow_windows_available}"
-            )
-        slow_metrics = agent.update_slow(
-            progress_label=f"monolithic update {update} slow PPO",
-            progress_interval_seconds=cli.progress_interval_seconds,
-        )
-        update_metrics = {"fast": fast_metrics, "slow": slow_metrics}
         load_multiplier_mean = float(
             np.mean([multiplier for multiplier, _ in update_load_assignments])
         )
@@ -884,6 +879,72 @@ def main() -> None:
             reference_checkpoint_load,
         )
         checkpoint_ready = len(checkpoint_selection_history) >= best_checkpoint_window
+        should_replace_best = (
+            (checkpoint_ready and not best_checkpoint_ready)
+            or (
+                checkpoint_ready == best_checkpoint_ready
+                and checkpoint_score < best_checkpoint_score
+            )
+        )
+        # The rollout score belongs to the policy *before* this update. Save
+        # that exact policy now; otherwise best.pt would contain parameters
+        # that have never produced the score used to select them.
+        if should_replace_best:
+            best_checkpoint_score = checkpoint_score
+            best_checkpoint_ready = checkpoint_ready
+            save_checkpoint(
+                agent,
+                checkpoint_dir / "best.pt",
+                {
+                    "args": {
+                        **base_args,
+                        "seed": effective_seed,
+                        "physical_seed": physical_seed,
+                        "episode_minutes": effective_episode_minutes,
+                        "episodes_per_update": cli.episodes_per_update,
+                        "sampled_seconds_per_window": effective_sampled_seconds,
+                        "updates": target_update,
+                        "additional_updates": cli.updates,
+                        "load_checkpoint": (
+                            None if resume_path is None else str(resume_path)
+                        ),
+                        "progress_interval_seconds": cli.progress_interval_seconds,
+                        "run_name": run_name,
+                        "training_scheme": "Monolithic",
+                        "comparison_scenario_family": cli.scenario_family,
+                        "comparison_scenario_value": cli.scenario_value,
+                    },
+                    "synchronization": synchronization,
+                    "update": update,
+                    "policy_completed_updates": update - 1,
+                    "evaluated_by_rollout_update": update,
+                    "resumable": False,
+                    "selection_kind": "load_adjusted_rolling_train_pre_update",
+                    "best_checkpoint_score": best_checkpoint_score,
+                    "best_checkpoint_ready": best_checkpoint_ready,
+                    "checkpoint_score": checkpoint_score,
+                    "checkpoint_score_load_slope": checkpoint_load_slope,
+                    "checkpoint_reference_load": reference_checkpoint_load,
+                    "checkpoint_selection_window": best_checkpoint_window,
+                    "checkpoint_selection_history": checkpoint_selection_history,
+                },
+                training_random_streams,
+            )
+        fast_metrics = agent.update_fast(
+            progress_label=f"monolithic update {update} fast PPO",
+            progress_interval_seconds=cli.progress_interval_seconds,
+        )
+        slow_windows_available = agent.completed_slow_windows
+        if slow_windows_available < windows_this_update:
+            raise RuntimeError(
+                "Monolithic 1:1 update expected "
+                f"{windows_this_update} completed Slow windows, got {slow_windows_available}"
+            )
+        slow_metrics = agent.update_slow(
+            progress_label=f"monolithic update {update} slow PPO",
+            progress_interval_seconds=cli.progress_interval_seconds,
+        )
+        update_metrics = {"fast": fast_metrics, "slow": slow_metrics}
         slow_updated = True
         slow_lr_decayed = slow_lr_controller.observe(
             checkpoint_score,
@@ -902,13 +963,6 @@ def main() -> None:
         )
         slow_placement_lr = SlowLearningRateController.optimizer_lr(
             agent.slow_agent.placement_ppo.optimizer
-        )
-        should_replace_best = (
-            (checkpoint_ready and not best_checkpoint_ready)
-            or (
-                checkpoint_ready == best_checkpoint_ready
-                and checkpoint_score < best_checkpoint_score
-            )
         )
         row = {
             "update": float(update),
@@ -967,10 +1021,8 @@ def main() -> None:
                 resume_episode_offset + local_update * cli.episodes_per_update
             ),
             "deterministic_initialization": True,
-            "best_checkpoint_score": (
-                checkpoint_score if should_replace_best else best_checkpoint_score
-            ),
-            "best_checkpoint_ready": best_checkpoint_ready or checkpoint_ready,
+            "best_checkpoint_score": best_checkpoint_score,
+            "best_checkpoint_ready": best_checkpoint_ready,
             "checkpoint_score": checkpoint_score,
             "checkpoint_score_load_slope": checkpoint_load_slope,
             "checkpoint_reference_load": reference_checkpoint_load,
@@ -985,17 +1037,6 @@ def main() -> None:
             {**metadata, "selection_kind": "latest"},
             training_random_streams,
         )
-        if should_replace_best:
-            best_checkpoint_score = checkpoint_score
-            best_checkpoint_ready = checkpoint_ready
-            metadata["best_checkpoint_score"] = best_checkpoint_score
-            metadata["best_checkpoint_ready"] = best_checkpoint_ready
-            save_checkpoint(
-                agent,
-                checkpoint_dir / "best.pt",
-                {**metadata, "selection_kind": "load_adjusted_rolling_train"},
-                training_random_streams,
-            )
         if checkpoint_interval > 0 and update % checkpoint_interval == 0:
             save_checkpoint(
                 agent,

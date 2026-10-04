@@ -24,7 +24,8 @@ from train_dual_ppo import load_checkpoint
 
 
 MONOLITHIC_FAST_DESIGN_V2 = "aggregate-kkt-v2"
-MONOLITHIC_FAST_DESIGN = "aggregate-kkt-v3"
+MONOLITHIC_FAST_DESIGN_V3 = "aggregate-kkt-v3"
+MONOLITHIC_FAST_DESIGN = "aggregate-kkt-v4"
 
 
 class MonolithicTemperatureGATPolicy(GraphAttentionNodeScoringActorCritic):
@@ -90,6 +91,65 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
     serialization path while keeping this behavior opt-in for Monolithic runs.
     """
 
+    def _batch_reward_queue(self) -> list[int]:
+        queue = getattr(self, "_monolithic_batch_reward_counts", None)
+        if queue is None:
+            queue = []
+            self._monolithic_batch_reward_counts = queue
+        return queue
+
+    def schedule_batch(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        deterministic: bool = False,
+        record: bool = True,
+    ) -> list[list[int]]:
+        schedules = super().schedule_batch(
+            env,
+            requests,
+            deterministic=deterministic,
+            record=record,
+        )
+        if (
+            record
+            and requests
+            and getattr(self, "monolithic_fast_design", None)
+            == MONOLITHIC_FAST_DESIGN
+        ):
+            self._batch_reward_queue().append(len(requests))
+        return schedules
+
+    def assign_schedule_rewards(
+        self,
+        rewards: list[float],
+        done: bool,
+        weight: float = 1.0,
+    ) -> None:
+        """Treat every jointly settled request batch as one PPO trajectory."""
+
+        if getattr(self, "monolithic_fast_design", None) != MONOLITHIC_FAST_DESIGN:
+            return super().assign_schedule_rewards(rewards, done=done, weight=weight)
+        if len(rewards) != 1:
+            raise ValueError("Monolithic Fast expects exactly one reward per request")
+        queue = self._batch_reward_queue()
+        if not queue:
+            raise RuntimeError("Monolithic Fast received a reward without a recorded batch")
+        remaining = int(queue[0])
+        if remaining <= 0:
+            raise RuntimeError("invalid Monolithic Fast batch reward counter")
+        is_batch_terminal = remaining == 1
+        self.ppo.buffer.rewards.append(float(rewards[0]))
+        self.ppo.buffer.dones.append(bool(done or is_batch_terminal))
+        self.ppo.buffer.weights.append(float(weight))
+        if is_batch_terminal:
+            queue.pop(0)
+        else:
+            queue[0] = remaining - 1
+
+    def clear_batch_reward_context(self) -> None:
+        self._batch_reward_queue().clear()
+
     def _build_state(
         self,
         env: EdgeComputingEnv,
@@ -103,6 +163,7 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
         kkt_link_sqrt: np.ndarray | None = None,
         processed_request_weight: float = 0.0,
         total_request_weight: float = 1.0,
+        remaining_requests: list[TaskRequest] | tuple[TaskRequest, ...] | None = None,
     ) -> np.ndarray:
         if self.chain_context != "chain-kkt-v3":
             raise ValueError(
@@ -123,18 +184,47 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
             0.0,
         )
         max_bandwidth = max(float(np.max(finite_bandwidth)), 1e-9)
-        tick_weight = float(sum(item.request_count for item in env.current_requests))
-        tick_events = float(len(env.current_requests))
+        use_remaining_context = (
+            getattr(self, "monolithic_fast_design", None)
+            == MONOLITHIC_FAST_DESIGN
+        )
+        active_requests = list(
+            env.current_requests
+            if remaining_requests is None or not use_remaining_context
+            else remaining_requests
+        )
+        tick_weight = float(sum(item.request_count for item in active_requests))
+        tick_events = float(len(active_requests))
         service_weight = float(
             sum(
                 item.request_count
-                for item in env.current_requests
+                for item in active_requests
                 if item.service_id == request.service_id
             )
         )
         home_weight = np.zeros(self.num_nodes, dtype=np.float64)
-        for item in env.current_requests:
+        remaining_compute = 0.0
+        remaining_input = 0.0
+        for item in active_requests:
             home_weight[int(item.home_node)] += float(item.request_count)
+            remaining_compute += float(item.request_count) * float(
+                sum(item.stage_compute_gcycles)
+            )
+            remaining_input += float(item.request_count) * float(item.input_mb)
+        full_compute = max(
+            sum(
+                float(item.request_count) * float(sum(item.stage_compute_gcycles))
+                for item in env.current_requests
+            ),
+            1e-9,
+        )
+        full_input = max(
+            sum(
+                float(item.request_count) * float(item.input_mb)
+                for item in env.current_requests
+            ),
+            1e-9,
+        )
 
         expected_node_work, _ = self._expected_current_compute_workload(env)
         if reservation_node_delta is not None:
@@ -282,8 +372,8 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
             float(np.max(finite_link_load)) if finite_link_load.size else 0.0,
             float(np.count_nonzero(mask)) / max(self.num_nodes, 1),
             progress,
-            1.0 - progress,
-            1.0,
+            remaining_compute / full_compute,
+            remaining_input / full_input,
         ]
         if self.policy_kind == "gat_node_scorer":
             node_features.extend(self._build_edge_features(env))
@@ -370,7 +460,11 @@ def specialize_monolithic_fast_agent(
 ) -> HierarchicalPPOAgent:
     """Enable the opt-in Monolithic observation without rebuilding PPO state."""
 
-    if design not in {MONOLITHIC_FAST_DESIGN_V2, MONOLITHIC_FAST_DESIGN}:
+    if design not in {
+        MONOLITHIC_FAST_DESIGN_V2,
+        MONOLITHIC_FAST_DESIGN_V3,
+        MONOLITHIC_FAST_DESIGN,
+    }:
         return agent
     if agent.fast_agent.chain_context != "chain-kkt-v3":
         raise ValueError(
@@ -379,7 +473,8 @@ def specialize_monolithic_fast_agent(
     # The specialization adds methods but no fields.  Retaining the same
     # instance preserves initialization, optimizer references, and checkpoint
     # serialization while changing behavior only for explicitly tagged runs.
-    if design == MONOLITHIC_FAST_DESIGN:
+    agent.fast_agent.monolithic_fast_design = design
+    if design == MONOLITHIC_FAST_DESIGN_V3:
         if not isinstance(
             agent.fast_agent.ppo.policy,
             GraphAttentionNodeScoringActorCritic,
@@ -481,11 +576,34 @@ def expand_monolithic_schedule(schedule: list[int] | tuple[int, ...], stage_coun
     return [int(schedule[0])] * stage_count
 
 
+def collapse_deployment_for_monolithic(
+    scenario: EdgeScenario,
+    deployment: np.ndarray,
+) -> np.ndarray:
+    """Project staged deployment state into complete-service replicas.
+
+    A node is a valid Monolithic replica only if every original service stage
+    is deployed there.  This preserves the previous deployment in Slow's
+    evaluation observation without inventing a complete service replica.
+    """
+
+    collapsed = np.zeros_like(np.asarray(deployment, dtype=bool))
+    for service in scenario.services:
+        valid_stage_ids = [int(stage.stage_id) for stage in service.stages]
+        if valid_stage_ids:
+            collapsed[int(service.service_id), 0] = np.all(
+                deployment[int(service.service_id), valid_stage_ids],
+                axis=0,
+            )
+    return collapsed
+
+
 def _copy_runtime_state(source: EdgeComputingEnv, target: EdgeComputingEnv) -> None:
     target.node_compute_load = source.node_compute_load.copy()
     target.link_load = source.link_load.copy()
     target.current_time_minute = source.current_time_minute
     target.next_deployment_update_minute = source.next_deployment_update_minute
+    target.last_load_update_minute = source.last_load_update_minute
 
 
 class MonolithicScheme(BaseComparisonScheme):
@@ -518,6 +636,15 @@ class MonolithicScheme(BaseComparisonScheme):
         self._planning_env.deployment = np.zeros_like(env.deployment)
         self._planning_env._route_cache.clear()
         self.agent = self._load_agent(self._planning_env, checkpoint_args, device)
+        self._window_latency_samples: list[tuple[float, float]] = []
+        self._window_penalty_latency_sum = 0.0
+        self._window_deadline_violations = 0.0
+        self._window_invalid_actions = 0.0
+        self._window_weight = 0.0
+        self._window_max_node_load = 0.0
+        self._window_max_link_load = 0.0
+        self._window_memory_fraction = 0.0
+        self._window_storage_fraction = 0.0
 
     def _load_agent(
         self, planning_env: EdgeComputingEnv, checkpoint_args: dict[str, Any], device: str
@@ -553,8 +680,17 @@ class MonolithicScheme(BaseComparisonScheme):
     def maybe_plan(self, env: EdgeComputingEnv) -> None:
         if not env.needs_deployment_update:
             return
+        if env.current_time_minute > 1e-9:
+            self._finalize_window_feedback()
+        else:
+            self.agent.slow_agent.last_window_feedback = {}
+            self._reset_window_feedback()
         _copy_runtime_state(env, self._planning_env)
-        self._planning_env.deployment = np.zeros_like(env.deployment)
+        assert env.scenario is not None and env.deployment is not None
+        self._planning_env.deployment = collapse_deployment_for_monolithic(
+            env.scenario,
+            env.deployment,
+        )
         self._planning_env.current_requests = []
         self._planning_env.current_request = None
         monolithic_deployment = self.agent.slow_agent.plan_deployment(
@@ -567,6 +703,87 @@ class MonolithicScheme(BaseComparisonScheme):
             for stage in service.stages:
                 projected[service.service_id, stage.stage_id] = source
         env.apply_deployment(projected)
+        self._window_memory_fraction, self._window_storage_fraction = (
+            self.agent._deployment_resource_fractions(env)
+        )
+
+    def _finalize_window_feedback(self) -> None:
+        if self._window_weight <= 0.0:
+            self.agent.slow_agent.last_window_feedback = {}
+            self._reset_window_feedback()
+            return
+        ordered = sorted(self._window_latency_samples, key=lambda item: item[0])
+        cutoff = 0.95 * self._window_weight
+        cumulative = 0.0
+        p95 = ordered[-1][0]
+        for value, weight in ordered:
+            cumulative += weight
+            if cumulative >= cutoff:
+                p95 = value
+                break
+        mean_latency = sum(
+            value * weight for value, weight in self._window_latency_samples
+        ) / self._window_weight
+        self.agent.slow_agent.last_window_feedback = {
+            "avg_latency_s": float(mean_latency),
+            "p95_latency_s": float(p95),
+            "avg_penalty_latency_s": float(
+                self._window_penalty_latency_sum / self._window_weight
+            ),
+            "deadline_violation_rate": float(
+                self._window_deadline_violations / self._window_weight
+            ),
+            "invalid_action_rate": float(
+                self._window_invalid_actions / self._window_weight
+            ),
+            "max_node_compute_load": float(self._window_max_node_load),
+            "max_link_load": float(self._window_max_link_load),
+            "deployment_memory_fraction": float(self._window_memory_fraction),
+            "deployment_storage_fraction": float(self._window_storage_fraction),
+        }
+        self._reset_window_feedback()
+
+    def _reset_window_feedback(self) -> None:
+        self._window_latency_samples.clear()
+        self._window_penalty_latency_sum = 0.0
+        self._window_deadline_violations = 0.0
+        self._window_invalid_actions = 0.0
+        self._window_weight = 0.0
+        self._window_max_node_load = 0.0
+        self._window_max_link_load = 0.0
+
+    def observe_step(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        schedules: list[list[int]],
+        info: dict[str, Any],
+    ) -> None:
+        del schedules
+        for request, group_info in zip(requests, info.get("group_infos", [])):
+            weight = float(group_info.get("request_count", request.request_count))
+            latency = float(group_info["latency_s"])
+            self._window_latency_samples.append((latency, weight))
+            self._window_penalty_latency_sum += float(
+                group_info.get("penalty_latency_s", 0.0)
+            ) * weight
+            self._window_deadline_violations += float(
+                latency > float(request.deadline_s)
+            ) * weight
+            self._window_invalid_actions += float(
+                not bool(group_info.get("valid", False))
+            ) * weight
+            self._window_weight += weight
+        self._window_max_node_load = max(
+            self._window_max_node_load,
+            float(np.max(env.node_compute_load)),
+        )
+        finite_links = env.link_load[np.isfinite(env.link_load)]
+        if finite_links.size:
+            self._window_max_link_load = max(
+                self._window_max_link_load,
+                float(np.max(finite_links)),
+            )
 
     def adapt_requests(self, requests: list[TaskRequest]) -> list[TaskRequest]:
         return [adapt_request_for_monolithic_evaluation(request) for request in requests]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from edge_drl.comparison.types import SchemeDiagnostics
 from edge_drl.env.environment import EdgeComputingEnv
 from edge_drl.env.scenario import TaskRequest
@@ -21,3 +23,14 @@ class BaseComparisonScheme:
         self, env: EdgeComputingEnv, requests: list[TaskRequest]
     ) -> list[list[int]]:
         raise NotImplementedError
+
+    def observe_step(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        schedules: list[list[int]],
+        info: dict[str, Any],
+    ) -> None:
+        """Receive post-settlement feedback; legacy schemes intentionally ignore it."""
+
+        del env, requests, schedules, info

@@ -2304,7 +2304,7 @@ class FastSchedulingPPOAgent:
         processed_weight = 0.0
         total_weight = max(float(sum(request.request_count for request in requests)), 1.0)
 
-        for request in requests:
+        for request_index, request in enumerate(requests):
             partial: list[int] = []
             request_records: list[tuple[np.ndarray, np.ndarray, int, float, float]] = []
             request_costs: list[float] = []
@@ -2318,6 +2318,7 @@ class FastSchedulingPPOAgent:
                     kkt_link_sqrt=link_sqrt,
                     processed_request_weight=processed_weight,
                     total_request_weight=total_weight,
+                    remaining_requests=requests[request_index:],
                 )
                 mask = self._build_mask(env, request, stage_id, partial)
                 action, logprob, value = self.ppo.act(
@@ -2477,7 +2478,9 @@ class FastSchedulingPPOAgent:
         kkt_link_sqrt: np.ndarray | None = None,
         processed_request_weight: float = 0.0,
         total_request_weight: float = 1.0,
+        remaining_requests: list[TaskRequest] | tuple[TaskRequest, ...] | None = None,
     ) -> np.ndarray:
+        del remaining_requests
         assert env.scenario is not None
         prev_node = request.home_node if not partial_nodes else partial_nodes[-1]
         nodes = env.scenario.nodes
@@ -3584,6 +3587,13 @@ class HierarchicalPPOAgent:
         self.slow_agent.last_window_feedback = {}
         self.last_slow_window_metrics = {}
         self.fast_agent.pending_kkt_stage_costs.clear()
+        clear_batch_context = getattr(
+            self.fast_agent,
+            "clear_batch_reward_context",
+            None,
+        )
+        if clear_batch_context is not None:
+            clear_batch_context()
 
     def act(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> list[int]:
         self.maybe_update_deployment(env, deterministic=deterministic, record=record)

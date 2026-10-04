@@ -109,10 +109,12 @@ python .\run_comparison.py `
   --run-id $runId
 ```
 
-Train the Monolithic checkpoint separately before comparison.  The trainer
+Train the Monolithic checkpoint separately before comparison. The trainer
 inherits the Proposed checkpoint's physical seed, demand random streams, load
-strata, episode length, and temporal sampling by default; the only training
-structure change is the one-stage collapse:
+strata and weights, episode length, temporal sampling, and PPO controls by
+default. The service is collapsed to one stage; V4 then uses batch-level Fast
+credit and a remaining-demand observation so that the one-stage action still
+has valid sequential PPO semantics:
 
 ```powershell
 python .\train_monolithic.py `
@@ -135,9 +137,12 @@ seed, environment/request seed, load assignments, and trace hash for every
 episode so parity can be audited.
 
 Monolithic fixes NumPy and PyTorch initialization from the same master seed
-before constructing the policy.  Every update-boundary checkpoint also stores
-the model, optimizers, adaptive entropy state, Slow critic replay, Slow learning
-rate controller, load/demand/environment random streams, and global counters.
+before constructing the policy. Every resumable update-boundary checkpoint
+also stores the model, optimizers, adaptive entropy state, Slow critic replay,
+Slow learning rate controller, load/demand/environment random streams, and
+global counters. `best.pt` is an evaluation-only snapshot of the exact
+pre-update policy that produced its selecting rollout; resume from `latest.pt`,
+`last.pt`, or a periodic `update_XXXX.pt` checkpoint.
 If a run is interrupted after update 66 and 254 updates remain, resume into a
 new run directory as follows (`--updates` always means additional updates when
 `--load-checkpoint` is present):

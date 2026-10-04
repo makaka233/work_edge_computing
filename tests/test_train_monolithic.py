@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from train_monolithic import (
+    _agent_from_config,
     _format_duration,
     _monolithic_rollout_args,
     _resume_offsets,
@@ -12,7 +13,7 @@ from train_monolithic import (
     build_parser,
 )
 from edge_drl.comparison.trace import generate_comparison_trace
-from tests.comparison_helpers import tiny_scenario
+from tests.comparison_helpers import tiny_replay_env, tiny_scenario
 
 
 def test_monolithic_progress_cli_defaults_to_ten_seconds(monkeypatch) -> None:
@@ -56,6 +57,7 @@ def test_monolithic_rollout_inherits_slow_counterfactual_credit() -> None:
             "fast_controllable_latency_credit": True,
             "fast_oracle_beam_width": 16,
             "fast_oracle_candidates_per_stage": 4,
+            "slow_replica_ablation_samples": 2,
         },
         sampled_seconds_per_window=6,
         fast_counterfactual_credit_coef=0.45,
@@ -66,6 +68,7 @@ def test_monolithic_rollout_inherits_slow_counterfactual_credit() -> None:
     assert args.fast_controllable_latency_credit is True
     assert args.sampled_seconds_per_window == 6
     assert args.fast_oracle_diagnostic_requests == 0
+    assert args.slow_replica_ablation_samples == 2
 
 
 def test_monolithic_rollout_defaults_missing_slow_credit_to_zero() -> None:
@@ -76,6 +79,26 @@ def test_monolithic_rollout_defaults_missing_slow_credit_to_zero() -> None:
     )
 
     assert args.slow_counterfactual_credit_coef == 0.0
+    assert args.slow_replica_ablation_samples == 0
+
+
+def test_monolithic_agent_inherits_load_weights_and_slow_ablation() -> None:
+    env = tiny_replay_env()
+    env.reset()
+    agent = _agent_from_config(
+        env,
+        {
+            "fast_chain_context": "chain-kkt-v3",
+            "fast_load_balanced_updates": True,
+            "load_strata": "0.6:0.8,0.8:1.0,1.0:1.2,1.2:1.4",
+            "load_stratum_probabilities": "0.20,0.45,0.25,0.10",
+            "slow_replica_ablation_samples": 2,
+        },
+        "cpu",
+    )
+
+    assert agent.fast_agent.load_group_weights == (0.20, 0.45, 0.25, 0.10)
+    assert agent.window_replica_ablation_samples == 2
 
 
 def test_monolithic_resume_offsets_require_an_update_boundary() -> None:
