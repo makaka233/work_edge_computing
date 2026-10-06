@@ -66,10 +66,12 @@ def evaluate_scheme_episode(
         scheduling_start = time.perf_counter()
         schedules = scheme.schedule_batch(env, requests)
         scheduling_time += time.perf_counter() - scheduling_start
+        resource_weights = scheme.resource_weights(env, requests, schedules)
         settlement_start = time.perf_counter()
         _, _, _, info = env.step(
             schedules,
             represented_seconds=step_represented_seconds,
+            batch_resource_weights=resource_weights,
         )
         settlement_time += time.perf_counter() - settlement_start
         scheme.observe_step(env, requests, schedules, info)

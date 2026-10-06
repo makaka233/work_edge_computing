@@ -15,6 +15,9 @@ class ComputeDemand:
     # treats every demand passed to one call as concurrent; the environment
     # uses this field to make one call per chain phase.
     serial_phase: int = 0
+    # Optional policy-selected positive priority used only by the learned-share
+    # allocator.  KKT and equal-share deliberately ignore this field.
+    allocation_weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,7 @@ class LinkDemand:
     data_mb: float
     multiplicity: float = 1.0
     serial_phase: int = 0
+    allocation_weight: float = 1.0
 
 
 def allocate_compute_kkt(

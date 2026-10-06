@@ -24,6 +24,17 @@ class BaseComparisonScheme:
     ) -> list[list[int]]:
         raise NotImplementedError
 
+    def resource_weights(
+        self,
+        env: EdgeComputingEnv,
+        requests: list[TaskRequest],
+        schedules: list[list[int]],
+    ) -> list[list[float]] | None:
+        """Optional learned per-stage resource priorities for settlement."""
+
+        del env, requests, schedules
+        return None
+
     def observe_step(
         self,
         env: EdgeComputingEnv,

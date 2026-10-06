@@ -14,6 +14,11 @@ def parse_args() -> argparse.Namespace:
         help="Explicit separately trained Monolithic PPO checkpoint",
     )
     parser.add_argument(
+        "--unified-checkpoint",
+        default=None,
+        help="Explicit independently trained UnifiedPPO checkpoint",
+    )
+    parser.add_argument(
         "--monolithic-checkpoint-mode",
         choices=("fixed", "per-point"),
         default="fixed",
@@ -82,6 +87,7 @@ def main() -> None:
         phase2_validation_run=args.phase2_validation_run,
         monolithic_checkpoint=args.monolithic_checkpoint,
         monolithic_checkpoint_mode=args.monolithic_checkpoint_mode,
+        unified_checkpoint=args.unified_checkpoint,
         eval_seeds_override=None if args.eval_seeds is None else tuple(args.eval_seeds),
         scenario_families=None if args.scenario_families is None else tuple(args.scenario_families),
         sampled_seconds_per_window=args.sampled_seconds_per_window,

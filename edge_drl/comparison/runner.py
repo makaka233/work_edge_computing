@@ -27,6 +27,7 @@ from edge_drl.comparison.io import write_csv, write_json
 from edge_drl.comparison.metrics import evaluate_scheme_episode
 from edge_drl.comparison.monolithic import MonolithicScheme
 from edge_drl.comparison.proposed import ProposedScheme
+from edge_drl.comparison.unified import UnifiedPPOScheme
 from edge_drl.comparison.replay_env import TraceReplayEnv
 from edge_drl.comparison.scenario_transforms import formal_experiment_points, transform_scenario, transform_trace
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
@@ -43,6 +44,7 @@ AVAILABLE_SCHEMES = FORMAL_SCHEMES + (
     "PopularityDeploy",
     "FitDeploy",
     "UniformFirstFitDeploy",
+    "UnifiedPPO",
 )
 FORMAL_SCENARIO_FAMILIES = (
     "request_load",
@@ -98,6 +100,7 @@ def run_comparison(
     phase2_validation_run: str | Path | None = None,
     monolithic_checkpoint: str | Path | None = None,
     monolithic_checkpoint_mode: str = "fixed",
+    unified_checkpoint: str | Path | None = None,
     eval_seeds_override: tuple[int, ...] | None = None,
     scenario_families: tuple[str, ...] | None = None,
     sampled_seconds_per_window: int = 0,
@@ -111,6 +114,12 @@ def run_comparison(
             "Monolithic is trainable and requires --monolithic-checkpoint; "
             "it is never replaced by an optimization baseline"
         )
+    if "UnifiedPPO" in schemes and unified_checkpoint is None:
+        raise ValueError(
+            "UnifiedPPO is trainable and requires --unified-checkpoint"
+        )
+    if "UnifiedPPO" in schemes and not Path(str(unified_checkpoint)).is_file():
+        raise ValueError("--unified-checkpoint must name one checkpoint file")
     if monolithic_checkpoint_mode not in {"fixed", "per-point"}:
         raise ValueError("monolithic_checkpoint_mode must be 'fixed' or 'per-point'")
     if sampled_seconds_per_window < 0:
@@ -197,6 +206,7 @@ def run_comparison(
         "standard_phase_design": is_standard_design,
         "checkpoint": str(checkpoint_path),
         "monolithic_checkpoint": None if monolithic_checkpoint is None else str(monolithic_checkpoint),
+        "unified_checkpoint": None if unified_checkpoint is None else str(unified_checkpoint),
         "learning_checkpoint_protocol": (
             "fixed_across_scenario_sweeps"
             if monolithic_checkpoint_mode == "fixed"
@@ -224,6 +234,7 @@ def run_comparison(
             "PopularityDeploy": "fixed demand/capacity/locality placement with frozen Proposed Fast PPO and unchanged KKT settlement",
             "FitDeploy": "demand-only replica priority and ascending-node First-Fit placement, with coverage feasibility repair, frozen Proposed Fast PPO and unchanged KKT settlement",
             "UniformFirstFitDeploy": "equal-count stage replica allocation and ascending-node First-Fit placement with coverage feasibility repair, frozen Proposed Fast PPO and unchanged KKT settlement",
+            "UnifiedPPO": "one shared PPO actor-critic for deployment, routing, and learned resource priorities; no KKT optimization",
         },
     }
     write_json(output / "metadata.json", metadata)
@@ -270,7 +281,11 @@ def run_comparison(
             )
             for scheme_name in schemes:
                 for repeat in range(routing_repeats):
-                    env = TraceReplayEnv(config, scenario, trace)
+                    # Some schemes intentionally use a different resource
+                    # settlement rule.  Give every scheme an independent
+                    # config so that one adapter cannot contaminate the next
+                    # scheme in the same paired comparison.
+                    env = TraceReplayEnv(deepcopy(config), scenario, trace)
                     env.reset()
                     routing_seed = request_seed + 10_000 * (repeat + 1)
                     try:
@@ -282,6 +297,7 @@ def run_comparison(
                             device=device,
                             monolithic_checkpoint=monolithic_checkpoint,
                             monolithic_checkpoint_mode=monolithic_checkpoint_mode,
+                            unified_checkpoint=unified_checkpoint,
                             point=point,
                             learned_fast_deterministic=learned_fast_eval_mode == "deterministic",
                         )
@@ -404,6 +420,7 @@ def _make_scheme(
     device: str,
     monolithic_checkpoint: str | Path | None = None,
     monolithic_checkpoint_mode: str = "fixed",
+    unified_checkpoint: str | Path | None = None,
     point: ExperimentPoint | None = None,
     learned_fast_deterministic: bool = True,
 ):
@@ -451,6 +468,14 @@ def _make_scheme(
             resolved,
             device=device,
             fast_deterministic=learned_fast_deterministic,
+        )
+    if name == "UnifiedPPO":
+        assert unified_checkpoint is not None
+        return UnifiedPPOScheme(
+            env,
+            unified_checkpoint,
+            device=device,
+            deterministic=learned_fast_deterministic,
         )
     raise ValueError(name)
 

@@ -53,8 +53,8 @@ Configuration is defined by the Python entrypoints and checkpoint metadata;
 the former documentation-only YAML files have been removed. Use each
 entrypoint's `--help` to inspect supported options.
 
-Current entrypoints are `train_dual_ppo.py`, `train_monolithic.py`, and
-`run_comparison.py`. Reusable analysis tools live in `scripts/`:
+Current entrypoints are `train_dual_ppo.py`, `train_monolithic.py`,
+`train_unified_ppo.py`, and `run_comparison.py`. Reusable analysis tools live in `scripts/`:
 `analyze_convergence.py` (update summaries), `plot_training_run.py` (update
 diagnostics), `plot_rollout_training.py` (rollout curves),
 `plot_proposed_monolithic_results.py` (episode and two-scheme curves), and
@@ -65,18 +65,28 @@ removed; they remain recoverable from Git tag
 `backup-before-comparison-redesign-20260904`. Training outputs, checkpoints,
 paper sources, and checkpoint compatibility code are retained.
 
-The comparison runner supports Proposed, separately trained Monolithic, a
-hybrid using Proposed Slow deployment with algorithmic request scheduling, and
-a fully algorithmic deployment and scheduling scheme. The last two share the
-same batch-aware serial path scheduler. Archived experiment outputs are retained.
+The comparison runner also supports `UnifiedPPO`, an independently trained
+single actor-critic that jointly chooses staged deployment, per-request routing,
+and independent continuous compute/link priorities. It does not use the KKT optimizer: selected
+priorities are normalized to the available capacity by `learned-share`.
+The current v3 uses live per-batch resource ledgers, exact telescoping latency
+increments and causal return-to-go, conditional action heads, and one centralized
+value network/optimizer. Checkpoints from v1/v2 are preserved but cannot resume
+the changed architecture. Archived experiment outputs are retained.
+This UnifiedPPO comparison attempt is archived as unsuccessful; see
+`docs/FAILED_UNIFIED_PPO_COMPARISON.md` for the status and evidence limits.
 
 - `edge_drl/env/scenario.py`: realistic synthetic MEC scenario generator.
 - `edge_drl/env/environment.py`: event-driven environment and action masks.
 - `edge_drl/allocators/kkt.py`: KKT sqrt-rule resource allocator.
+- `edge_drl/allocators/learned_share.py`: feasibility-only capacity normalization for learned priorities.
 - `edge_drl/agents/hierarchical.py`: slow greedy deployment and fast greedy scheduler baseline.
 - `edge_drl/agents/drl.py`: trainable hierarchical dual-agent PPO scaffold.
+- `edge_drl/agents/unified.py`: one-policy end-to-end PPO comparison agent.
+- `edge_drl/models/unified_ppo.py`: mixed categorical/Beta PPO, isolated from Proposed.
 - `edge_drl/models/ppo.py`: masked categorical PPO core, following the rollout-memory style used by DRL-AC-Allocation.
 - `train_dual_ppo.py`: slow deployment PPO + fast scheduling PPO training entrypoint.
+- `train_unified_ppo.py`: independently trains the single-policy, no-KKT comparison.
 - `tests/test_env_smoke.py`: KKT and environment smoke tests.
 - `tests/test_dual_ppo_smoke.py`: dual-agent PPO rollout/update tests.
 

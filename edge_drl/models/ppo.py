@@ -1303,6 +1303,10 @@ class PPOAgent:
                 "combined_advantage_std": 0.0,
                 "explained_variance": 0.0,
                 "post_explained_variance": 0.0,
+                "optimizer_steps": 0.0,
+                "minibatches_completed": 0.0,
+                "minibatches_planned": 0.0,
+                "samples_seen_fraction": 0.0,
             }
         if not np.isfinite(auxiliary_advantage_coef) or auxiliary_advantage_coef < 0.0:
             raise ValueError("auxiliary_advantage_coef must be finite and non-negative")
@@ -1453,6 +1457,8 @@ class PPOAgent:
         optimizer_steps = 0
         epochs_completed = 0
         kl_early_stop = False
+        minibatches_completed = 0
+        samples_seen = np.zeros(n, dtype=bool)
         for epoch_idx in range(self.k_epochs):
             order = np.random.permutation(n)
             approx_kls: list[float] = []
@@ -1503,6 +1509,8 @@ class PPOAgent:
                 self._clip_policy_gradients()
                 self.optimizer.step()
                 optimizer_steps += 1
+                minibatches_completed += 1
+                samples_seen[idx] = True
                 approx_kls.append(float(approx_kl.item()))
                 last_metrics = {
                     "loss": float(loss.item()),
@@ -1568,6 +1576,10 @@ class PPOAgent:
         last_metrics.update(self._buffer_policy_diagnostics(actions_np, old_logprobs_np, weights_np))
         last_metrics["epochs_completed"] = float(epochs_completed)
         last_metrics["kl_early_stop"] = float(kl_early_stop)
+        last_metrics["optimizer_steps"] = float(optimizer_steps)
+        last_metrics["minibatches_completed"] = float(minibatches_completed)
+        last_metrics["minibatches_planned"] = float(self.k_epochs * batches_per_epoch)
+        last_metrics["samples_seen_fraction"] = float(np.mean(samples_seen))
         self.buffer.clear()
         return last_metrics
 

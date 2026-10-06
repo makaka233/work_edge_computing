@@ -7,6 +7,10 @@ import numpy as np
 
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
 from edge_drl.allocators.equal_share import allocate_compute_equal_share, allocate_link_equal_share
+from edge_drl.allocators.learned_share import (
+    allocate_compute_learned_share,
+    allocate_link_learned_share,
+)
 from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_realistic_scenario, generate_request
 
 
@@ -189,6 +193,92 @@ def _allocate_serial_link_equal_share(
     return delays, externalities
 
 
+def _compute_learned_share_externality_delays(
+    demands: list[ComputeDemand], capacities: np.ndarray
+) -> dict[str, float]:
+    """Per-request externality under policy-priority proportional sharing."""
+
+    result: dict[str, float] = {}
+    by_node: dict[int, list[ComputeDemand]] = {}
+    for demand in demands:
+        if demand.compute_gcycles <= 0.0:
+            result[demand.demand_id] = 0.0
+        else:
+            by_node.setdefault(demand.node_id, []).append(demand)
+    for node_id, grouped in by_node.items():
+        capacity = max(float(capacities[node_id]), 1e-9)
+        for demand in grouped:
+            own_weight = max(float(demand.allocation_weight), 1e-9)
+            other_cost = sum(
+                other.multiplicity
+                * other.compute_gcycles
+                / max(float(other.allocation_weight), 1e-9)
+                for other in grouped
+                if other.demand_id != demand.demand_id
+            )
+            result[demand.demand_id] = float(own_weight * other_cost / capacity)
+    return result
+
+
+def _link_learned_share_externality_delays(
+    demands: list[LinkDemand], capacities: np.ndarray
+) -> dict[str, float]:
+    """Per-request externality under learned link priorities."""
+
+    result: dict[str, float] = {}
+    by_link: dict[tuple[int, int], list[LinkDemand]] = {}
+    for demand in demands:
+        if demand.src_node == demand.dst_node or demand.data_mb <= 0.0:
+            result[demand.demand_id] = 0.0
+        else:
+            by_link.setdefault((demand.src_node, demand.dst_node), []).append(demand)
+    for (src, dst), grouped in by_link.items():
+        capacity = max(float(capacities[src, dst]), 1e-9)
+        for demand in grouped:
+            own_weight = max(float(demand.allocation_weight), 1e-9)
+            other_cost = sum(
+                other.multiplicity
+                * other.data_mb
+                / max(float(other.allocation_weight), 1e-9)
+                for other in grouped
+                if other.demand_id != demand.demand_id
+            )
+            result[demand.demand_id] = float(own_weight * other_cost / capacity)
+    return result
+
+
+def _allocate_serial_compute_learned_share(
+    demands: list[ComputeDemand], capacities: np.ndarray
+) -> tuple[dict[str, float], dict[str, float]]:
+    delays: dict[str, float] = {}
+    externalities: dict[str, float] = {}
+    by_phase: dict[int, list[ComputeDemand]] = {}
+    for demand in demands:
+        by_phase.setdefault(int(demand.serial_phase), []).append(demand)
+    for phase in sorted(by_phase):
+        grouped = by_phase[phase]
+        _, phase_delays, _ = allocate_compute_learned_share(grouped, capacities)
+        delays.update(phase_delays)
+        externalities.update(_compute_learned_share_externality_delays(grouped, capacities))
+    return delays, externalities
+
+
+def _allocate_serial_link_learned_share(
+    demands: list[LinkDemand], capacities: np.ndarray
+) -> tuple[dict[str, float], dict[str, float]]:
+    delays: dict[str, float] = {}
+    externalities: dict[str, float] = {}
+    by_phase: dict[int, list[LinkDemand]] = {}
+    for demand in demands:
+        by_phase.setdefault(int(demand.serial_phase), []).append(demand)
+    for phase in sorted(by_phase):
+        grouped = by_phase[phase]
+        _, phase_delays, _ = allocate_link_learned_share(grouped, capacities)
+        delays.update(phase_delays)
+        externalities.update(_link_learned_share_externality_delays(grouped, capacities))
+    return delays, externalities
+
+
 def _daily_arrival_factor(minute_of_day: float) -> float:
     morning_peak = np.exp(-0.5 * ((minute_of_day - 9 * 60) / 105.0) ** 2)
     lunch_peak = np.exp(-0.5 * ((minute_of_day - 13 * 60) / 90.0) ** 2)
@@ -305,10 +395,15 @@ class EdgeEnvConfig:
             raise ValueError("wireless_uplink_mbps must be positive.")
         if self.radio_rtt_ms < 0:
             raise ValueError("radio_rtt_ms must be non-negative.")
-        if self.compute_allocation_mode not in {"kkt", "equal-share"}:
-            raise ValueError("compute_allocation_mode must be 'kkt' or 'equal-share'.")
-        if self.link_allocation_mode not in {"kkt", "equal-share"}:
-            raise ValueError("link_allocation_mode must be 'kkt' or 'equal-share'.")
+        allocation_modes = {"kkt", "equal-share", "learned-share"}
+        if self.compute_allocation_mode not in allocation_modes:
+            raise ValueError(
+                "compute_allocation_mode must be 'kkt', 'equal-share', or 'learned-share'."
+            )
+        if self.link_allocation_mode not in allocation_modes:
+            raise ValueError(
+                "link_allocation_mode must be 'kkt', 'equal-share', or 'learned-share'."
+            )
 
 
 class EdgeComputingEnv:
@@ -474,6 +569,8 @@ class EdgeComputingEnv:
         batch_stage_nodes: list[list[int] | tuple[int, ...] | np.ndarray],
         *,
         represented_seconds: float = 1.0,
+        batch_resource_weights: list[list[float] | tuple[float, ...] | np.ndarray] | None = None,
+        batch_link_resource_weights: list[list[float] | tuple[float, ...] | np.ndarray] | None = None,
     ) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
         """Settle one sampled second that may represent a longer logical interval."""
 
@@ -486,7 +583,12 @@ class EdgeComputingEnv:
         if len(schedules) != len(requests):
             raise ValueError(f"expected {len(requests)} request schedules, got {len(schedules)}")
 
-        group_infos = self.evaluate_batch_schedules(requests, schedules)
+        group_infos = self.evaluate_batch_schedules(
+            requests,
+            schedules,
+            batch_resource_weights=batch_resource_weights,
+            batch_link_resource_weights=batch_link_resource_weights,
+        )
         migration_cost = self.last_migration_cost
         migration_penalty = self.config.migration_cost_weight * migration_cost
         self.last_migration_cost = 0.0
@@ -602,6 +704,9 @@ class EdgeComputingEnv:
         self,
         requests: list[TaskRequest],
         batch_stage_nodes: list[list[int] | tuple[int, ...] | np.ndarray],
+        *,
+        batch_resource_weights: list[list[float] | tuple[float, ...] | np.ndarray] | None = None,
+        batch_link_resource_weights: list[list[float] | tuple[float, ...] | np.ndarray] | None = None,
     ) -> list[dict[str, Any]]:
         """Jointly allocate compute and links for all request groups in one second."""
 
@@ -610,12 +715,28 @@ class EdgeComputingEnv:
         assert self.deployment is not None
         if len(requests) != len(batch_stage_nodes):
             raise ValueError("requests and batch_stage_nodes must have the same length")
+        if batch_resource_weights is not None and len(requests) != len(batch_resource_weights):
+            raise ValueError("requests and batch_resource_weights must have the same length")
+        if batch_link_resource_weights is not None and len(requests) != len(batch_link_resource_weights):
+            raise ValueError("requests and batch_link_resource_weights must have the same length")
 
         prepared: list[dict[str, Any]] = []
         all_compute_demands: list[ComputeDemand] = []
         all_link_demands: list[LinkDemand] = []
         for group_idx, (request, stage_nodes) in enumerate(zip(requests, batch_stage_nodes)):
-            group = self._prepare_group_demands(group_idx, request, stage_nodes)
+            resource_weights = (
+                None
+                if batch_resource_weights is None
+                else batch_resource_weights[group_idx]
+            )
+            group = self._prepare_group_demands(
+                group_idx,
+                request,
+                stage_nodes,
+                stage_allocation_weights=resource_weights,
+                stage_link_allocation_weights=(None if batch_link_resource_weights is None
+                                               else batch_link_resource_weights[group_idx]),
+            )
             prepared.append(group)
             all_compute_demands.extend(group["joint_compute_demands"])
             all_link_demands.extend(group["joint_link_demands"])
@@ -631,21 +752,21 @@ class EdgeComputingEnv:
         finite = np.isfinite(link_capacity)
         link_capacity[finite] *= np.clip(1.0 - 0.75 * self.link_load[finite], 0.10, 1.0)
 
-        compute_allocator = (
-            _allocate_serial_compute_kkt
-            if self.config.compute_allocation_mode == "kkt"
-            else _allocate_serial_compute_equal_share
-        )
+        compute_allocator = {
+            "kkt": _allocate_serial_compute_kkt,
+            "equal-share": _allocate_serial_compute_equal_share,
+            "learned-share": _allocate_serial_compute_learned_share,
+        }[self.config.compute_allocation_mode]
         joint_compute_delays, joint_compute_externalities = compute_allocator(
             all_compute_demands, node_capacity
         )
         link_allocation_failed = False
         try:
-            link_allocator = (
-                _allocate_serial_link_kkt
-                if self.config.link_allocation_mode == "kkt"
-                else _allocate_serial_link_equal_share
-            )
+            link_allocator = {
+                "kkt": _allocate_serial_link_kkt,
+                "equal-share": _allocate_serial_link_equal_share,
+                "learned-share": _allocate_serial_link_learned_share,
+            }[self.config.link_allocation_mode]
             joint_link_delays, joint_link_externalities = link_allocator(
                 all_link_demands, link_capacity
             )
@@ -724,6 +845,9 @@ class EdgeComputingEnv:
         group_idx: int,
         request: TaskRequest,
         stage_nodes: list[int] | tuple[int, ...] | np.ndarray,
+        *,
+        stage_allocation_weights: list[float] | tuple[float, ...] | np.ndarray | None = None,
+        stage_link_allocation_weights: list[float] | tuple[float, ...] | np.ndarray | None = None,
     ) -> dict[str, Any]:
         assert self.scenario is not None
         assert self.deployment is not None
@@ -731,6 +855,28 @@ class EdgeComputingEnv:
         valid = True
         violations: list[str] = []
         stage_count = len(request.stage_compute_gcycles)
+        if stage_allocation_weights is None:
+            allocation_weights = [1.0] * stage_count
+        else:
+            raw_weights = np.asarray(stage_allocation_weights, dtype=np.float64)
+            if raw_weights.shape == (stage_count, 2):
+                if stage_link_allocation_weights is not None:
+                    raise ValueError("cannot combine paired weights with separate link weights")
+                stage_link_allocation_weights = raw_weights[:, 1]
+                raw_weights = raw_weights[:, 0]
+            if raw_weights.shape != (stage_count,):
+                raise ValueError("resource weights must be stage scalars or (compute, incoming-link) pairs")
+            allocation_weights = [float(value) for value in raw_weights]
+            if len(allocation_weights) != stage_count:
+                raise ValueError("resource weight count must equal the request stage count")
+            if any(not np.isfinite(value) or value <= 0.0 for value in allocation_weights):
+                raise ValueError("resource weights must be finite and positive")
+        link_allocation_weights = (allocation_weights if stage_link_allocation_weights is None
+                                   else [float(value) for value in stage_link_allocation_weights])
+        if len(link_allocation_weights) != stage_count:
+            raise ValueError("link resource weight count must equal the request stage count")
+        if any(not np.isfinite(value) or value <= 0.0 for value in link_allocation_weights):
+            raise ValueError("link resource weights must be finite and positive")
         if len(nodes) != stage_count:
             valid = False
             violations.append("stage node count mismatch")
@@ -751,6 +897,7 @@ class EdgeComputingEnv:
                 node_id,
                 request.stage_compute_gcycles[stage_id],
                 serial_phase=2 * stage_id + 1,
+                allocation_weight=allocation_weights[stage_id],
             )
             for stage_id, node_id in enumerate(nodes)
         ]
@@ -764,6 +911,7 @@ class EdgeComputingEnv:
             data_mb: float,
             *,
             serial_phase: int,
+            allocation_weight: float,
         ) -> None:
             nonlocal valid
             if src_node == dst_node:
@@ -784,6 +932,7 @@ class EdgeComputingEnv:
                         hop_dst,
                         data_mb,
                         serial_phase=serial_phase,
+                        allocation_weight=allocation_weight,
                     )
                 )
                 propagation_s += float(self.scenario.propagation_ms[hop_src, hop_dst]) / 1000.0
@@ -796,6 +945,7 @@ class EdgeComputingEnv:
                 nodes[0],
                 request.input_mb,
                 serial_phase=0,
+                allocation_weight=link_allocation_weights[0],
             )
         for stage_id in range(max(len(nodes) - 1, 0)):
             if nodes[stage_id] != nodes[stage_id + 1]:
@@ -805,6 +955,7 @@ class EdgeComputingEnv:
                     nodes[stage_id + 1],
                     request.stage_output_mb[stage_id],
                     serial_phase=2 * stage_id + 2,
+                    allocation_weight=link_allocation_weights[stage_id + 1],
                 )
 
         count = float(request.request_count)
@@ -815,6 +966,7 @@ class EdgeComputingEnv:
                 demand.compute_gcycles,
                 multiplicity=count,
                 serial_phase=demand.serial_phase,
+                allocation_weight=demand.allocation_weight,
             )
             for demand in compute_demands
         ]
@@ -826,6 +978,7 @@ class EdgeComputingEnv:
                 demand.data_mb,
                 multiplicity=count,
                 serial_phase=demand.serial_phase,
+                allocation_weight=demand.allocation_weight,
             )
             for demand in link_demands
         ]
