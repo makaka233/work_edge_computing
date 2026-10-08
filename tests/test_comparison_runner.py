@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import torch
+import csv
 
 from edge_drl.comparison.checkpoint import load_checkpoint_configuration
 from edge_drl.comparison.metrics import evaluate_scheme_episode
@@ -8,6 +9,7 @@ from edge_drl.comparison.scheme import BaseComparisonScheme
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
 from edge_drl.comparison.types import ExperimentPoint
 from edge_drl.comparison.runner import (
+    _write_incremental,
     _require_phase2_validation,
     _resolve_monolithic_checkpoint,
     configured_phase_design,
@@ -67,6 +69,46 @@ def test_comparison_sampling_matches_training_weighted_settlement() -> None:
     assert env.metrics["time_steps"] == pytest.approx(600.0)
     assert env.current_time_minute == pytest.approx(10.0)
     assert result.invalid_action_rate == 0.0
+
+
+@pytest.mark.parametrize("sampled_seconds_per_window", [0, 6])
+def test_service_latency_rows_reconcile_with_overall_latency(sampled_seconds_per_window) -> None:
+    env = tiny_replay_env()
+    rows = []
+    result = evaluate_scheme_episode(
+        scheme=FixedScheme(),
+        env=env,
+        point=ExperimentPoint("request_load", 1.0, "nominal"),
+        eval_seed=20,
+        routing_repeat=0,
+        sampled_seconds_per_window=sampled_seconds_per_window,
+        service_latency_rows=rows,
+    )
+    assert {row["service_id"] for row in rows} == {0, 1}
+    assert {row["service_name"] for row in rows} == {"two-stage", "three-stage"}
+    assert sum(row["request_count"] for row in rows) == pytest.approx(result.request_count)
+    assert sum(row["total_latency_s"] for row in rows) == pytest.approx(result.episode_total_latency_s)
+    observed = [row for row in rows if row["request_count"] > 0]
+    assert all(row["mean_latency_ms"] is None for row in rows if row["request_count"] == 0)
+    assert (
+        sum(row["mean_latency_ms"] * row["request_count"] for row in observed)
+        / sum(row["request_count"] for row in observed)
+    ) == pytest.approx(result.mean_latency_ms)
+
+
+def test_service_latency_diagnostic_csv_is_written_separately(tmp_path) -> None:
+    rows = [{
+        "scheme": "Proposed", "scenario_family": "request_load", "scenario_value": 1.0,
+        "eval_seed": 20, "routing_repeat": 0, "service_id": 1,
+        "service_name": "three-stage", "request_count": 12.0,
+        "total_latency_s": 6.0, "mean_latency_ms": 500.0,
+    }]
+    _write_incremental(tmp_path, [], [], [], [], rows)
+    with (tmp_path / "diagnostics" / "service_latency.csv").open(encoding="utf-8", newline="") as handle:
+        logged = list(csv.DictReader(handle))
+    assert len(logged) == 1
+    assert logged[0]["service_id"] == "1"
+    assert float(logged[0]["mean_latency_ms"]) == 500.0
 
 
 def test_statistics_use_seed_rows_and_paired_student_t_intervals() -> None:

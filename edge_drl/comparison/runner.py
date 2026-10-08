@@ -181,6 +181,7 @@ def run_comparison(
     failure_rows: list[dict[str, Any]] = []
     trace_manifest: list[dict[str, Any]] = []
     solver_diagnostics: list[dict[str, Any]] = []
+    service_latency_rows: list[dict[str, Any]] = []
 
     metadata = {
         "run_id": selected_run_id,
@@ -320,6 +321,7 @@ def run_comparison(
                             eval_seed=eval_seed,
                             routing_repeat=repeat,
                             sampled_seconds_per_window=sampled_seconds_per_window,
+                            service_latency_rows=service_latency_rows,
                         )
                         row = result.to_dict()
                         row.update(
@@ -372,13 +374,13 @@ def run_comparison(
                         }
                         failure_rows.append(failure)
                         raw_rows.append(failure)
-                    _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
+                    _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics, service_latency_rows)
                     print(
                         f"[{scheme_name}] {point.label} seed={eval_seed} repeat={repeat} "
                         f"status={'failed' if failure_rows and failure_rows[-1].get('scheme') == scheme_display and failure_rows[-1].get('trace_hash') == trace.trace_hash else 'complete'}"
                     )
 
-    _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
+    _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics, service_latency_rows)
     if (
         phase == 2
         and is_standard_design
@@ -522,7 +524,7 @@ def _resolve_monolithic_checkpoint(
     raise FileNotFoundError(candidate)
 
 
-def _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics) -> None:
+def _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics, service_latency_rows) -> None:
     families = ("request_load", "compute_capacity", "wired_bandwidth", "intermediate_data", "stage_heterogeneity")
     for family in families:
         write_csv(output / "raw" / f"{family}.csv", [row for row in raw_rows if row.get("scenario_family") == family])
@@ -539,3 +541,4 @@ def _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_di
     )
     write_csv(output / "diagnostics" / "trace_manifest.csv", trace_manifest)
     write_csv(output / "diagnostics" / "solver.csv", solver_diagnostics)
+    write_csv(output / "diagnostics" / "service_latency.csv", service_latency_rows)

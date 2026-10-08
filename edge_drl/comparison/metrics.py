@@ -16,6 +16,7 @@ def evaluate_scheme_episode(
     eval_seed: int,
     routing_repeat: int,
     sampled_seconds_per_window: int = 0,
+    service_latency_rows: list[dict] | None = None,
 ) -> EpisodeResult:
     if sampled_seconds_per_window < 0:
         raise ValueError("sampled_seconds_per_window must be >= 0")
@@ -27,6 +28,8 @@ def evaluate_scheme_episode(
     invalid = 0.0
     total_requests = 0.0
     total_latency = 0.0
+    service_request_counts: dict[int, float] = {}
+    service_total_latency_s: dict[int, float] = {}
     replica_sum = 0.0
     used_node_sum = 0.0
     used_replica_rate_sum = 0.0
@@ -87,6 +90,9 @@ def evaluate_scheme_episode(
             request_weights.append(weight)
             total_requests += weight
             total_latency += latency * weight
+            service_id = int(request.service_id)
+            service_request_counts[service_id] = service_request_counts.get(service_id, 0.0) + weight
+            service_total_latency_s[service_id] = service_total_latency_s.get(service_id, 0.0) + latency * weight
             components["compute"] += float(group_info["compute_delay_s"]) * weight
             components["link"] += float(group_info["link_delay_s"]) * weight
             components["access"] += float(group_info["access_delay_s"]) * weight
@@ -135,6 +141,27 @@ def evaluate_scheme_episode(
     mean_latency = total_latency / max(total_requests, 1.0)
     p95 = _weighted_percentile(latencies, request_weights, 95.0)
     assert env.scenario is not None
+    if service_latency_rows is not None:
+        for service in env.scenario.services:
+            service_id = int(service.service_id)
+            count = service_request_counts.get(service_id, 0.0)
+            latency_total = service_total_latency_s.get(service_id, 0.0)
+            service_latency_rows.append(
+                {
+                    "scheme": scheme.name,
+                    "scenario_family": point.family,
+                    "scenario_value": point.value,
+                    "scenario_label": point.label,
+                    "eval_seed": int(eval_seed),
+                    "routing_repeat": int(routing_repeat),
+                    "trace_hash": env._comparison_trace.trace_hash,
+                    "service_id": service_id,
+                    "service_name": service.name,
+                    "request_count": count,
+                    "total_latency_s": latency_total,
+                    "mean_latency_ms": latency_total / count * 1000.0 if count > 0 else None,
+                }
+            )
     stage_count = sum(len(service.stages) for service in env.scenario.services)
     return EpisodeResult(
         scheme=scheme.name,
