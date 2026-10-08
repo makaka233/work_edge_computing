@@ -1,6 +1,6 @@
-# HEFTFast comparison scheme
+# HEFT comparison scheme
 
-HEFTFast keeps the frozen Proposed Slow deployment policy and replaces only the
+HEFT keeps the frozen Proposed Slow deployment policy and replaces only the
 Fast PPO scheduler with a HEFT-style heterogeneous list scheduler. It is an
 opt-in exploratory comparison scheme; the existing four-scheme formal defaults
 remain unchanged.
@@ -32,7 +32,7 @@ The first evaluation is stored at
 `results/comparison/heft_fast_nominal_s6_20260929`. It uses phase 1, seed 2026,
 nominal request load, ten logical minutes and six sampled settlement seconds.
 
-| Metric | Proposed | HEFTFast | Proposed reduction |
+| Metric | Proposed | HEFT | Proposed reduction |
 |---|---:|---:|---:|
 | Mean latency, ms | 481.1421 | 526.3970 | 8.60% |
 | P95 latency, ms | 774.8621 | 838.9117 | 7.63% |

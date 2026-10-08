@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import argparse
 
-from edge_drl.comparison.runner import AVAILABLE_SCHEMES, FORMAL_SCENARIO_FAMILIES, FORMAL_SCHEMES, run_comparison
+from edge_drl.comparison.runner import ACCEPTED_SCHEMES, FORMAL_SCENARIO_FAMILIES, FORMAL_SCHEMES, run_comparison
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run isolated IEEE scheme comparisons")
     parser.add_argument("--checkpoint", required=True, help="Explicit Proposed best.pt checkpoint")
     parser.add_argument(
-        "--monolithic-checkpoint",
+        "--mso-checkpoint", "--monolithic-checkpoint",
+        dest="monolithic_checkpoint",
         default=None,
-        help="Explicit separately trained Monolithic PPO checkpoint",
+        help="Explicit separately trained MSO PPO checkpoint",
     )
     parser.add_argument(
         "--unified-checkpoint",
@@ -19,11 +20,12 @@ def parse_args() -> argparse.Namespace:
         help="Explicit independently trained UnifiedPPO checkpoint",
     )
     parser.add_argument(
-        "--monolithic-checkpoint-mode",
+        "--mso-checkpoint-mode", "--monolithic-checkpoint-mode",
+        dest="monolithic_checkpoint_mode",
         choices=("fixed", "per-point"),
         default="fixed",
         help=(
-            "Use one frozen Monolithic checkpoint across every scenario (formal default), "
+            "Use one frozen MSO checkpoint across every scenario (formal default), "
             "or explicitly opt into exploratory per-point checkpoints"
         ),
     )
@@ -36,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Required for Phase 3; path to a successfully completed Phase 2 result directory",
     )
-    parser.add_argument("--schemes", nargs="+", choices=AVAILABLE_SCHEMES, default=list(FORMAL_SCHEMES))
+    parser.add_argument("--schemes", nargs="+", choices=ACCEPTED_SCHEMES, default=list(FORMAL_SCHEMES))
     parser.add_argument(
         "--eval-seeds",
         nargs="+",

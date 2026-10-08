@@ -606,7 +606,7 @@ def _copy_runtime_state(source: EdgeComputingEnv, target: EdgeComputingEnv) -> N
     target.last_load_update_minute = source.last_load_update_minute
 
 
-class MonolithicScheme(BaseComparisonScheme):
+class MSOScheme(BaseComparisonScheme):
     """DRL counterpart whose only structural change is stage aggregation.
 
     PPO architecture, optimizer, reward path, two time scales, and KKT
@@ -614,7 +614,7 @@ class MonolithicScheme(BaseComparisonScheme):
     trained checkpoint is mandatory; no MILP or heuristic is used here.
     """
 
-    name = "Monolithic"
+    name = "Monolithic Service Orchestration (MSO)"
 
     def __init__(
         self,
@@ -823,3 +823,6 @@ class MonolithicScheme(BaseComparisonScheme):
             expand_monolithic_schedule(schedule, len(request.stage_compute_gcycles))
             for request, schedule in zip(requests, compact_schedules)
         ]
+
+
+MonolithicScheme = MSOScheme

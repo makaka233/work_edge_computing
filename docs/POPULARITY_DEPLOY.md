@@ -1,11 +1,11 @@
-# PopularityDeploy：算法部署、Proposed 调度的部署侧对照
+# DARP：算法部署、Proposed 调度的部署侧对照
 
-`PopularityDeploy` 用于回答一个单独的问题：Proposed 的 Slow PPO 学习式部署是否优于固定算法部署？
+`DARP` 用于回答一个单独的问题：Proposed 的 Slow PPO 学习式部署是否优于固定算法部署？
 
 ## 唯一改变
 
 - **Proposed**：Slow PPO 部署 + Fast PPO 调度 + KKT 连续资源分配。
-- **PopularityDeploy**：热度/容量/局部性算法部署 + 同一个冻结的 Fast PPO + 同一个 KKT 连续资源分配。
+- **DARP**：热度/容量/局部性算法部署 + 同一个冻结的 Fast PPO + 同一个 KKT 连续资源分配。
 
 需求轨迹、物理网络、随机种子、Fast checkpoint、KKT 结算和指标计算均保持一致。该方案不训练，也不读取未来请求或评估结果。
 
@@ -19,7 +19,7 @@
 $runName = "popularity_deploy_phase1_s6_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 python .\run_comparison.py `
   --checkpoint ".\runs\global_incremental_cf_s6_u180_20260903_192623\checkpoints\best.pt" `
-  --schemes Proposed PopularityDeploy `
+  --schemes Proposed DARP `
   --phase 1 `
   --sampled-seconds-per-window 6 `
   --device cuda `
@@ -28,13 +28,13 @@ python .\run_comparison.py `
 
 ## 解释边界
 
-如果 `PopularityDeploy` 弱于 Proposed，差值支持“学习式部署在冻结的学习式调度之上仍有贡献”。它不能单独证明所有场景下都更优；正式论文结论仍需固定规则后的五场景、多种子置信区间。
+如果 `DARP` 弱于 Proposed，差值支持“学习式部署在冻结的学习式调度之上仍有贡献”。它不能单独证明所有场景下都更优；正式论文结论仍需固定规则后的五场景、多种子置信区间。
 
 ## 固定规则后的快速预检
 
 目录：`results/comparison/popularity_deploy_phase1_s6_20260929`
 
-| 指标 | Proposed | PopularityDeploy | Proposed 相对降低 |
+| 指标 | Proposed | DARP | Proposed 相对降低 |
 |---|---:|---:|---:|
 | 平均时延 | 481.142 ms | 516.247 ms | 6.80% |
 | P95 时延 | 774.862 ms | 873.943 ms | 11.34% |

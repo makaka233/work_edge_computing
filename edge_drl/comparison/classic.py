@@ -121,10 +121,10 @@ class HEFTScheduler:
         return schedules
 
 
-class HEFTFastScheme(BaseComparisonScheme):
+class HEFTScheme(BaseComparisonScheme):
     """Frozen Proposed Slow policy with HEFT-style Fast scheduling."""
 
-    name = "HEFTFast"
+    name = "Heterogeneous Earliest Finish Time Scheduling (HEFT)"
 
     def __init__(self, env, checkpoint_path: str | Path, checkpoint_args: dict, *, device: str):
         super().__init__()
@@ -138,8 +138,11 @@ class HEFTFastScheme(BaseComparisonScheme):
             return
         self.agent.maybe_update_deployment(env, deterministic=True, record=False)
         self.diagnostics.planning.append(
-            {"time_minute": env.current_time_minute, "planner": "frozen_proposed_slow_heft_fast"}
+            {"time_minute": env.current_time_minute, "planner": "frozen_proposed_slow_heft"}
         )
 
     def schedule_batch(self, env, requests):
         return self.scheduler.schedule_batch(env, requests)
+
+
+HEFTFastScheme = HEFTScheme

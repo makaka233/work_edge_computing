@@ -385,10 +385,10 @@ class HybridScheme(BaseComparisonScheme):
         return self.scheduler.schedule_batch(env, requests)
 
 
-class AlgorithmicScheme(BaseComparisonScheme):
+class DPMSScheme(BaseComparisonScheme):
     """Demand-aware integer deployment with the same Fast algorithm as Hybrid."""
 
-    name = "Algorithmic"
+    name = "Demand-Aware Placement and Marginal-Cost Scheduling (DPMS)"
 
     def __init__(self) -> None:
         super().__init__()
@@ -404,3 +404,7 @@ class AlgorithmicScheme(BaseComparisonScheme):
 
     def schedule_batch(self, env: EdgeComputingEnv, requests: list[TaskRequest]) -> list[list[int]]:
         return self.scheduler.schedule_batch(env, requests)
+
+
+# Archived imports retain the same implementation.
+AlgorithmicScheme = DPMSScheme

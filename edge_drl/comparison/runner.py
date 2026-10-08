@@ -14,18 +14,19 @@ import scipy
 import torch
 
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
-from edge_drl.comparison.algorithmic import AlgorithmicScheme, HybridScheme
+from edge_drl.comparison.algorithmic import DPMSScheme, HybridScheme
 from edge_drl.comparison.heuristic import (
-    PopularityDeployScheme,
+    DARPScheme,
     FitDeployScheme,
     UniformFirstFitDeployScheme,
     PopularityEFTScheme,
     PopularityNearestScheme,
 )
-from edge_drl.comparison.classic import HEFTFastScheme
+from edge_drl.comparison.classic import HEFTScheme
 from edge_drl.comparison.io import write_csv, write_json
 from edge_drl.comparison.metrics import evaluate_scheme_episode
-from edge_drl.comparison.monolithic import MonolithicScheme
+from edge_drl.comparison.monolithic import MSOScheme
+from edge_drl.comparison.names import LEGACY_SCHEME_IDS, SCHEME_LABELS, canonical_scheme_id, display_scheme_name
 from edge_drl.comparison.proposed import ProposedScheme
 from edge_drl.comparison.unified import UnifiedPPOScheme
 from edge_drl.comparison.replay_env import TraceReplayEnv
@@ -36,16 +37,17 @@ from edge_drl.comparison.types import ExperimentPoint
 from edge_drl.env.environment import EdgeComputingEnv
 
 
-FORMAL_SCHEMES = ("Proposed", "Monolithic", "Hybrid", "Algorithmic")
+FORMAL_SCHEMES = ("Proposed", "MSO", "Hybrid", "DPMS")
 AVAILABLE_SCHEMES = FORMAL_SCHEMES + (
     "PopularityEFT",
     "PopularityNearest",
-    "HEFTFast",
-    "PopularityDeploy",
+    "HEFT",
+    "DARP",
     "FitDeploy",
     "UniformFirstFitDeploy",
     "UnifiedPPO",
 )
+ACCEPTED_SCHEMES = AVAILABLE_SCHEMES + tuple(LEGACY_SCHEME_IDS)
 FORMAL_SCENARIO_FAMILIES = (
     "request_load",
     "compute_capacity",
@@ -107,11 +109,12 @@ def run_comparison(
     learned_fast_eval_mode: str = "deterministic",
     routing_repeats_override: int | None = None,
 ) -> Path:
+    schemes = tuple(canonical_scheme_id(name) for name in schemes)
     if phase == 3:
         _require_phase2_validation(phase2_validation_run, schemes=schemes)
-    if "Monolithic" in schemes and monolithic_checkpoint is None:
+    if "MSO" in schemes and monolithic_checkpoint is None:
         raise ValueError(
-            "Monolithic is trainable and requires --monolithic-checkpoint; "
+            "MSO is trainable and requires --mso-checkpoint; "
             "it is never replaced by an optimization baseline"
         )
     if "UnifiedPPO" in schemes and unified_checkpoint is None:
@@ -129,12 +132,12 @@ def run_comparison(
     if routing_repeats_override is not None and routing_repeats_override <= 0:
         raise ValueError("routing_repeats_override must be positive")
     if (
-        "Monolithic" in schemes
+        "MSO" in schemes
         and monolithic_checkpoint_mode == "fixed"
         and not Path(str(monolithic_checkpoint)).is_file()
     ):
         raise ValueError(
-            "formal fixed-checkpoint comparison requires --monolithic-checkpoint "
+            "formal fixed-checkpoint comparison requires --mso-checkpoint "
             "to name one checkpoint file"
         )
     checkpoint_path, checkpoint_args, checkpoint_internal = load_checkpoint_configuration(checkpoint)
@@ -184,6 +187,7 @@ def run_comparison(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "phase": phase,
         "formal_schemes": list(schemes),
+        "scheme_display_names": {name: SCHEME_LABELS.get(name, name) for name in schemes},
         "greedy_in_main_results": False,
         "episode_minutes": episode_minutes,
         "sampled_seconds_per_window": sampled_seconds_per_window,
@@ -225,13 +229,13 @@ def run_comparison(
             "torch": torch.__version__,
         },
         "labels": {
-            "Monolithic": "separately trained dual-scale PPO with one aggregated stage per service",
+            "MSO": "separately trained dual-scale PPO with one aggregated stage per service",
             "Hybrid": "frozen Proposed Slow PPO with causal KKT marginal-cost path scheduling",
-            "Algorithmic": "demand-aware binary MILP placement with marginal replicas and the same path scheduling",
+            "DPMS": "demand-aware binary MILP placement with marginal replicas and the same path scheduling",
             "PopularityEFT": "v1 demand/capacity/locality replica allocation with online work-based stage completion scheduling; project-specific heuristic",
             "PopularityNearest": "frozen popularity/resource placement with static nearest-reachable-replica scheduling",
-            "HEFTFast": "frozen Proposed Slow PPO with HEFT-style upward-rank and earliest-finish Fast scheduling",
-            "PopularityDeploy": "fixed demand/capacity/locality placement with frozen Proposed Fast PPO and unchanged KKT settlement",
+            "HEFT": "frozen Proposed Slow PPO with HEFT-style upward-rank and earliest-finish Fast scheduling",
+            "DARP": "fixed demand/capacity/locality placement with frozen Proposed Fast PPO and unchanged KKT settlement",
             "FitDeploy": "demand-only replica priority and ascending-node First-Fit placement, with coverage feasibility repair, frozen Proposed Fast PPO and unchanged KKT settlement",
             "UniformFirstFitDeploy": "equal-count stage replica allocation and ascending-node First-Fit placement with coverage feasibility repair, frozen Proposed Fast PPO and unchanged KKT settlement",
             "UnifiedPPO": "one shared PPO actor-critic for deployment, routing, and learned resource priorities; no KKT optimization",
@@ -280,6 +284,7 @@ def run_comparison(
                 }
             )
             for scheme_name in schemes:
+                scheme_display = display_scheme_name(scheme_name)
                 for repeat in range(routing_repeats):
                     # Some schemes intentionally use a different resource
                     # settlement rule.  Give every scheme an independent
@@ -337,7 +342,7 @@ def run_comparison(
                         for diagnostic in scheme.diagnostics.planning:
                             solver_diagnostics.append(
                                 {
-                                    "scheme": scheme_name,
+                                    "scheme": scheme_display,
                                     "scenario_family": point.family,
                                     "scenario_value": point.value,
                                     "eval_seed": eval_seed,
@@ -349,7 +354,7 @@ def run_comparison(
                             failure_rows.append(row)
                     except Exception as error:
                         failure = {
-                            "scheme": scheme_name,
+                            "scheme": scheme_display,
                             "scenario_family": point.family,
                             "scenario_value": point.value,
                             "eval_seed": eval_seed,
@@ -370,7 +375,7 @@ def run_comparison(
                     _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
                     print(
                         f"[{scheme_name}] {point.label} seed={eval_seed} repeat={repeat} "
-                        f"status={'failed' if failure_rows and failure_rows[-1].get('scheme') == scheme_name and failure_rows[-1].get('trace_hash') == trace.trace_hash else 'complete'}"
+                        f"status={'failed' if failure_rows and failure_rows[-1].get('scheme') == scheme_display and failure_rows[-1].get('trace_hash') == trace.trace_hash else 'complete'}"
                     )
 
     _write_incremental(output, raw_rows, failure_rows, trace_manifest, solver_diagnostics)
@@ -406,7 +411,7 @@ def _require_phase2_validation(
     if (
         payload.get("validated") is not True
         or payload.get("phase") != 2
-        or payload.get("schemes") != list(schemes)
+        or [canonical_scheme_id(name) for name in payload.get("schemes", [])] != list(schemes)
     ):
         raise ValueError(f"invalid Phase 2 validation marker: {marker}")
 
@@ -434,17 +439,18 @@ def _make_scheme(
         )
     if name == "Hybrid":
         return HybridScheme(env, checkpoint_path, checkpoint_args, device=device)
-    if name == "Algorithmic":
-        return AlgorithmicScheme()
+    name = canonical_scheme_id(name)
+    if name == "DPMS":
+        return DPMSScheme()
     if name == "PopularityEFT":
         return PopularityEFTScheme()
     if name == "PopularityNearest":
         return PopularityNearestScheme()
-    if name == "HEFTFast":
-        return HEFTFastScheme(env, checkpoint_path, checkpoint_args, device=device)
-    if name in {"PopularityDeploy", "FitDeploy", "UniformFirstFitDeploy"}:
+    if name == "HEFT":
+        return HEFTScheme(env, checkpoint_path, checkpoint_args, device=device)
+    if name in {"DARP", "FitDeploy", "UniformFirstFitDeploy"}:
         scheme_class = {
-            "PopularityDeploy": PopularityDeployScheme,
+            "DARP": DARPScheme,
             "FitDeploy": FitDeployScheme,
             "UniformFirstFitDeploy": UniformFirstFitDeployScheme,
         }[name]
@@ -455,7 +461,7 @@ def _make_scheme(
             device=device,
             fast_deterministic=learned_fast_deterministic,
         )
-    if name == "Monolithic":
+    if name == "MSO":
         assert monolithic_checkpoint is not None
         assert point is not None
         resolved = _resolve_monolithic_checkpoint(
@@ -463,7 +469,7 @@ def _make_scheme(
             point,
             mode=monolithic_checkpoint_mode,
         )
-        return MonolithicScheme(
+        return MSOScheme(
             env,
             resolved,
             device=device,

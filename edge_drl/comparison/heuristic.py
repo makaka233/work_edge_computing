@@ -16,7 +16,7 @@ from edge_drl.env.environment import EdgeComputingEnv
 from edge_drl.env.scenario import TaskRequest
 
 
-class PopularityPlacement:
+class DemandAwareReplicaPlacement:
     """Mandatory coverage followed by demand-proportional replica allocation.
 
 Replica priority is expected work divided by current pooled compute capacity
@@ -273,7 +273,7 @@ class PopularityEFTScheme(BaseComparisonScheme):
 
     def __init__(self):
         super().__init__()
-        self.planner = PopularityPlacement()
+        self.planner = DemandAwareReplicaPlacement()
         self.scheduler = StageCompletionScheduler()
 
     def maybe_plan(self, env):
@@ -330,7 +330,7 @@ class PopularityNearestScheme(BaseComparisonScheme):
 
     def __init__(self):
         super().__init__()
-        self.planner = PopularityPlacement()
+        self.planner = DemandAwareReplicaPlacement()
         self.scheduler = NearestReplicaScheduler()
 
     def maybe_plan(self, env):
@@ -345,17 +345,17 @@ class PopularityNearestScheme(BaseComparisonScheme):
         return self.scheduler.schedule_batch(env, requests)
 
 
-class PopularityDeployScheme(BaseComparisonScheme):
+class DARPScheme(BaseComparisonScheme):
     """Fixed algorithmic placement paired with the frozen Proposed Fast PPO.
 
     This is a deployment-only component comparison.  It changes exactly one
     decision layer relative to Proposed: Slow PPO is replaced by
-    :class:`PopularityPlacement`.  Scheduling and continuous KKT settlement
+    :class:`DemandAwareReplicaPlacement`. Scheduling and continuous KKT settlement
     remain identical to Proposed.
     """
 
-    name = "PopularityDeploy"
-    planner_label = "popularity_deploy_with_frozen_proposed_fast"
+    name = "Demand-Aware Replica Placement (DARP)"
+    planner_label = "darp_with_frozen_proposed_fast"
 
     def __init__(
         self,
@@ -368,7 +368,7 @@ class PopularityDeployScheme(BaseComparisonScheme):
     ) -> None:
         super().__init__()
         self.fast_deterministic = bool(fast_deterministic)
-        self.planner = PopularityPlacement()
+        self.planner = DemandAwareReplicaPlacement()
         self.agent, self.checkpoint_metadata = build_proposed_agent(
             env, checkpoint_path, checkpoint_args, device=device
         )
@@ -396,7 +396,7 @@ class PopularityDeployScheme(BaseComparisonScheme):
         )
 
 
-class FitDeployScheme(PopularityDeployScheme):
+class FitDeployScheme(DARPScheme):
     """First-Fit placement with the same frozen Fast PPO and KKT settlement."""
 
     name = "FitDeploy"
@@ -407,7 +407,7 @@ class FitDeployScheme(PopularityDeployScheme):
         self.planner = PopularityFirstFitPlacement()
 
 
-class UniformFirstFitDeployScheme(PopularityDeployScheme):
+class UniformFirstFitDeployScheme(DARPScheme):
     """Uniform First-Fit deployment with the frozen Proposed Fast PPO."""
 
     name = "UniformFirstFitDeploy"
@@ -416,3 +416,7 @@ class UniformFirstFitDeployScheme(PopularityDeployScheme):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.planner = UniformFirstFitPlacement()
+
+
+PopularityDeployScheme = DARPScheme
+PopularityPlacement = DemandAwareReplicaPlacement

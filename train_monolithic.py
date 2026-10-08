@@ -58,7 +58,7 @@ MONOLITHIC_PLACEMENT_IDLE_COEF = 0.005
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the isolated Monolithic PPO comparison controller")
+    parser = argparse.ArgumentParser(description="Train Monolithic Service Orchestration (MSO) PPO")
     parser.add_argument(
         "--base-checkpoint",
         required=True,
@@ -460,8 +460,8 @@ def main() -> None:
         resume_path, resume_args, resume_internal = load_checkpoint_configuration(
             cli.load_checkpoint
         )
-        if resume_args.get("training_scheme") != "Monolithic":
-            raise ValueError("--load-checkpoint must be a Monolithic training checkpoint")
+        if resume_args.get("training_scheme") not in {"Monolithic", "MSO"}:
+            raise ValueError("--load-checkpoint must be an MSO training checkpoint")
         if resume_internal.get("resumable") is False:
             raise ValueError(
                 "this Monolithic checkpoint is evaluation-only; resume from latest.pt, "
@@ -631,7 +631,7 @@ def main() -> None:
             f"placement={SlowLearningRateController.optimizer_lr(agent.slow_agent.placement_ppo.optimizer):.3g}",
             flush=True,
         )
-    run_name = cli.run_name or f"monolithic_ppo_{cli.scenario_family}_{cli.scenario_value:g}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_name = cli.run_name or f"mso_ppo_{cli.scenario_family}_{cli.scenario_value:g}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(cli.run_root) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
@@ -910,7 +910,7 @@ def main() -> None:
                         ),
                         "progress_interval_seconds": cli.progress_interval_seconds,
                         "run_name": run_name,
-                        "training_scheme": "Monolithic",
+                        "training_scheme": "MSO",
                         "comparison_scenario_family": cli.scenario_family,
                         "comparison_scenario_value": cli.scenario_value,
                     },
@@ -1009,7 +1009,7 @@ def main() -> None:
                 "load_checkpoint": None if resume_path is None else str(resume_path),
                 "progress_interval_seconds": cli.progress_interval_seconds,
                 "run_name": run_name,
-                "training_scheme": "Monolithic",
+                "training_scheme": "MSO",
                 "comparison_scenario_family": cli.scenario_family,
                 "comparison_scenario_value": cli.scenario_value,
             },
@@ -1073,7 +1073,7 @@ def main() -> None:
                     "load_checkpoint": None if resume_path is None else str(resume_path),
                     "progress_interval_seconds": cli.progress_interval_seconds,
                     "run_name": run_name,
-                    "training_scheme": "Monolithic",
+                    "training_scheme": "MSO",
                     "comparison_scenario_family": cli.scenario_family,
                     "comparison_scenario_value": cli.scenario_value,
                 },
@@ -1111,7 +1111,7 @@ def main() -> None:
                     "additional_updates": cli.updates,
                     "load_checkpoint": None if resume_path is None else str(resume_path),
                     "run_name": run_name,
-                    "training_scheme": "Monolithic",
+                    "training_scheme": "MSO",
                     "comparison_scenario_family": cli.scenario_family,
                     "comparison_scenario_value": cli.scenario_value,
                 },

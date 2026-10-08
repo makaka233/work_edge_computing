@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import matplotlib
 
@@ -9,10 +10,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from edge_drl.comparison.names import canonical_scheme_id
 
-SCHEME_ORDER = ("Proposed", "Monolithic")
-COLORS = {"Proposed": "#0072B2", "Monolithic": "#D55E00"}
-LINE_STYLES = {"Proposed": "-", "Monolithic": "--"}
+SCHEME_ORDER = ("Proposed", "MSO")
+COLORS = {"Proposed": "#0072B2", "MSO": "#D55E00"}
+LINE_STYLES = {"Proposed": "-", "MSO": "--"}
 FAMILY_ORDER = (
     "request_load",
     "compute_capacity",
@@ -31,11 +34,11 @@ FAMILY_LABELS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot Proposed/Monolithic five-scenario evaluation and training curves."
+        description="Plot Proposed/MSO five-scenario evaluation and training curves."
     )
     parser.add_argument("--comparison-run", type=Path, required=True)
     parser.add_argument("--proposed-run", type=Path, required=True)
-    parser.add_argument("--monolithic-run", type=Path, required=True)
+    parser.add_argument("--mso-run", "--monolithic-run", dest="mso_run", type=Path, required=True)
     parser.add_argument("--rolling-episodes", type=int, default=20)
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser.parse_args()
@@ -56,6 +59,7 @@ def _load_comparison_rows(run_dir: Path) -> pd.DataFrame:
     if not frames:
         raise ValueError(f"no comparison rows found under {raw_dir}")
     data = pd.concat(frames, ignore_index=True)
+    data["scheme"] = data["scheme"].map(canonical_scheme_id)
     if bool(data.get("failed", pd.Series(False, index=data.index)).astype(bool).any()):
         raise ValueError("comparison results contain failed rows")
     expected = {
@@ -188,7 +192,7 @@ def plot_training_rewards(
         rolling_episodes=rolling_episodes,
     )
     axes[1].set_xlabel("Training episode (60 minutes each)")
-    figure.suptitle("Proposed and Monolithic training rewards", fontsize=15)
+    figure.suptitle("Proposed and MSO training rewards", fontsize=15)
     return _save_figure(figure, output_stem)
 
 
@@ -215,7 +219,7 @@ def plot_training_latency(
         rolling_episodes=rolling_episodes,
     )
     axes[1].set_xlabel("Training episode (60 minutes each)")
-    figure.suptitle("Proposed and Monolithic training latency", fontsize=15)
+    figure.suptitle("Proposed and MSO training latency", fontsize=15)
     return _save_figure(figure, output_stem)
 
 
@@ -229,7 +233,7 @@ def main() -> None:
     comparison = _load_comparison_rows(args.comparison_run)
     logs = {
         "Proposed": _load_episode_log(args.proposed_run),
-        "Monolithic": _load_episode_log(args.monolithic_run),
+        "MSO": _load_episode_log(args.mso_run),
     }
     outputs: list[Path] = []
     outputs.extend(

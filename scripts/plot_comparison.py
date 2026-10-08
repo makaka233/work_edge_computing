@@ -3,34 +3,37 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from edge_drl.comparison.names import canonical_scheme_id
 
-SCHEME_ORDER = ("Proposed", "Monolithic", "Hybrid", "Algorithmic", "PopularityEFT", "PopularityNearest", "HEFTFast", "PopularityDeploy", "FitDeploy", "UniformFirstFitDeploy")
+SCHEME_ORDER = ("Proposed", "MSO", "Hybrid", "DPMS", "PopularityEFT", "PopularityNearest", "HEFT", "DARP", "FitDeploy", "UniformFirstFitDeploy")
 COLORS = {
     "Proposed": "#0072B2",
-    "Monolithic": "#D55E00",
+    "MSO": "#D55E00",
     "Hybrid": "#009E73",
-    "Algorithmic": "#CC79A7",
+    "DPMS": "#CC79A7",
     "PopularityEFT": "#8C564B",
     "PopularityNearest": "#7F7F7F",
-    "HEFTFast": "#E69F00",
-    "PopularityDeploy": "#56B4E9",
+    "HEFT": "#E69F00",
+    "DARP": "#56B4E9",
     "FitDeploy": "#009E73",
     "UniformFirstFitDeploy": "#CC79A7",
 }
-LINE_STYLES = {"Proposed": "-", "Monolithic": "--", "Hybrid": "-.", "Algorithmic": ":"}
-MARKERS = {"Proposed": "o", "Monolithic": "s", "Hybrid": "^", "Algorithmic": "D"}
+LINE_STYLES = {"Proposed": "-", "MSO": "--", "Hybrid": "-.", "DPMS": ":"}
+MARKERS = {"Proposed": "o", "MSO": "s", "Hybrid": "^", "DPMS": "D"}
 LINE_STYLES["PopularityEFT"] = "--"
 MARKERS["PopularityEFT"] = "v"
 LINE_STYLES["PopularityNearest"] = ":"
 MARKERS["PopularityNearest"] = "P"
-LINE_STYLES["HEFTFast"] = "-."
-MARKERS["HEFTFast"] = "X"
-LINE_STYLES["PopularityDeploy"] = "--"
-MARKERS["PopularityDeploy"] = "*"
+LINE_STYLES["HEFT"] = "-."
+MARKERS["HEFT"] = "X"
+LINE_STYLES["DARP"] = "--"
+MARKERS["DARP"] = "*"
 LINE_STYLES["FitDeploy"] = ":"
 MARKERS["FitDeploy"] = "^"
 LINE_STYLES["UniformFirstFitDeploy"] = "--"
@@ -65,7 +68,7 @@ def _selected_rows(
             for row in rows
             if row["scenario_family"] == family
             and row["metric"] == metric
-            and row["scheme"] == scheme
+            and canonical_scheme_id(row["scheme"]) == scheme
         ),
         key=lambda row: float(row["scenario_value"]),
     )
@@ -101,7 +104,7 @@ def plot_five_scenario_overview(
     output_stem: Path,
     linear_scale: bool = False,
 ) -> list[Path]:
-    figure, axes = plt.subplots(2, 3, figsize=(15.2, 8.3), constrained_layout=True)
+    figure, axes = plt.subplots(2, 3, figsize=(15.2, 8.3))
     flat_axes = axes.ravel()
     for axis, family in zip(flat_axes, FAMILY_ORDER):
         for scheme in SCHEME_ORDER:
@@ -117,15 +120,18 @@ def plot_five_scenario_overview(
     legend_axis = flat_axes[-1]
     legend_axis.axis("off")
     handles, labels = flat_axes[0].get_legend_handles_labels()
-    legend_axis.legend(
+    figure.legend(
         handles,
         labels,
-        loc="center",
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.965),
+        ncol=3,
         frameon=False,
-        fontsize=12,
-        handlelength=3.0,
+        fontsize=10,
+        handlelength=2.5,
     )
-    figure.suptitle(title, fontsize=16)
+    figure.suptitle(title, fontsize=16, y=0.995)
+    figure.tight_layout(rect=(0, 0, 1, 0.88))
     outputs = [output_stem.with_suffix(".png"), output_stem.with_suffix(".pdf")]
     figure.savefig(outputs[0], dpi=300)
     figure.savefig(outputs[1])
@@ -166,13 +172,21 @@ def plot_run(run_dir: Path, *, mean_only: bool = False, linear_scale: bool = Fal
         ):
             if mean_only and metric != "mean_latency_ms":
                 continue
-            figure, axis = plt.subplots(figsize=(7.2, 4.6), constrained_layout=True)
+            figure, axis = plt.subplots(figsize=(7.2, 4.6))
             for scheme in SCHEME_ORDER:
                 _plot_series(axis, _selected_rows(rows, family, metric, scheme), scheme)
             axis.set_xlabel(family.replace("_", " ").title() + " multiplier")
             axis.set_ylabel(ylabel)
             axis.grid(True, alpha=0.25)
-            axis.legend(frameon=False, ncol=2)
+            axis.legend(
+                frameon=False,
+                ncol=3,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 1.02),
+                fontsize=9,
+                handlelength=2.4,
+            )
+            figure.subplots_adjust(bottom=0.15, left=0.14, right=0.97, top=0.78)
             output = plot_dir / f"{family}_{suffix}.png"
             figure.savefig(output, dpi=220)
             plt.close(figure)
@@ -181,7 +195,7 @@ def plot_run(run_dir: Path, *, mean_only: bool = False, linear_scale: bool = Fal
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot formal four-scheme comparison results")
+    parser = argparse.ArgumentParser(description="Plot comparison results with publication-facing scheme names")
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--mean-only", action="store_true", help="Only plot mean latency")
     parser.add_argument("--linear-scale", action="store_true", help="Use linear overview axes")

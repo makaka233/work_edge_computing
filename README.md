@@ -374,11 +374,14 @@ Slow deployment exploration can also be controlled separately with
 is especially sensitive because its action space is only the replica count.
 
 An additional deployment-only comparison is available as
-`--schemes Proposed HEFTFast FitDeploy`. It uses demand-only
+`--schemes Proposed HEFT FitDeploy`. It uses demand-only
 replica priority and fixed-order First-Fit placement with the frozen Proposed
 Fast policy. See [POPULARITY_FIRST_FIT.md](POPULARITY_FIRST_FIT.md) for the
 algorithm, coverage repair and evaluation protocol. The original
-`PopularityDeploy` remains separately selectable.
+`DARP` remains separately selectable. The current comparison identifiers are
+`MSO`, `DPMS`, `HEFT`, and `DARP`; their publication labels are defined in
+`edge_drl/comparison/names.py`. Old identifiers remain accepted for archived
+commands, and `train_mso.py` is the preferred MSO training entry point.
 
 `UniformFirstFitDeploy` is a separate demand-independent deployment baseline.
 It adds replicas to the feasible stage with the fewest replicas, with fixed
