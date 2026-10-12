@@ -343,6 +343,16 @@ network pressure visible. `--pressure-profile mec-stress` is a stronger bounded
 ablation. Explicit scale flags override a profile, and the resolved values are
 stored in `metadata.json`.
 
+`--pressure-profile mec-latency200` explicitly selects the new AI-edge candidate:
+300 Mbps effective upload plus 10 ms fixed access overhead, three Jetson Orin
+tiers, and ten payload-grounded staged workloads. Compute remains expressed in
+effective Gcycle/s; its budgets and runtime reservations require matching-device
+profiling, not TOPS conversion. Legacy profiles and default behavior are unchanged.
+The <200 ms baseline-load objective is not a measured or guaranteed result.
+See [parameter tables, references, and theoretical bounds](docs/LATENCY200_SCENARIO.md).
+Train new Proposed and Monolithic checkpoints on the same profile before a new
+comparison; archived checkpoints describe the old environment.
+
 The moderate profile is intended as the first pressure test. It targets a
 moderate operating point rather than immediate saturation: if diagnostics show
 persistent infeasible actions or penalty latency, use the moderate profile as a

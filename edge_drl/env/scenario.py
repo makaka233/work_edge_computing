@@ -5,6 +5,8 @@ from typing import Sequence
 
 import numpy as np
 
+from edge_drl.env import latency200
+
 
 @dataclass(frozen=True)
 class EdgeNode:
@@ -102,14 +104,10 @@ def generate_realistic_scenario(
         raise ValueError("topology_k_nearest must be in [1, num_edge_nodes).")
     if deadline_scale <= 0.0:
         raise ValueError("deadline_scale must be positive.")
-    if edge_node_profile not in {"synthetic-tiered", "hardware-constrained"}:
-        raise ValueError(
-            "edge_node_profile must be 'synthetic-tiered' or 'hardware-constrained'."
-        )
-    if service_workload_profile not in {"legacy-random", "edge-ai-pipelines"}:
-        raise ValueError(
-            "service_workload_profile must be 'legacy-random' or 'edge-ai-pipelines'."
-        )
+    if edge_node_profile not in {"synthetic-tiered", "hardware-constrained", latency200.NODE_PROFILE}:
+        raise ValueError(f"unknown edge_node_profile: {edge_node_profile!r}")
+    if service_workload_profile not in {"legacy-random", "edge-ai-pipelines", latency200.SERVICE_PROFILE}:
+        raise ValueError(f"unknown service_workload_profile: {service_workload_profile!r}")
 
     city_width_km = 36.0
     city_height_km = 28.0
@@ -141,6 +139,15 @@ def generate_realistic_scenario(
             compute = [96, 192, 384][tier] * rng.uniform(0.80, 1.25)
             hardware_type = "synthetic-tier"
             network_uplink_mb_s = float("inf")
+        elif edge_node_profile == latency200.NODE_PROFILE:
+            # Same three-tier structure and RNG draw order as the archived
+            # hardware profile; only the hardware anchors and budgets change.
+            tier = int(rng.choice([0, 1, 2], p=[0.45, 0.40, 0.15]))
+            hardware_type = latency200.NODE_TYPES[tier]
+            memory_gb = latency200.NODE_MEMORY_GB[tier] * rng.uniform(0.95, 1.05)
+            storage_gb = latency200.NODE_STORAGE_GB[tier] * rng.uniform(0.90, 1.10)
+            compute = latency200.NODE_COMPUTE_GCYCLES_S[tier] * rng.uniform(0.90, 1.10)
+            network_uplink_mb_s = latency200.NODE_NIC_MB_S[tier]
         else:
             # Hardware anchors:
             # - Raspberry Pi 5: 4 x 2.4 GHz CPU, 8 GB deployment;
@@ -225,17 +232,23 @@ def generate_realistic_scenario(
             if link_class == "bottleneck":
                 raw_bandwidth = rng.uniform(25.0, 90.0)
             elif link_class == "metro":
-                raw_bandwidth = rng.uniform(120.0, 650.0)
+                bounds = (125.0, 125.0) if edge_node_profile == latency200.NODE_PROFILE else (120.0, 650.0)
+                raw_bandwidth = rng.uniform(*bounds)
             else:
-                raw_bandwidth = rng.uniform(750.0, 1800.0)
-            link_bandwidth = raw_bandwidth / (1.0 + 0.06 * distance)
+                bounds = (1250.0, 1250.0) if edge_node_profile == latency200.NODE_PROFILE else (750.0, 1800.0)
+                raw_bandwidth = rng.uniform(*bounds)
+            distance_coefficient = 0.0 if edge_node_profile == latency200.NODE_PROFILE else 0.06
+            link_bandwidth = raw_bandwidth / (1.0 + distance_coefficient * distance)
             link_bandwidth = min(
                 link_bandwidth,
                 nodes[i].network_uplink_mb_s,
                 nodes[j].network_uplink_mb_s,
             )
             link_bandwidth *= wired_link_bandwidth_scale
-            link_propagation = 0.35 * distance + rng.uniform(0.2, 1.5)
+            if edge_node_profile == latency200.NODE_PROFILE:
+                link_propagation = 0.005 * distance + rng.uniform(0.05, 0.20)
+            else:
+                link_propagation = 0.35 * distance + rng.uniform(0.2, 1.5)
             bandwidth[i, j] = link_bandwidth
             bandwidth[j, i] = link_bandwidth
             propagation[i, j] = link_propagation
@@ -585,6 +598,8 @@ def _generate_services(
         profiles = legacy_profiles
     elif service_workload_profile == "edge-ai-pipelines":
         profiles = edge_ai_profiles
+    elif service_workload_profile == latency200.SERVICE_PROFILE:
+        profiles = latency200.SERVICE_PROFILES
     else:
         raise ValueError("unknown service_workload_profile")
 
@@ -593,11 +608,10 @@ def _generate_services(
         stage_count = min(len(profile["stage_compute"]), max_service_stages)
         stages = []
         for stage_id in range(stage_count):
-            if service_workload_profile == "edge-ai-pipelines":
-                # Include serving-runtime/orchestration memory and retained
-                # TensorRT/model/container versions in addition to bare model
-                # weights. These bounded overheads make the catalogue heavier
-                # than the legacy independent random stage resources.
+            if service_workload_profile in {"edge-ai-pipelines", latency200.SERVICE_PROFILE}:
+                # Preserve the original catalogue's runtime/model allowances.
+                # latency200 stores pre-divided bases, so its documented final
+                # reservations include these allowances exactly once.
                 memory_gb = float(
                     1.15 * profile["stage_memory"][stage_id] * rng.uniform(0.92, 1.08)
                 )

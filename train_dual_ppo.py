@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - exercised only when tqdm is absent.
 from edge_drl.agents.hierarchical import FastGreedyScheduler, SlowGreedyDeploymentPolicy, build_baseline_agent
 from edge_drl.agents.drl import HierarchicalPPOAgent
 from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
+from edge_drl.env import latency200
 
 
 PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str | bool]] = {
@@ -58,10 +59,39 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str | bool]] = {
         "service_resource_fraction": 0.20,
         "deadline_scale": 3.0,
     },
-    # Opt-in heterogeneous deployment grounded in representative device,
-    # accelerator, and regional-server edge hardware. Runtime compute is the
-    # scarce resource; wired capacity remains usable so splitting a chain can
-    # sometimes beat unconditional colocation.
+    # Opt-in AI-edge candidate; hardware/payload references and unmeasured
+    # effective-compute budgets are separated in docs/LATENCY200_SCENARIO.md.
+    "mec-latency200": {
+        "training_design": "trajectory-simultaneous",
+        "edge_node_profile": latency200.NODE_PROFILE,
+        "service_workload_profile": latency200.SERVICE_PROFILE,
+        "num_users": 12_000,
+        "num_edge_nodes": 32,
+        "num_service_types": 10,
+        "episode_minutes": 60,
+        "deployment_interval_minutes": 10,
+        "arrival_profile": "stationary",
+        "active_user_ratio": 0.20,
+        "active_user_request_rate_per_minute": 1.75,
+        "traffic_scale": 1.0,
+        "load_multipliers": "0.7,0.9,1.1,1.35",
+        "load_sampling_mode": "distribution-random",
+        "load_strata": "0.65:0.80,0.80:1.00,1.00:1.20,1.20:1.45",
+        "load_stratum_probabilities": "0.20,0.45,0.25,0.10",
+        "task_compute_scale": 1.0,
+        "task_data_scale": 1.0,
+        "node_compute_capacity_scale": 1.0,
+        "wired_link_bandwidth_scale": 0.80,
+        "topology_k_nearest": 6,
+        "service_resource_fraction": 0.60,
+        "wireless_uplink_mbps": 300.0,
+        "radio_rtt_ms": 10.0,
+        "sampled_load_update_mode": "interval-average",
+        # Keep deadline semantics identical to the archived constrained run.
+        # Lower physical latency is never manufactured by relaxing deadlines.
+        "deadline_scale": 2.75,
+    },
+    # Preserve the archived constrained scenario without numerical changes.
     "mec-realistic-constrained": {
         "training_design": "trajectory-simultaneous",
         "edge_node_profile": "hardware-constrained",
@@ -343,20 +373,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-data-scale", type=float, default=1.0)
     parser.add_argument(
         "--edge-node-profile",
-        choices=["synthetic-tiered", "hardware-constrained"],
+        choices=["synthetic-tiered", "hardware-constrained", latency200.NODE_PROFILE],
         default="synthetic-tiered",
         help=(
             "Physical node catalogue. hardware-constrained uses Raspberry Pi 5, "
-            "Jetson Orin Nano, and PowerEdge XR4000 inspired resource tiers."
+            "Jetson Orin Nano, and PowerEdge XR4000 inspired resource tiers. "
+            "jetson-ai-edge selects Orin Nano 8GB, NX 16GB, and AGX Orin 32GB."
         ),
     )
     parser.add_argument(
         "--service-workload-profile",
-        choices=["legacy-random", "edge-ai-pipelines"],
+        choices=["legacy-random", "edge-ai-pipelines", latency200.SERVICE_PROFILE],
         default="legacy-random",
         help=(
             "Service resource catalogue. edge-ai-pipelines uses staged speech, "
-            "vision, robotics, and connected-vehicle workload demands."
+            "vision, robotics, and connected-vehicle workload demands. "
+            "edge-ai-latency200 selects the opt-in, pending-calibration candidate."
         ),
     )
     parser.add_argument(

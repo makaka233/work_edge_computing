@@ -12,6 +12,7 @@ from edge_drl.allocators.learned_share import (
     allocate_link_learned_share,
 )
 from edge_drl.env.scenario import EdgeScenario, TaskRequest, generate_realistic_scenario, generate_request
+from edge_drl.env import latency200
 
 
 def _compute_kkt_externality_delays(
@@ -365,14 +366,10 @@ class EdgeEnvConfig:
             raise ValueError("task_compute_scale must be positive.")
         if self.task_data_scale <= 0:
             raise ValueError("task_data_scale must be positive.")
-        if self.edge_node_profile not in {"synthetic-tiered", "hardware-constrained"}:
-            raise ValueError(
-                "edge_node_profile must be 'synthetic-tiered' or 'hardware-constrained'."
-            )
-        if self.service_workload_profile not in {"legacy-random", "edge-ai-pipelines"}:
-            raise ValueError(
-                "service_workload_profile must be 'legacy-random' or 'edge-ai-pipelines'."
-            )
+        if self.edge_node_profile not in {"synthetic-tiered", "hardware-constrained", latency200.NODE_PROFILE}:
+            raise ValueError(f"unknown edge_node_profile: {self.edge_node_profile!r}")
+        if self.service_workload_profile not in {"legacy-random", "edge-ai-pipelines", latency200.SERVICE_PROFILE}:
+            raise ValueError(f"unknown service_workload_profile: {self.service_workload_profile!r}")
         if self.node_compute_capacity_scale <= 0:
             raise ValueError("node_compute_capacity_scale must be positive.")
         if self.wired_link_bandwidth_scale <= 0:
