@@ -490,6 +490,8 @@ def parse_args() -> argparse.Namespace:
                         help="detached normalized conditional critic loss weight in repaired mode")
     parser.add_argument("--slow-deployment-context", choices=["auto", "legacy", "deployment-aware-v2"], default="auto",
                         help="auto preserves checkpoint architecture; fresh repaired latency200 budget runs use deployment-aware-v2")
+    parser.add_argument("--ppo-update-design", choices=["auto", "full-rollout-v1", "guarded-minibatch-v2"], default="auto",
+                        help="fresh repaired Proposed runs use atomic KL-guarded minibatch epochs and an independent Fast critic; resume retains saved design")
     parser.add_argument("--network-constraint-mode", choices=["edge-only", "shared-nic"], default="edge-only")
     parser.add_argument("--service-calibration-mode", choices=["legacy", "audited-v1"], default="legacy")
     parser.add_argument("--service-calibration-file", default=None, help="schema-1 measured/estimated budget JSON")
@@ -3391,6 +3393,7 @@ def save_checkpoint(
             # surfacing later as opaque tensor-size mismatches.
             "slow_allocation_mode": agent.slow_agent.allocation_mode,
             "slow_deployment_context": agent.slow_agent.deployment_context,
+            "ppo_update_design": agent.fast_agent.ppo_update_design,
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
             "slow_count_optimizer": agent.slow_agent.count_ppo.optimizer.state_dict(),
             "slow_stage_agent": (
@@ -3465,6 +3468,8 @@ def load_checkpoint(
     # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
     # copy their tensors to the parameter device themselves.
     checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("ppo_update_design", "full-rollout-v1") != agent.fast_agent.ppo_update_design:
+        raise ValueError("checkpoint PPO update design differs; resume with --ppo-update-design auto or start a fresh run")
     if checkpoint.get("slow_deployment_context", "legacy") != agent.slow_agent.deployment_context:
         raise ValueError("checkpoint Slow deployment context differs; resume the saved architecture or start a fresh Slow with --init-fast-checkpoint")
     requested_repair = "batch-credit-v1" if agent.fast_agent.batch_credit else "legacy"
@@ -4062,6 +4067,17 @@ def resolve_slow_deployment_context(args: argparse.Namespace) -> str:
             else "legacy")
 
 
+def resolve_ppo_update_design(args: argparse.Namespace) -> str:
+    requested = getattr(args, "ppo_update_design", "auto")
+    if requested != "auto":
+        return requested
+    checkpoint_path = getattr(args, "load_checkpoint", None) or getattr(args, "init_fast_checkpoint", None)
+    if checkpoint_path:
+        return str(torch.load(Path(checkpoint_path), map_location="cpu").get("ppo_update_design", "full-rollout-v1"))
+    return ("guarded-minibatch-v2" if args.training_repair == "batch-credit-v1"
+            and args.slow_deployment_context == "deployment-aware-v2" else "full-rollout-v1")
+
+
 def initialize_fast_checkpoint(agent, path: Path, args) -> dict[str, object]:
     """Transfer Fast only. This is NOT continuation of a previous training run."""
     checkpoint = torch.load(path, map_location="cpu")
@@ -4084,6 +4100,8 @@ def initialize_fast_checkpoint(agent, path: Path, args) -> dict[str, object]:
         raise ValueError("Fast initialization service calibration document differs")
     if checkpoint.get("training_repair", "legacy") != args.training_repair:
         raise ValueError("Fast initialization training repair differs")
+    if checkpoint.get("ppo_update_design", "full-rollout-v1") != agent.fast_agent.ppo_update_design:
+        raise ValueError("Fast initialization PPO design differs; use the saved design or train from scratch")
     agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"], strict=True)
     if agent.fast_agent.batch_credit:
         agent.fast_agent.ppo.load_value_normalization_state(checkpoint["fast_value_normalization"])
@@ -4096,6 +4114,9 @@ def main() -> None:
     args.fast_chain_context = resolve_fast_chain_context(args)
     args.training_repair = resolve_training_repair(args)
     args.slow_deployment_context = resolve_slow_deployment_context(args)
+    args.ppo_update_design = resolve_ppo_update_design(args)
+    if args.ppo_update_design == "guarded-minibatch-v2" and args.training_repair != "batch-credit-v1":
+        raise ValueError("guarded-minibatch-v2 requires --training-repair batch-credit-v1")
     if args.load_checkpoint and args.init_fast_checkpoint:
         raise ValueError("--load-checkpoint and --init-fast-checkpoint are mutually exclusive")
     args.rollout_acceleration_version = "vector-features-v1"
@@ -4183,6 +4204,7 @@ def main() -> None:
         training_repair=args.training_repair,
         slow_team_value_coef=args.slow_team_value_coef,
         slow_deployment_context=args.slow_deployment_context,
+        ppo_update_design=args.ppo_update_design,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
         fast_load_balanced_updates=args.fast_load_balanced_updates,
         fast_load_group_weights=_load_probabilities_for_args(
@@ -4240,6 +4262,7 @@ def main() -> None:
     print(f"  train_mode={args.train_mode}")
     print(f"  training_design={args.training_design}")
     print(f"  slow_deployment_context={args.slow_deployment_context}")
+    print(f"  ppo_update_design={args.ppo_update_design}")
     if args.fast_initialization:
         print(f"  Fast initialized from {args.fast_initialization['path']}; fresh Slow, optimizers and run counters")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
@@ -5327,6 +5350,12 @@ def main() -> None:
         else:
             slow_metrics = agent.slow_agent.empty_update_metrics()
         losses = {"slow": slow_metrics, "fast": fast_metrics}
+        if agent.fast_agent.ppo.guarded_minibatch_epochs:
+            append_log(run_dir / "logs" / "policy_update_metrics.csv", {
+                "update": update + 1, "ppo_update_design": args.ppo_update_design,
+                **{"fast_" + k: v for k, v in fast_metrics.items()},
+                **({"slow_" + k: v for k, v in agent.slow_agent.last_update_diagnostics.items()} if slow_updated else {}),
+            })
         if agent.slow_agent.deployment_aware and slow_updated:
             append_log(run_dir / "logs" / "slow_update_metrics.csv", {
                 "update": update + 1, "context_version": args.slow_deployment_context,
