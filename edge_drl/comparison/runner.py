@@ -28,6 +28,7 @@ from edge_drl.comparison.metrics import evaluate_scheme_episode
 from edge_drl.comparison.monolithic import MSOScheme
 from edge_drl.comparison.names import LEGACY_SCHEME_IDS, SCHEME_LABELS, canonical_scheme_id, display_scheme_name
 from edge_drl.comparison.proposed import ProposedScheme
+from edge_drl.comparison.placement_cost import DPMS_COST_IMPLEMENTATION
 from edge_drl.comparison.unified import UnifiedPPOScheme
 from edge_drl.comparison.replay_env import TraceReplayEnv
 from edge_drl.comparison.scenario_transforms import formal_experiment_points, transform_scenario, transform_trace
@@ -209,6 +210,7 @@ def run_comparison(
         "eval_seeds": eval_seeds,
         "slow_window_feedback_protocol": SLOW_FEEDBACK_PROTOCOL,
         "slow_window_feedback_schemes": [name for name in schemes if name in {"Proposed", "HEFT", "MSO"}],
+        "dpms_cost_implementation": DPMS_COST_IMPLEMENTATION if "DPMS" in schemes else None,
         "scenario_families": list(dict.fromkeys(point.family for point in points)),
         "scenario_point_count": len(points),
         "standard_phase_design": is_standard_design,

@@ -9,6 +9,7 @@ import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 
 from edge_drl.comparison.checkpoint import build_proposed_agent
+from edge_drl.comparison.placement_cost import DPMS_COST_IMPLEMENTATION, PreparedServiceCost
 from edge_drl.comparison.scheme import BaseComparisonScheme
 from edge_drl.env.environment import EdgeComputingEnv
 from edge_drl.env.scenario import Service, TaskRequest
@@ -185,43 +186,22 @@ class DemandAwareMILPPlacement:
         task_data_scale: float,
         arrival_rate_per_s: float,
     ) -> float:
-        allowed = [np.flatnonzero(selected[stage.stage_id]) for stage in service.stages]
-        if any(len(nodes) == 0 for nodes in allowed):
-            return float("inf")
-        totals = 0.0
-        for home in np.flatnonzero(demand):
-            first = allowed[0]
-            cost = (
-                propagation[home, first]
-                + service.input_mb_mean * task_data_scale * inverse_bandwidth[home, first]
-                + service.stages[0].compute_gcycles_mean * task_compute_scale / node_capacities[first]
-            )
-            for stage_id in range(1, len(allowed)):
-                previous, current = allowed[stage_id - 1], allowed[stage_id]
-                transfer = (
-                    propagation[np.ix_(previous, current)]
-                    + service.stages[stage_id - 1].output_mb_mean
-                    * task_data_scale
-                    * inverse_bandwidth[np.ix_(previous, current)]
-                )
-                cost = np.min(cost[:, None] + transfer, axis=0)
-                cost += service.stages[stage_id].compute_gcycles_mean * task_compute_scale / node_capacities[current]
-            totals += float(demand[home]) * float(np.min(cost))
-        # When several requests of the same stage arrive in a second, the
-        # KKT delay grows with their shared square-root workload. A pooled
-        # capacity surrogate credits replicas even when the closest path for
-        # a representative home has not changed yet.
-        service_mass = float(demand.sum())
-        for stage in service.stages:
-            pooled_capacity = float(node_capacities[allowed[stage.stage_id]].sum())
-            totals += (
-                service_mass**2
-                * arrival_rate_per_s
-                * stage.compute_gcycles_mean
-                * task_compute_scale
-                / max(pooled_capacity, 1e-9)
-            )
-        return totals
+        # Keep this stateless private entry point available for diagnostics.
+        return PreparedServiceCost(
+            service, demand, node_capacities, propagation, inverse_bandwidth,
+            task_compute_scale, task_data_scale, arrival_rate_per_s,
+        ).evaluate(selected)
+
+    @staticmethod
+    def _prepare_service_cost(
+        service: Service, demand: np.ndarray, node_capacities: np.ndarray,
+        propagation: np.ndarray, inverse_bandwidth: np.ndarray,
+        task_compute_scale: float, task_data_scale: float, arrival_rate_per_s: float,
+    ) -> PreparedServiceCost:
+        return PreparedServiceCost(
+            service, demand, node_capacities, propagation, inverse_bandwidth,
+            task_compute_scale, task_data_scale, arrival_rate_per_s,
+        )
 
     def plan(self, env: EdgeComputingEnv) -> tuple[np.ndarray, dict[str, Any]]:
         if env.scenario is None or env.deployment is None:
@@ -277,14 +257,16 @@ class DemandAwareMILPPlacement:
         for service, stage in stages:
             memory_left -= deployment[service.service_id, stage.stage_id] * stage.memory_gb
             storage_left -= deployment[service.service_id, stage.stage_id] * stage.storage_gb
-        costs = {
-            service.service_id: self._service_cost(
-                service, deployment[service.service_id], demand[:, service.service_id],
+        cost_evaluators = {
+            service.service_id: self._prepare_service_cost(
+                service, demand[:, service.service_id],
                 node_capacities, propagation, inverse_bandwidth,
                 env.config.task_compute_scale, env.config.task_data_scale, arrival_rate_per_s,
             )
             for service in services
         }
+        costs = {service.service_id: cost_evaluators[service.service_id].evaluate(deployment[service.service_id])
+                 for service in services}
         shortlist = [
             np.argsort(stage_cost[index])[: self.candidate_nodes]
             if self.candidate_nodes > 0 else np.argsort(stage_cost[index])
@@ -306,11 +288,7 @@ class DemandAwareMILPPlacement:
                     if memory_left[node_id] + 1e-9 < stage.memory_gb or storage_left[node_id] + 1e-9 < stage.storage_gb:
                         continue
                     deployment[service_id, stage.stage_id, node_id] = True
-                    new_cost = self._service_cost(
-                        service, deployment[service_id], demand[:, service_id],
-                        node_capacities, propagation, inverse_bandwidth,
-                        env.config.task_compute_scale, env.config.task_data_scale, arrival_rate_per_s,
-                    )
+                    new_cost = cost_evaluators[service_id].evaluate(deployment[service_id])
                     deployment[service_id, stage.stage_id, node_id] = False
                     gain = costs[service_id] - new_cost
                     if gain <= 1e-12:
@@ -350,6 +328,7 @@ class DemandAwareMILPPlacement:
             "added_replicas": additions,
             "replicas": int(deployment.sum()),
             "planning_time_s": time.perf_counter() - started,
+            "cost_implementation": DPMS_COST_IMPLEMENTATION,
         }
 
 

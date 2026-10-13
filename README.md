@@ -428,6 +428,13 @@ New outputs mark `own-window-weighted-feedback-v1`; retain old results but rerun
 the comparison before using it as a final result. Existing training checkpoints
 remain usable. See [evaluation feedback repair](docs/EVALUATION_SLOW_FEEDBACK_REPAIR.md).
 
+DPMS placement now batches ingress-home cost calculations and caches fixed costs
+within each deployment plan. It retains the original MILP, objective, all-node
+candidate search, replica search and resource constraints; no CLI change is
+required. New outputs identify `plan-local-home-vectorized-v1`. An already-running
+evaluation continues with its loaded implementation. See
+[equivalent DPMS acceleration](docs/DPMS_EQUIVALENT_ACCELERATION.md).
+
 `UniformFirstFitDeploy` is a separate demand-independent deployment baseline.
 It adds replicas to the feasible stage with the fewest replicas, with fixed
 service/stage ordering and ascending-node First-Fit placement. It reuses the
