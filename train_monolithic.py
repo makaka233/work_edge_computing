@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 from datetime import datetime
 import json
 from pathlib import Path
@@ -15,16 +14,14 @@ from edge_drl.agents.drl import HierarchicalPPOAgent
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
 from edge_drl.comparison.monolithic import (
     MONOLITHIC_FAST_DESIGN,
-    collapse_scenario,
-    collapse_trace,
     specialize_monolithic_fast_agent,
 )
-from edge_drl.comparison.replay_env import TraceReplayEnv
-from edge_drl.comparison.scenario_transforms import transform_scenario, transform_trace
-from edge_drl.comparison.trace import ComparisonTrace, generate_comparison_trace
+from edge_drl.comparison.monolithic_training_env import (
+    MONOLITHIC_REQUEST_GENERATOR,
+    MonolithicTrainingEnv,
+)
 from edge_drl.comparison.types import ExperimentPoint
-from edge_drl.env.environment import EdgeComputingEnv, EdgeEnvConfig
-from edge_drl.env.scenario import EdgeScenario
+from edge_drl.env.environment import EdgeComputingEnv
 from train_dual_ppo import (
     _load_probabilities_for_args,
     _load_strata_for_args,
@@ -257,6 +254,7 @@ def _optimized_monolithic_args(
     values = dict(base_args)
     values["fast_reservation_microbatch_size"] = int(reservation_microbatch_size)
     values["monolithic_fast_design"] = MONOLITHIC_FAST_DESIGN
+    values["monolithic_request_generator"] = MONOLITHIC_REQUEST_GENERATOR
     # Retain the field for checkpoint schema compatibility. V4 does not use a
     # temperature-scaled policy; only V3 checkpoint loading consumes it.
     values.setdefault(
@@ -345,25 +343,6 @@ def _monolithic_rollout_args(
     )
 
 
-def _arrival_rate_trace_schedule(
-    config,
-    load_multipliers: list[float] | tuple[float, ...],
-    *,
-    window_seconds: int,
-    logical_steps: int,
-) -> tuple[float, ...]:
-    """Convert Proposed's per-window assignments to per-second arrival rates."""
-
-    probe = EdgeComputingEnv(deepcopy(config))
-    rates: list[float] = []
-    for second in range(logical_steps):
-        window_index = min(second // window_seconds, len(load_multipliers) - 1)
-        probe.config.demand_load_multiplier = float(load_multipliers[window_index])
-        probe.current_time_minute = float(second) / 60.0
-        rates.append(float(probe._arrival_rate_per_minute()))
-    return tuple(rates)
-
-
 def _synchronized_episode(
     *,
     base_args: dict[str, object],
@@ -371,17 +350,14 @@ def _synchronized_episode(
     environment_seed: int,
     demand_seed: int,
     episode_minutes: int,
-    window_seconds: int,
-    sampled_seconds_per_window: int,
     load_assignments: list[tuple[float, int]],
     windows_per_episode: int,
     point: ExperimentPoint,
-) -> tuple[EdgeEnvConfig, EdgeScenario, ComparisonTrace]:
+) -> MonolithicTrainingEnv:
     """Create one Monolithic episode from Proposed's seeds and load schedule.
 
-    The physical scenario and request stream are generated with the same seed
-    streams as ``train_dual_ppo.py``.  Only after that shared trace is built do
-    we apply the Monolithic stage collapse.
+    Use Proposed's on-demand generator and inherited temporal sampler. Collapse
+    only the execution view, not the catalogue used to draw individual tasks.
     """
 
     if len(load_assignments) != windows_per_episode:
@@ -401,42 +377,9 @@ def _synchronized_episode(
     )
     config.demand_load_group = int(first_group)
 
-    source_env = EdgeComputingEnv(config)
-    source_env.reset()
-    assert source_env.scenario is not None
-    base_scenario = deepcopy(source_env.scenario)
-    scenario = transform_scenario(base_scenario, point)
-
-    rates = _arrival_rate_trace_schedule(
-        config,
-        [assignment[0] for assignment in load_assignments],
-        window_seconds=window_seconds,
-        logical_steps=episode_minutes * 60,
-    )
-    request_trace = generate_comparison_trace(
-        scenario=base_scenario,
-        logical_steps=episode_minutes * 60,
-        requests_per_minute=rates[0],
-        requests_per_minute_schedule=rates,
-        schedule_window_seconds=1,
-        request_stride_seconds=(
-            1
-            if config.temporal_sampling_mode == "stratified-jitter"
-            or sampled_seconds_per_window <= 0 or sampled_seconds_per_window >= window_seconds
-            else max(int(round(window_seconds / sampled_seconds_per_window)), 1)
-        ),
-        reload_schedule_boundaries=True,
-        reload_window_seconds=window_seconds,
-        physical_seed=int(config.physical_seed if config.physical_seed is not None else physical_seed),
-        demand_seed=int(demand_seed),
-        # EdgeComputingEnv uses config.seed for its request RNG. Reusing the
-        # same seed reproduces the Proposed request-generation stream.
-        request_seed=int(environment_seed),
-        task_compute_scale=config.task_compute_scale,
-        task_data_scale=config.task_data_scale,
-    )
-    request_trace = transform_trace(request_trace, point)
-    return config, scenario, request_trace
+    env = MonolithicTrainingEnv(config, point)
+    env.reset()
+    return env
 
 
 def main() -> None:
@@ -514,15 +457,17 @@ def main() -> None:
         demand_seed=effective_seed,
         demand_load_multiplier=1.0,
     )
-    physical_env = EdgeComputingEnv(config)
-    physical_env.reset()
-    assert physical_env.scenario is not None
-    base_scenario = deepcopy(physical_env.scenario)
     point = ExperimentPoint(cli.scenario_family, cli.scenario_value, f"{cli.scenario_family}:{cli.scenario_value:g}")
-    scenario = transform_scenario(base_scenario, point)
-    staged_scenario = deepcopy(scenario)
-    base_env = TraceReplayEnv(config, collapse_scenario(scenario), _empty_trace(config.episode_minutes * 60))
+    base_env = MonolithicTrainingEnv(config, point)
     base_env.reset()
+    # Persist resolved defaults as well as explicit flags, so a repaired run can
+    # resume without silently changing its sampler or physical constraints.
+    base_args.update({
+        "network_constraint_mode": config.network_constraint_mode,
+        "service_calibration_mode": config.service_calibration_mode,
+        "temporal_sampling_mode": config.temporal_sampling_mode,
+        "sampling_max_interval_seconds": float(base_args.get("sampling_max_interval_seconds", 0.0)),
+    })
     agent = _agent_from_config(base_env, base_args, cli.device)
     total_windows_per_episode = max(
         int(np.ceil(effective_episode_minutes / max(config.deployment_interval_minutes, 1))),
@@ -552,6 +497,11 @@ def main() -> None:
                 base_args["fast_entropy_adaptation_rate"]
             ),
             "monolithic_fast_design": base_args["monolithic_fast_design"],
+            "monolithic_request_generator": MONOLITHIC_REQUEST_GENERATOR,
+            "network_constraint_mode": base_env.config.network_constraint_mode,
+            "service_calibration_mode": base_env.config.service_calibration_mode,
+            "temporal_sampling_mode": base_env.config.temporal_sampling_mode,
+            "sampling_max_interval_seconds": base_args.get("sampling_max_interval_seconds", 0.0),
             "monolithic_fast_logit_temperature_max": float(
                 base_args["monolithic_fast_logit_temperature_max"]
             ),
@@ -678,6 +628,9 @@ def main() -> None:
         "resume_rollout_offset": training_rollout_idx,
         "inherited_best_checkpoint": inherited_best_checkpoint,
         "request_trace_rng": "Proposed environment_seed stream",
+        "request_generator": MONOLITHIC_REQUEST_GENERATOR,
+        "trace_pre_generated": False,
+        "window_load_observation_sync": True,
         "structural_difference": (
             "Monolithic complete-service stage collapse with batch-trajectory "
             "Fast credit and remaining-demand observation"
@@ -711,6 +664,7 @@ def main() -> None:
         f"fast_entropy_target={float(base_args['fast_entropy_target']):g} "
         f"fast_entropy_max={float(base_args['fast_entropy_max_coef']):g} "
         f"fast_design={base_args['monolithic_fast_design']} "
+        f"request_generator={MONOLITHIC_REQUEST_GENERATOR} "
         f"fast_temperature=disabled-v4 "
         f"allow_full_resource_use={cli.allow_full_resource_use} "
         f"slow_counterfactual_credit={float(base_args.get('slow_counterfactual_credit_coef', 0.0) or 0.0):g} "
@@ -718,8 +672,7 @@ def main() -> None:
         flush=True,
     )
 
-    # The rollout seeds and load assignments follow train_dual_ppo.py exactly.
-    # The generated trace is then collapsed only for the Monolithic view.
+    # Reuse Proposed's seeds, load assignments and on-demand RNG advancement.
     for local_update in range(1, cli.updates + 1):
         update = resume_update_offset + local_update
         fast_counterfactual_coef = fast_counterfactual_credit_coefficient(
@@ -737,6 +690,11 @@ def main() -> None:
             rollout_start_idx=training_rollout_idx,
             rng=training_random_streams.load_rng,
         )
+        if point.family == "request_load":
+            update_load_assignments = [
+                (float(multiplier) * point.value, group)
+                for multiplier, group in update_load_assignments
+            ]
         for episode_offset in range(cli.episodes_per_update):
             episode_index = (
                 resume_episode_offset
@@ -752,24 +710,17 @@ def main() -> None:
             episode_assignments = update_load_assignments[
                 assignment_start : assignment_start + total_windows_per_episode
             ]
-            episode_config, episode_scenario, request_trace = _synchronized_episode(
+            env = _synchronized_episode(
                 base_args=base_args,
                 physical_seed=physical_seed,
                 environment_seed=environment_seed,
                 demand_seed=demand_seed,
                 episode_minutes=effective_episode_minutes,
-                window_seconds=window_seconds,
-                sampled_seconds_per_window=effective_sampled_seconds,
                 load_assignments=episode_assignments,
                 windows_per_episode=total_windows_per_episode,
                 point=point,
             )
-            env = TraceReplayEnv(
-                episode_config,
-                collapse_scenario(episode_scenario),
-                collapse_trace(request_trace),
-            )
-            env.reset()
+            episode_config = env.config
             update_episode_manifest.append(
                 {
                     "episode": episode_index + 1,
@@ -782,14 +733,16 @@ def main() -> None:
                     ),
                     "load_multipliers": [float(value) for value, _ in episode_assignments],
                     "load_groups": [int(group) for _, group in episode_assignments],
-                    "trace_hash": request_trace.trace_hash,
-                    "trace_request_count": int(request_trace.request_count),
-                    "logical_steps": int(request_trace.logical_steps),
+                    "request_generator": MONOLITHIC_REQUEST_GENERATOR,
+                    "trace_pre_generated": False,
+                    "logical_steps": effective_episode_minutes * 60,
                 }
             )
             window_stats: list[dict[str, float]] = []
             window_contexts: list[dict[str, float | int | str]] = []
             for window_offset in range(total_windows_per_episode):
+                load_multiplier, load_group = episode_assignments[window_offset]
+                env.set_window_load(load_multiplier, load_group)
                 one_stats = rollout(
                     env,
                     agent,
@@ -811,7 +764,6 @@ def main() -> None:
                     progress_interval_seconds=cli.progress_interval_seconds,
                 )
                 window_stats.append(one_stats)
-                load_multiplier, load_group = episode_assignments[window_offset]
                 context: dict[str, float | int | str] = {
                     "rollout": training_rollout_idx + 1,
                     "update": update,
@@ -839,6 +791,11 @@ def main() -> None:
                 )
                 training_rollout_idx += 1
             episode_stats = aggregate_rollout_stats(window_stats)
+            update_episode_manifest[-1].update({
+                "generated_request_batches": env.generated_request_batches,
+                "generated_request_events": env.generated_request_events,
+                "sampled_settlement_steps": int(episode_stats["settlement_steps"]),
+            })
             episode_stats_for_update.append(episode_stats)
             append_log(
                 episode_log_path,
@@ -1140,12 +1097,6 @@ def main() -> None:
             training_random_streams,
         )
     print(f"monolithic checkpoints: {checkpoint_dir.resolve()}")
-
-
-def _empty_trace(logical_steps: int):
-    from edge_drl.comparison.trace import ComparisonTrace
-
-    return ComparisonTrace(tuple(() for _ in range(logical_steps)), 0, 0, 0, "empty")
 
 
 if __name__ == "__main__":

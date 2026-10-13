@@ -414,6 +414,13 @@ algorithm, coverage repair and evaluation protocol. The original
 `edge_drl/comparison/names.py`. Old identifiers remain accepted for archived
 commands, and `train_mso.py` is the preferred MSO training entry point.
 
+MSO training now synchronizes each window's observed load and PPO group before
+decisions, and uses Proposed's on-demand request generation and temporal sampler
+instead of pre-generating a full episode trace. Start a fresh MSO run after this
+repair; old models remain evaluable but cannot silently resume with the changed
+request process. Proposed and comparison evaluation are unchanged. See
+[Monolithic sampling repair and test command](docs/MONOLITHIC_SAMPLING_REPAIR.md).
+
 `UniformFirstFitDeploy` is a separate demand-independent deployment baseline.
 It adds replicas to the feasible stage with the fewest replicas, with fixed
 service/stage ordering and ascending-node First-Fit placement. It reuses the
