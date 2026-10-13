@@ -423,6 +423,7 @@ class GraphAttentionActorCritic(nn.Module):
         stage_feature_dim: int | None = None,
         hidden_dim: int = 128,
         detach_critic_backbone: bool = False,
+        independent_critic: bool = False,
     ):
         super().__init__()
         if action_mode not in {"node", "count", "budget", "stage"}:
@@ -438,6 +439,7 @@ class GraphAttentionActorCritic(nn.Module):
         self.stage_feature_dim = int(stage_feature_dim or 0)
         self.stage_action_count = action_dim - 1 if action_mode == "stage" else 0
         self.detach_critic_backbone = detach_critic_backbone
+        self.independent_critic = independent_critic
         self.count_min_scale = max(float(action_dim) / 12.0, 1.0)
         self.node_offset = global_dim
         self.stage_offset = global_dim + num_nodes * node_feature_dim
@@ -515,7 +517,7 @@ class GraphAttentionActorCritic(nn.Module):
             with torch.no_grad():
                 self.stop_actor[-1].bias.fill_(-2.5)
         self.critic = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 2 + (self.edge_offset if independent_critic else 0), hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -587,6 +589,10 @@ class GraphAttentionActorCritic(nn.Module):
             logits = logits.masked_fill(~safe_masks, -1e9)
             dist = Categorical(logits=logits)
         critic_context = graph_context.detach() if self.detach_critic_backbone else graph_context
+        if self.independent_critic:
+            # Direct pre-action inventory/budget/stage inputs have their OWN
+            # trained encoder, rather than depending only on detached actor features.
+            critic_context = torch.cat([states[:, :self.edge_offset], critic_context], dim=-1)
         values = self.critic(critic_context).squeeze(-1)
         return dist, values
 
@@ -632,6 +638,9 @@ class PPOAgent:
         full_batch_kl_stop: bool = False,
         normalize_value_targets: bool = False,
         guarded_epochs: bool = False,
+        independent_critic: bool = False,
+        critic_lr: float | None = None,
+        critic_extra_epochs: int = 0,
         device: str = "cpu",
     ):
         self.gamma = gamma
@@ -657,6 +666,11 @@ class PPOAgent:
         self.full_batch_kl_stop = bool(full_batch_kl_stop)
         self.normalize_value_targets = bool(normalize_value_targets)
         self.guarded_epochs = bool(guarded_epochs)
+        self.critic_extra_epochs = int(critic_extra_epochs)
+        if self.critic_extra_epochs < 0:
+            raise ValueError("critic_extra_epochs must be nonnegative")
+        if (independent_critic or self.critic_extra_epochs) and not detach_critic_backbone:
+            raise ValueError("independent critic learning requires detached critic backbone")
         self.value_return_mean = 0.0
         self.value_return_std = 1.0
         self.value_normalization_initialized = False
@@ -713,10 +727,21 @@ class PPOAgent:
                 stage_feature_dim=stage_feature_dim,
                 hidden_dim=hidden_dim,
                 detach_critic_backbone=detach_critic_backbone,
+                independent_critic=independent_critic,
             ).to(self.device)
         else:
             raise ValueError(f"unknown policy_kind: {policy_kind}")
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+        if critic_lr is None:
+            self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+        else:
+            if critic_lr <= 0 or not np.isfinite(critic_lr):
+                raise ValueError("critic learning rate must be positive and finite")
+            critic_parameters = list(self.policy.critic.parameters())
+            critic_ids = {id(p) for p in critic_parameters}
+            self.optimizer = torch.optim.Adam([
+                {"params": [p for p in self.policy.parameters() if id(p) not in critic_ids], "lr": lr},
+                {"params": critic_parameters, "lr": critic_lr, "role": "critic"},
+            ])
         self.buffer = RolloutBuffer()
 
     def _raw_values(self, values: torch.Tensor) -> torch.Tensor:
@@ -1211,6 +1236,7 @@ class PPOAgent:
         self, actions_np, old_logprobs_np, advantages_np, value_targets_np,
         weights_np, group_ids_np, advantage_mean, advantage_std,
         progress_label, progress_interval_seconds,
+        critic_weights_np=None,
     ) -> dict[str, float]:
         """One full-rollout gradient per epoch; minibatches only bound memory.
 
@@ -1222,6 +1248,8 @@ class PPOAgent:
         size = max(1, min(self.minibatch_size, n))
         batches = int(np.ceil(n / size))
         denominator = max(float(weights_np.sum()), 1e-8)
+        critic_weights_np = weights_np if critic_weights_np is None else critic_weights_np
+        critic_denominator = max(float(critic_weights_np.sum()), 1e-8)
         accepted = retries = checks = consumed = 0
         stopped = False
         metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0}
@@ -1245,12 +1273,13 @@ class PPOAgent:
                 advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
                 targets = torch.as_tensor(value_targets_np[idx], dtype=torch.float32, device=self.device)
                 weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
+                value_weights = torch.as_tensor(critic_weights_np[idx], dtype=torch.float32, device=self.device)
                 dist, values = self.policy(states, masks)
                 ratio = (dist.log_prob(actions) - old).exp()
                 surrogate = torch.minimum(ratio * advantages,
                                           ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages)
                 actor = -(surrogate * weights).sum() / denominator
-                critic = ((values - targets).square() * weights).sum() / denominator
+                critic = ((values - targets).square() * value_weights).sum() / critic_denominator
                 entropy = (dist.entropy() * weights).sum() / denominator
                 loss = actor + self.value_coef * critic - self.entropy_coef * entropy
                 loss.backward()
@@ -1302,8 +1331,48 @@ class PPOAgent:
             "accepted_step_lr": accepted_lr, "value_return_mean": self.value_return_mean,
             "value_return_std": self.value_return_std,
         })
+        if self.critic_extra_epochs:
+            metrics.update(self._fit_conditional_critic(value_targets_np, critic_weights_np))
         self.buffer.clear()
         return metrics
+
+    def _fit_conditional_critic(self, targets_np, weights_np) -> dict[str, float]:
+        """Value-only passes: no actor/encoder or actor Adam-moment updates.
+
+        The actor's advantages still use predictions recorded BEFORE sampling.
+        Fitting these returns cannot leak same-action labels into that baseline.
+        """
+        n = len(targets_np)
+        size = max(1, min(self.minibatch_size, n))
+        denominator = max(float(np.sum(weights_np)), 1e-8)
+        last_loss = 0.0
+        for _ in range(self.critic_extra_epochs):
+            self.optimizer.zero_grad(set_to_none=True)
+            last_loss = 0.0
+            for start in range(0, n, size):
+                states = torch.as_tensor(np.stack(self.buffer.states[start:start + size]), dtype=torch.float32, device=self.device)
+                masks = torch.as_tensor(np.stack(self.buffer.masks[start:start + size]), dtype=torch.bool, device=self.device)
+                targets = torch.as_tensor(targets_np[start:start + size], dtype=torch.float32, device=self.device)
+                weights = torch.as_tensor(weights_np[start:start + size], dtype=torch.float32, device=self.device)
+                _, values = self.policy(states, masks)
+                loss = ((values - targets).square() * weights).sum() / denominator
+                (self.value_coef * loss).backward()
+                last_loss += float(loss.detach())
+            nn.utils.clip_grad_norm_(self.policy.critic.parameters(), 5.0)
+            self.optimizer.step()
+        predictions = []
+        with torch.no_grad():
+            for start in range(0, n, size):
+                states = torch.as_tensor(np.stack(self.buffer.states[start:start + size]), dtype=torch.float32, device=self.device)
+                masks = torch.as_tensor(np.stack(self.buffer.masks[start:start + size]), dtype=torch.bool, device=self.device)
+                predictions.extend(self.policy(states, masks)[1].cpu().tolist())
+        target_mean = np.average(targets_np, weights=weights_np)
+        variance = np.average((targets_np - target_mean)**2, weights=weights_np)
+        residual = targets_np - np.asarray(predictions)
+        residual_variance = np.average((residual - np.average(residual, weights=weights_np))**2, weights=weights_np)
+        return {"critic_extra_optimizer_steps": float(self.critic_extra_epochs),
+                "critic_extra_value_loss": last_loss,
+                "post_explained_variance": float(1 - residual_variance / variance) if variance > 1e-8 else 0.0}
 
     def update_actor(
         self,
@@ -1433,6 +1502,7 @@ class PPOAgent:
         returns: np.ndarray,
         *,
         sample_weights: np.ndarray | None = None,
+        critic_sample_weights: np.ndarray | None = None,
         advantage_group_ids: np.ndarray | None = None,
         actor_use_value_baseline: bool = True,
         actor_baseline_values: np.ndarray | None = None,
@@ -1495,7 +1565,10 @@ class PPOAgent:
             if np.any(weights_np < 0.0) or not np.isfinite(weights_np).all():
                 raise ValueError("sample_weights must be finite and non-negative")
         weights_np = weights_np / max(float(weights_np.mean()), 1e-8)
-        value_targets_np = self._normalized_value_targets(returns_np, weights_np)
+        critic_weights_np = weights_np if critic_sample_weights is None else np.asarray(critic_sample_weights, dtype=np.float32)
+        if critic_weights_np.shape != (n,) or not np.isfinite(critic_weights_np).all() or np.any(critic_weights_np < 0) or critic_weights_np.sum() <= 0:
+            raise ValueError("critic weights must be finite, nonnegative and match actions")
+        value_targets_np = self._normalized_value_targets(returns_np, critic_weights_np)
 
         # A poor component critic can make an otherwise useful Monte-Carlo
         # signal noisier. Count can therefore train its actor from direct
@@ -1597,6 +1670,16 @@ class PPOAgent:
             dtype=np.float32 if self.continuous_actions else np.int64,
         )
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
+        if self.guarded_epochs:
+            metrics = self._update_guarded_epochs(
+                actions_np, old_logprobs_np, advantages_np, value_targets_np,
+                weights_np, None, advantage_mean, advantage_std,
+                progress_label=progress_label, progress_interval_seconds=progress_interval_seconds,
+                critic_weights_np=critic_weights_np,
+            )
+            metrics["explained_variance"] = explained_variance
+            metrics["combined_advantage_std"] = combined_advantage_std
+            return metrics
         minibatch_size = max(1, min(self.minibatch_size, n))
         batches_per_epoch = int(np.ceil(n / minibatch_size))
         progress = None

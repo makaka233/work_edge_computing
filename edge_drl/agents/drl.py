@@ -11,6 +11,10 @@ from edge_drl.env.scenario import TaskRequest
 from edge_drl.models.ppo import PPOAgent
 from edge_drl.allocators.nic_kkt import nic_link_rates
 from edge_drl.agents.rollout_features import edge_features as vector_edge_features, route_plan, nic_features
+from edge_drl.agents.slow_context import (
+    SlowDeploymentContext, SLOW_DEPLOYMENT_CONTEXT, INVENTORY_DIM, BUDGET_DIM,
+    CURRENT_STAGE_DIM, CANDIDATE_DIM, STAGE_COST_DIM,
+)
 
 
 SLOW_GLOBAL_DIM = 17
@@ -42,22 +46,28 @@ def _discounted_window_returns(
     return discounted
 
 
-def slow_node_feature_dim(num_service_types: int, cost_context: bool = False) -> int:
-    return SLOW_NODE_BASE_FEATURE_DIM + num_service_types + (2 if cost_context else 0)
+def slow_node_feature_dim(num_service_types: int, cost_context: bool = False,
+                          max_service_stages: int = 3, deployment_context: bool = False) -> int:
+    return SLOW_NODE_BASE_FEATURE_DIM + num_service_types + (2 if cost_context else 0) + (
+        num_service_types * max_service_stages + CANDIDATE_DIM if deployment_context else 0)
 
 
-def slow_global_dim(num_service_types: int, cost_context: bool = False) -> int:
-    return SLOW_GLOBAL_DIM + (5 * num_service_types if cost_context else 0)
+def slow_global_dim(num_service_types: int, cost_context: bool = False,
+                    max_service_stages: int = 3, deployment_context: bool = False) -> int:
+    return SLOW_GLOBAL_DIM + (5 * num_service_types if cost_context else 0) + (
+        INVENTORY_DIM * num_service_types * max_service_stages + BUDGET_DIM + CURRENT_STAGE_DIM
+        if deployment_context else 0)
 
 
-def slow_stage_feature_dim(cost_context: bool = False) -> int:
-    return SLOW_STAGE_FEATURE_DIM + (2 if cost_context else 0)
+def slow_stage_feature_dim(cost_context: bool = False, deployment_context: bool = False) -> int:
+    return SLOW_STAGE_FEATURE_DIM + (2 if cost_context else 0) + (STAGE_COST_DIM if deployment_context else 0)
 
 
-def slow_obs_dim(num_nodes: int, num_service_types: int, cost_context: bool = False) -> int:
+def slow_obs_dim(num_nodes: int, num_service_types: int, cost_context: bool = False,
+                 max_service_stages: int = 3, deployment_context: bool = False) -> int:
     return (
-        slow_global_dim(num_service_types, cost_context)
-        + num_nodes * slow_node_feature_dim(num_service_types, cost_context)
+        slow_global_dim(num_service_types, cost_context, max_service_stages, deployment_context)
+        + num_nodes * slow_node_feature_dim(num_service_types, cost_context, max_service_stages, deployment_context)
         + num_nodes * num_nodes * SLOW_EDGE_FEATURE_DIM
     )
 
@@ -67,9 +77,10 @@ def slow_incremental_obs_dim(
     num_service_types: int,
     max_service_stages: int,
     cost_context: bool = False,
+    deployment_context: bool = False,
 ) -> int:
-    return slow_obs_dim(num_nodes, num_service_types, cost_context) + (
-        num_service_types * max_service_stages * slow_stage_feature_dim(cost_context)
+    return slow_obs_dim(num_nodes, num_service_types, cost_context, max_service_stages, deployment_context) + (
+        num_service_types * max_service_stages * slow_stage_feature_dim(cost_context, deployment_context)
     )
 
 
@@ -168,7 +179,11 @@ class SlowDeploymentPPOAgent:
     cost_context: bool = False
     team_window_credit: bool = False
     team_value_coef: float = 0.5
+    deployment_context: str = "legacy"
     device: str = "cpu"
+    _active_context: SlowDeploymentContext | None = field(default=None, init=False, repr=False)
+    last_deployment_diagnostics: list[dict] = field(default_factory=list, init=False)
+    last_update_diagnostics: dict = field(default_factory=dict, init=False)
     count_ppo: PPOAgent = field(init=False)
     stage_ppo: PPOAgent | None = field(init=False, default=None)
     placement_ppo: PPOAgent = field(init=False)
@@ -222,6 +237,10 @@ class SlowDeploymentPPOAgent:
     critic_episode_index: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
+        if self.deployment_context not in {"legacy", SLOW_DEPLOYMENT_CONTEXT}:
+            raise ValueError("unknown Slow deployment context")
+        if self.deployment_aware and (not self.team_window_credit or self.allocation_mode != "budget-continuous-v2"):
+            raise ValueError("deployment-aware-v2 requires repaired team credit and budget-continuous-v2")
         if self.team_window_credit and (not np.isfinite(self.team_value_coef) or self.team_value_coef <= 0):
             raise ValueError("conditional team critic requires a positive finite team_value_coef")
         if not 0.0 <= self.tail_latency_coef <= 1.0:
@@ -300,16 +319,17 @@ class SlowDeploymentPPOAgent:
         )
         self.count_ppo = PPOAgent(
             obs_dim=(
-                slow_obs_dim(self.num_nodes, self.num_service_types, self.cost_context)
+                self._obs_dim()
                 if budget_allocation
                 else slow_incremental_obs_dim(
                     self.num_nodes,
                     self.num_service_types,
                     self.max_service_stages,
                     self.cost_context,
+                    self.deployment_aware,
                 )
                 if incremental_allocation
-                else slow_obs_dim(self.num_nodes, self.num_service_types, self.cost_context)
+                else self._obs_dim()
             ),
             action_dim=(
                 1
@@ -340,21 +360,26 @@ class SlowDeploymentPPOAgent:
                 if incremental_allocation
                 else "slow_gat_count"
             ),
-            global_dim=slow_global_dim(self.num_service_types, self.cost_context),
-            node_feature_dim=slow_node_feature_dim(self.num_service_types, self.cost_context),
+            global_dim=self._global_dim(),
+            node_feature_dim=self._node_dim(),
             edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
             stage_feature_dim=(
-                slow_stage_feature_dim(self.cost_context)
+                slow_stage_feature_dim(self.cost_context, self.deployment_aware)
                 if incremental_allocation and not budget_allocation
                 else None
             ),
             num_nodes=self.num_nodes,
             detach_critic_backbone=True,
             normalize_value_targets=self.team_window_credit,
+            independent_critic=self.deployment_aware,
+            critic_lr=self.critic_lr if self.deployment_aware else None,
+            critic_extra_epochs=max(self.critic_k_epochs - self.k_epochs, 0) if self.deployment_aware else 0,
+            full_batch_kl_stop=self.deployment_aware,
+            guarded_epochs=self.deployment_aware,
             device=self.device,
         )
         self.placement_ppo = PPOAgent(
-            obs_dim=slow_obs_dim(self.num_nodes, self.num_service_types, self.cost_context),
+            obs_dim=self._obs_dim(),
             action_dim=self.num_nodes,
             hidden_dim=128,
             lr=self.lr if self.placement_lr is None else self.placement_lr,
@@ -369,18 +394,23 @@ class SlowDeploymentPPOAgent:
             target_kl=self.target_kl if self.placement_target_kl is None else self.placement_target_kl,
             minibatch_size=self.minibatch_size,
             policy_kind="slow_gat_node",
-            global_dim=slow_global_dim(self.num_service_types, self.cost_context),
-            node_feature_dim=slow_node_feature_dim(self.num_service_types, self.cost_context),
+            global_dim=self._global_dim(),
+            node_feature_dim=self._node_dim(),
             edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
             num_nodes=self.num_nodes,
             detach_critic_backbone=True,
             normalize_value_targets=self.team_window_credit,
+            independent_critic=self.deployment_aware,
+            critic_lr=self.critic_lr if self.deployment_aware else None,
+            critic_extra_epochs=max(self.critic_k_epochs - self.placement_ppo_epochs, 0) if self.deployment_aware else 0,
+            full_batch_kl_stop=self.deployment_aware,
+            guarded_epochs=self.deployment_aware,
             device=self.device,
         )
         self.ppo = self.placement_ppo
         critic_device = torch.device(self.device)
         self.window_critic = SlowWindowCritic(
-            slow_obs_dim(self.num_nodes, self.num_service_types, self.cost_context),
+            self._obs_dim(),
             hidden_dim=128,
         ).to(critic_device)
         self.critic_optimizer = torch.optim.Adam(
@@ -397,6 +427,7 @@ class SlowDeploymentPPOAgent:
                     self.num_service_types,
                     self.max_service_stages,
                     self.cost_context,
+                    self.deployment_aware,
                 ),
                 action_dim=self.num_service_types * self.max_service_stages + 1,
                 hidden_dim=128,
@@ -416,15 +447,50 @@ class SlowDeploymentPPOAgent:
                 target_kl=self.count_target_kl,
                 minibatch_size=self.minibatch_size,
                 policy_kind="slow_gat_stage",
-                global_dim=slow_global_dim(self.num_service_types, self.cost_context),
-                node_feature_dim=slow_node_feature_dim(self.num_service_types, self.cost_context),
+                global_dim=self._global_dim(),
+                node_feature_dim=self._node_dim(),
                 edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
-                stage_feature_dim=slow_stage_feature_dim(self.cost_context),
+                stage_feature_dim=slow_stage_feature_dim(self.cost_context, self.deployment_aware),
                 num_nodes=self.num_nodes,
                 detach_critic_backbone=True,
                 normalize_value_targets=self.team_window_credit,
+                independent_critic=self.deployment_aware,
+                critic_lr=self.critic_lr if self.deployment_aware else None,
+                critic_extra_epochs=max(self.critic_k_epochs - (self.stage_k_epochs or self.k_epochs), 0) if self.deployment_aware else 0,
+                full_batch_kl_stop=self.deployment_aware,
+                guarded_epochs=self.deployment_aware,
                 device=self.device,
             )
+
+    @property
+    def deployment_aware(self) -> bool:
+        return self.deployment_context == SLOW_DEPLOYMENT_CONTEXT
+
+    @property
+    def placement_ppo_epochs(self) -> int:
+        return self.k_epochs if self.placement_k_epochs is None else self.placement_k_epochs
+
+    def _global_dim(self) -> int:
+        return slow_global_dim(self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware)
+
+    def _node_dim(self) -> int:
+        return slow_node_feature_dim(self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware)
+
+    def _obs_dim(self) -> int:
+        return slow_obs_dim(self.num_nodes, self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware)
+
+    def _context(self, env, demand):
+        return self._active_context or SlowDeploymentContext(env, demand)
+
+    def _deployment_features(self, env, demand, deployment, service_id=None, stage_id=None):
+        context = self._context(env, demand)
+        budget = [self.pending_budget_fraction,
+                  self.pending_budget_target_memory_gb / max(context.memory_capacity.sum(), 1e-9),
+                  self.pending_budget_target_storage_gb / max(context.storage_capacity.sum(), 1e-9),
+                  max(self.pending_budget_target_memory_gb - self.pending_budget_used_memory_gb, 0) / max(context.memory_capacity.sum(), 1e-9),
+                  max(self.pending_budget_target_storage_gb - self.pending_budget_used_storage_gb, 0) / max(context.storage_capacity.sum(), 1e-9),
+                  float(self.pending_budget_target_memory_gb > 0)]
+        return context.features(deployment, budget=budget, service_id=service_id, stage_id=stage_id)
 
     def _placement_entropy_start(self) -> float:
         return float(self.entropy_coef if self.placement_entropy_coef is None else self.placement_entropy_coef)
@@ -475,6 +541,26 @@ class SlowDeploymentPPOAgent:
         )
 
     def plan_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> np.ndarray:
+        try:
+            deployment = self._plan_deployment(env, deterministic=deterministic, record=record)
+            if self.deployment_aware:
+                context = self._active_context
+                _, pooled, proxy = context.inventory(deployment)
+                self.last_deployment_diagnostics = [
+                    {"service_id": service.service_id, "stage_id": stage.stage_id,
+                     "nodes": np.flatnonzero(deployment[service.service_id, stage.stage_id]).tolist(),
+                     "replicas": int(deployment[service.service_id, stage.stage_id].sum()),
+                     "pooled_effective_gcycles_s": float(pooled[service.service_id * self.max_service_stages + stage.stage_id]),
+                     "expected_work_gcycles_s": float(context.arrival * context.mass[service.service_id * self.max_service_stages + stage.stage_id] * context.compute[service.service_id * self.max_service_stages + stage.stage_id]),
+                     "compute_proxy_cost_s": float(proxy[service.service_id * self.max_service_stages + stage.stage_id]),
+                     "memory_per_replica_gb": stage.memory_gb}
+                    for service in env.scenario.services for stage in service.stages
+                ]
+            return deployment
+        finally:
+            self._active_context = None
+
+    def _plan_deployment(self, env: EdgeComputingEnv, deterministic: bool = False, record: bool = True) -> np.ndarray:
         env._require_ready()
         assert env.scenario is not None
         current = env.deployment if env.deployment is not None else np.zeros(
@@ -484,6 +570,8 @@ class SlowDeploymentPPOAgent:
         remaining_memory = env.service_memory_capacities()
         remaining_storage = env.service_storage_capacities()
         demand = self._node_service_demand(env)
+        if self.deployment_aware:
+            self._active_context = SlowDeploymentContext(env, demand)
         self.pending_count_indices.clear()
         self.pending_placement_indices.clear()
         self.pending_count_stage_keys.clear()
@@ -1374,6 +1462,7 @@ class SlowDeploymentPPOAgent:
         )
         count_metrics = self.count_ppo.update_from_returns(
             count_returns,
+            **({"critic_sample_weights": self._equal_window_action_weights(count_ids)} if self.deployment_aware else {}),
             sample_weights=(np.ones(len(count_ids), dtype=np.float32) if self.team_window_credit
                             else self._equal_window_action_weights(count_ids)),
             advantage_group_ids=count_advantage_groups,
@@ -1388,6 +1477,7 @@ class SlowDeploymentPPOAgent:
                 raise RuntimeError("Slow Stage returns exist without a Stage actor")
             stage_metrics = self.stage_ppo.update_from_returns(
                 stage_returns,
+                **({"critic_sample_weights": self._equal_window_action_weights(stage_ids)} if self.deployment_aware else {}),
                 sample_weights=(np.ones(len(stage_ids), dtype=np.float32) if self.team_window_credit
                                 else self._equal_window_action_weights(stage_ids)),
                 advantage_group_ids=stage_group_ids,
@@ -1414,6 +1504,7 @@ class SlowDeploymentPPOAgent:
         self.placement_ppo.entropy_coef = placement_entropy_coef
         placement_metrics = self.placement_ppo.update_from_returns(
             placement_returns,
+            **({"critic_sample_weights": self._equal_window_action_weights(placement_ids)} if self.deployment_aware else {}),
             sample_weights=placement_action_weights,
             advantage_group_ids=placement_group_ids,
             actor_use_value_baseline=self.team_window_credit,
@@ -1424,6 +1515,14 @@ class SlowDeploymentPPOAgent:
             progress_label=f"{progress_label} placement",
             progress_interval_seconds=progress_interval_seconds,
         )
+        if self.deployment_aware:
+            self.last_update_diagnostics = {
+                f"{head}_{key}": metrics.get(key, 0.0)
+                for head, metrics in (("count", count_metrics), ("stage", stage_metrics), ("placement", placement_metrics))
+                for key in ("optimizer_steps", "samples_seen_fraction", "approx_kl", "normalized_entropy",
+                            "kl_backtracks", "accepted_step_lr", "critic_extra_optimizer_steps",
+                            "value_return_std", "explained_variance", "post_explained_variance")
+            }
         critic_metrics = self._update_window_critic(trajectory_returns)
         self.last_window_critic_holdout_ev = float(
             critic_metrics["holdout_explained_variance"]
@@ -1850,6 +1949,8 @@ class SlowDeploymentPPOAgent:
         max_node_demand = max(float(total_node_demand.max()), 1e-9)
         affinity_nodes = np.zeros(self.num_nodes, dtype=np.float32)
         placement = planned_deployment if planned_deployment is not None else env.deployment
+        extra_global, extra_nodes = (self._deployment_features(env, demand, placement, service_id, stage_id)
+                                     if self.deployment_aware else ([], None))
         if placement is not None and stage_id > 0:
             affinity_nodes = placement[service_id, stage_id - 1].astype(np.float32)
         node_features = []
@@ -1868,6 +1969,8 @@ class SlowDeploymentPPOAgent:
             node_features.extend(demand[node.node_id].tolist())
             if self.cost_context:
                 node_features.extend(node_nic_features[node.node_id].tolist())
+            if self.deployment_aware:
+                node_features.extend(extra_nodes[node.node_id].tolist())
         scalars = [
             service_id / max(self.num_service_types - 1, 1),
             stage_id / max(self.max_service_stages - 1, 1),
@@ -1880,7 +1983,7 @@ class SlowDeploymentPPOAgent:
             1.0,
         ]
         return np.asarray(
-            scalars + self._feedback_features() + self._service_cost_features(env)
+            scalars + self._feedback_features() + self._service_cost_features(env) + list(extra_global)
             + node_features + self._build_edge_features(env),
             dtype=np.float32,
         )
@@ -1903,6 +2006,8 @@ class SlowDeploymentPPOAgent:
         active_deployment = (
             planned_deployment if planned_deployment is not None else env.deployment
         )
+        extra_global, extra_nodes = (self._deployment_features(env, demand, active_deployment)
+                                     if self.deployment_aware else ([], None))
         deployed_nodes = (
             np.any(active_deployment, axis=(0, 1)).astype(np.float32)
             if active_deployment is not None
@@ -1924,6 +2029,8 @@ class SlowDeploymentPPOAgent:
             node_features.extend(demand[node.node_id].tolist())
             if self.cost_context:
                 node_features.extend(node_nic_features[node.node_id].tolist())
+            if self.deployment_aware:
+                node_features.extend(extra_nodes[node.node_id].tolist())
         current_replica_rate = 0.0
         if active_deployment is not None:
             current_replica_rate = float(active_deployment.mean())
@@ -1942,7 +2049,7 @@ class SlowDeploymentPPOAgent:
             max_link_load,
         ]
         return np.asarray(
-            scalars + self._feedback_features() + self._service_cost_features(env)
+            scalars + self._feedback_features() + self._service_cost_features(env) + list(extra_global)
             + node_features + self._build_edge_features(env),
             dtype=np.float32,
         )
@@ -1965,21 +2072,21 @@ class SlowDeploymentPPOAgent:
             remaining_storage,
             planned_deployment=deployment,
         )
-        node_end = slow_global_dim(self.num_service_types, self.cost_context) + self.num_nodes * slow_node_feature_dim(
-            self.num_service_types, self.cost_context
-        )
+        node_end = self._global_dim() + self.num_nodes * self._node_dim()
         global_and_nodes = base[:node_end]
         edge_features = base[node_end:]
         stage_features: list[float] = []
         maximum_stage_demand = max(float(demand.sum(axis=0).max()), 1e-9)
         memory_capacity = np.maximum(env.service_memory_capacities(), 1e-9)
         storage_capacity = np.maximum(env.service_storage_capacities(), 1e-9)
+        cost_features = (self._context(env, demand).stage_costs(deployment, remaining_memory, remaining_storage)
+                         if self.deployment_aware else None)
         for service_id in range(self.num_service_types):
             service = env.scenario.services[service_id]
             for stage_id in range(self.max_service_stages):
                 valid = stage_id < len(service.stages)
                 if not valid:
-                    stage_features.extend([0.0] * slow_stage_feature_dim(self.cost_context))
+                    stage_features.extend([0.0] * slow_stage_feature_dim(self.cost_context, self.deployment_aware))
                     continue
                 stage = service.stages[stage_id]
                 placed = deployment[service_id, stage_id]
@@ -2020,6 +2127,8 @@ class SlowDeploymentPPOAgent:
                 if self.cost_context:
                     incoming = service.input_mb_mean if stage_id == 0 else service.stages[stage_id - 1].output_mb_mean
                     stage_features.extend([float(np.log1p(incoming)), float(np.log1p(stage.output_mb_mean))])
+                if self.deployment_aware:
+                    stage_features.extend(cost_features[service_id * self.max_service_stages + stage_id].tolist())
         return np.concatenate(
             [
                 global_and_nodes,
@@ -3529,10 +3638,15 @@ class HierarchicalPPOAgent:
         slow_counterfactual_credit_coef: float = 0.0,
         training_repair: str = "legacy",
         slow_team_value_coef: float = 0.5,
+        slow_deployment_context: str = "legacy",
     ) -> "HierarchicalPPOAgent":
         if training_repair not in {"legacy", "batch-credit-v1"}:
             raise ValueError("unknown training repair version")
         repair = training_repair == "batch-credit-v1"
+        # Unresolved parser metadata in legacy adapters is not authority to
+        # silently change architecture. The training entry point resolves auto.
+        if slow_deployment_context == "auto":
+            slow_deployment_context = "legacy"
         return cls(
             slow_agent=SlowDeploymentPPOAgent(
                 num_nodes=env.config.num_edge_nodes,
@@ -3580,6 +3694,7 @@ class HierarchicalPPOAgent:
                 cost_context=repair,
                 team_window_credit=repair,
                 team_value_coef=slow_team_value_coef,
+                deployment_context=slow_deployment_context,
                 device=device,
             ),
             fast_agent=FastSchedulingPPOAgent(

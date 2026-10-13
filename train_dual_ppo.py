@@ -488,6 +488,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--slow-team-value-coef", type=float, default=0.5,
                         help="detached normalized conditional critic loss weight in repaired mode")
+    parser.add_argument("--slow-deployment-context", choices=["auto", "legacy", "deployment-aware-v2"], default="auto",
+                        help="auto preserves checkpoint architecture; fresh repaired latency200 budget runs use deployment-aware-v2")
     parser.add_argument("--network-constraint-mode", choices=["edge-only", "shared-nic"], default="edge-only")
     parser.add_argument("--service-calibration-mode", choices=["legacy", "audited-v1"], default="legacy")
     parser.add_argument("--service-calibration-file", default=None, help="schema-1 measured/estimated budget JSON")
@@ -878,6 +880,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--load-checkpoint", type=str, default="")
+    parser.add_argument("--init-fast-checkpoint", type=str, default="",
+                        help="initialize only Fast weights/value scale from compatible environment; fresh Slow and optimizer/RNG streams")
     parser.add_argument("--deterministic-eval", action="store_true")
     parser.add_argument("--eval-baseline", action="store_true")
     parser.add_argument(
@@ -3386,6 +3390,7 @@ def save_checkpoint(
             # the architecture tag so resume failures are explicit instead of
             # surfacing later as opaque tensor-size mismatches.
             "slow_allocation_mode": agent.slow_agent.allocation_mode,
+            "slow_deployment_context": agent.slow_agent.deployment_context,
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
             "slow_count_optimizer": agent.slow_agent.count_ppo.optimizer.state_dict(),
             "slow_stage_agent": (
@@ -3460,6 +3465,8 @@ def load_checkpoint(
     # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
     # copy their tensors to the parameter device themselves.
     checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("slow_deployment_context", "legacy") != agent.slow_agent.deployment_context:
+        raise ValueError("checkpoint Slow deployment context differs; resume the saved architecture or start a fresh Slow with --init-fast-checkpoint")
     requested_repair = "batch-credit-v1" if agent.fast_agent.batch_credit else "legacy"
     if str(checkpoint.get("training_repair", "legacy")) != requested_repair:
         raise ValueError("checkpoint training repair version differs; use --training-repair auto to resume or start a fresh run")
@@ -3706,6 +3713,7 @@ class SlowLearningRateController:
         max_reductions: int = 1,
         cooldown_updates: int = 20,
         state: object = None,
+        independent_stage: bool = False,
     ) -> None:
         self.enabled = bool(enabled)
         self.patience = int(patience)
@@ -3721,6 +3729,9 @@ class SlowLearningRateController:
         self.kl_floor_fraction = float(kl_floor_fraction)
         self.max_reductions = int(max_reductions)
         self.cooldown_updates = int(cooldown_updates)
+        self.independent_stage = bool(independent_stage)
+        if self.independent_stage:
+            self.min_lrs["stage"] = self.min_lrs["count"]
         self.actor_state: dict[str, dict[str, float | int]] = {
             actor: {
                 "best_score": float("inf"),
@@ -3730,7 +3741,7 @@ class SlowLearningRateController:
                 "low_kl_blocks": 0,
                 "low_entropy_overrides": 0,
             }
-            for actor in ("count", "placement")
+            for actor in (("count", "stage", "placement") if self.independent_stage else ("count", "placement"))
         }
         if isinstance(state, dict):
             saved_actors = state.get("actors")
@@ -3788,9 +3799,14 @@ class SlowLearningRateController:
             ],
             "placement": [agent.slow_agent.placement_ppo.optimizer],
         }
+        if self.independent_stage and agent.slow_agent.stage_ppo is not None:
+            optimizers["count"] = [agent.slow_agent.count_ppo.optimizer]
+            optimizers["stage"] = [agent.slow_agent.stage_ppo.optimizer]
         for actor, actor_optimizers in optimizers.items():
             for optimizer in actor_optimizers:
                 for group in optimizer.param_groups:
+                    if group.get("role") == "critic":
+                        continue
                     old_lr = float(group["lr"])
                     new_lr = max(old_lr, self.min_lrs[actor])
                     group["lr"] = new_lr
@@ -3845,6 +3861,10 @@ class SlowLearningRateController:
                 placement_target_kl,
             ),
         }
+        if self.independent_stage:
+            actor_inputs["count"] = ([agent.slow_agent.count_ppo.optimizer], count_approx_kl, count_target_kl)
+            if agent.slow_agent.stage_ppo is not None:
+                actor_inputs["stage"] = ([agent.slow_agent.stage_ppo.optimizer], stage_approx_kl, count_target_kl)
         for actor, (actor_optimizers, approx_kl, target_kl) in actor_inputs.items():
             actor_state = self.actor_state[actor]
             if score < float(actor_state["best_score"]) - self.min_delta:
@@ -3897,6 +3917,8 @@ class SlowLearningRateController:
             actor_changed = False
             for optimizer in actor_optimizers:
                 for group in optimizer.param_groups:
+                    if group.get("role") == "critic":
+                        continue
                     old_lr = float(group["lr"])
                     new_lr = min(
                         old_lr,
@@ -4029,10 +4051,53 @@ def resolve_training_repair(args: argparse.Namespace) -> str:
     return "batch-credit-v1" if args.pressure_profile == "mec-latency200" else "legacy"
 
 
+def resolve_slow_deployment_context(args: argparse.Namespace) -> str:
+    requested = getattr(args, "slow_deployment_context", "auto")
+    if requested != "auto":
+        return requested
+    if args.load_checkpoint:
+        return str(torch.load(Path(args.load_checkpoint), map_location="cpu").get("slow_deployment_context", "legacy"))
+    return ("deployment-aware-v2" if args.pressure_profile == "mec-latency200"
+            and args.training_repair == "batch-credit-v1" and args.slow_allocation_mode == "budget-continuous-v2"
+            else "legacy")
+
+
+def initialize_fast_checkpoint(agent, path: Path, args) -> dict[str, object]:
+    """Transfer Fast only. This is NOT continuation of a previous training run."""
+    checkpoint = torch.load(path, map_location="cpu")
+    source_args = checkpoint.get("metadata", {}).get("args", {})
+    if not source_args:
+        with (path.parent.parent / "metadata.json").open(encoding="utf-8") as handle:
+            source_args = json.load(handle)["args"]
+    from edge_drl.comparison.checkpoint import CRITICAL_ENV_KEYS
+    for name in CRITICAL_ENV_KEYS + ("fast_policy_kind", "fast_chain_context", "reward_mode", "reward_scale", "max_service_stages"):
+        if name == "service_calibration_document":
+            continue
+        current = getattr(args, name, None)
+        if name in source_args and source_args[name] != current:
+            raise ValueError(f"Fast initialization configuration conflict: {name}")
+    source_physical_seed = source_args.get("physical_seed")
+    current_physical_seed = getattr(args, "physical_seed", None)
+    if (source_args.get("seed", 2026) if source_physical_seed is None else source_physical_seed) != (args.seed if current_physical_seed is None else current_physical_seed):
+        raise ValueError("Fast initialization physical seed differs")
+    if source_args.get("service_calibration_document") != getattr(args, "service_calibration_document", None):
+        raise ValueError("Fast initialization service calibration document differs")
+    if checkpoint.get("training_repair", "legacy") != args.training_repair:
+        raise ValueError("Fast initialization training repair differs")
+    agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"], strict=True)
+    if agent.fast_agent.batch_credit:
+        agent.fast_agent.ppo.load_value_normalization_state(checkpoint["fast_value_normalization"])
+    return {"path": str(path.resolve()), "source_update": checkpoint.get("metadata", {}).get("update"),
+            "scope": "fast_weights_and_value_scale_only", "resume": False}
+
+
 def main() -> None:
     args = parse_args()
     args.fast_chain_context = resolve_fast_chain_context(args)
     args.training_repair = resolve_training_repair(args)
+    args.slow_deployment_context = resolve_slow_deployment_context(args)
+    if args.load_checkpoint and args.init_fast_checkpoint:
+        raise ValueError("--load-checkpoint and --init-fast-checkpoint are mutually exclusive")
     args.rollout_acceleration_version = "vector-features-v1"
     args.network_allocator_version = "shared-nic-certified-v3"
     if args.training_repair == "batch-credit-v1":
@@ -4117,6 +4182,7 @@ def main() -> None:
         fast_chain_context=args.fast_chain_context,
         training_repair=args.training_repair,
         slow_team_value_coef=args.slow_team_value_coef,
+        slow_deployment_context=args.slow_deployment_context,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
         fast_load_balanced_updates=args.fast_load_balanced_updates,
         fast_load_group_weights=_load_probabilities_for_args(
@@ -4143,6 +4209,8 @@ def main() -> None:
         slow_counterfactual_credit_coef=args.slow_counterfactual_credit_coef,
     )
     agent.window_replica_ablation_samples = args.slow_replica_ablation_samples
+    args.fast_initialization = (initialize_fast_checkpoint(agent, Path(args.init_fast_checkpoint), args)
+                                if args.init_fast_checkpoint else None)
     loaded_metadata: dict[str, object] = {}
     if args.load_checkpoint:
         loaded_metadata = load_checkpoint(
@@ -4153,7 +4221,7 @@ def main() -> None:
     bc_metrics = pretrain_fast_agent(
         args,
         agent,
-        requests=0 if args.load_checkpoint else args.fast_bc_requests,
+        requests=0 if args.load_checkpoint or args.init_fast_checkpoint else args.fast_bc_requests,
         epochs=args.fast_bc_epochs,
     )
 
@@ -4171,6 +4239,9 @@ def main() -> None:
     )
     print(f"  train_mode={args.train_mode}")
     print(f"  training_design={args.training_design}")
+    print(f"  slow_deployment_context={args.slow_deployment_context}")
+    if args.fast_initialization:
+        print(f"  Fast initialized from {args.fast_initialization['path']}; fresh Slow, optimizers and run counters")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
     print(
         f"  fast_chain_context={args.fast_chain_context} "
@@ -4477,6 +4548,7 @@ def main() -> None:
                 )
     reference_checkpoint_load = checkpoint_reference_load(args)
     slow_lr_controller = SlowLearningRateController(
+        independent_stage=agent.slow_agent.deployment_aware,
         enabled=args.slow_lr_decay,
         patience=args.slow_lr_decay_patience,
         factor=args.slow_lr_decay_factor,
@@ -5172,6 +5244,12 @@ def main() -> None:
                 rollout_log_path,
                 build_rollout_metrics_row(one_stats, episode_context, rollout_in_update + 1),
             )
+            if agent.slow_agent.deployment_aware:
+                append_log(run_dir / "logs" / "slow_deployment_metrics.csv", {
+                    **episode_context, "context_version": args.slow_deployment_context,
+                    "budget_fraction": one_stats.get("slow_budget_fraction", 0.0),
+                    "stages_json": json.dumps(agent.slow_agent.last_deployment_diagnostics, separators=(",", ":")),
+                })
             if (
                 episode_rollout_contexts
                 and int(episode_rollout_contexts[-1]["episode"]) != episode_number
@@ -5249,6 +5327,11 @@ def main() -> None:
         else:
             slow_metrics = agent.slow_agent.empty_update_metrics()
         losses = {"slow": slow_metrics, "fast": fast_metrics}
+        if agent.slow_agent.deployment_aware and slow_updated:
+            append_log(run_dir / "logs" / "slow_update_metrics.csv", {
+                "update": update + 1, "context_version": args.slow_deployment_context,
+                **agent.slow_agent.last_update_diagnostics,
+            })
         slow_windows_buffered = agent.completed_slow_windows
         checkpoint_selection_history.append(
             {

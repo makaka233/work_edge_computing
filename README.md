@@ -56,6 +56,15 @@ budgets and full-duplex shared-NIC constraints. Old checkpoints retain their
 saved mode and observation dimensions. These changes require fresh training;
 they do not guarantee convergence or sub-200ms performance.
 
+Fresh repaired latency200 runs using `budget-continuous-v2` now resolve
+`--slow-deployment-context auto` to `deployment-aware-v2`: live stage capacity
+and full deployment observations, observable remaining budgets, independent
+conditional value encoders/training, and guarded full-rollout Slow updates.
+Old checkpoints automatically retain `legacy` dimensions and behavior.
+`--init-fast-checkpoint` transfers only compatible Fast weights/value scale
+into a fresh Slow run; it is not a resume. No environment, KKT, reward objective
+or baseline algorithm is changed. See the [Slow audit and training command](docs/SLOW_DEPLOYMENT_CONTEXT_REPAIR.md).
+
 Temporal samples are now stratified and capped at 15 represented seconds:
 requesting 6 samples in a 600-second window collects at least 40. Startup
 output reports both requested and effective counts. Budget and paired replay
