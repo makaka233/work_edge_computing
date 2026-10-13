@@ -30,6 +30,9 @@ class ServiceStage:
     storage_gb: float
     compute_gcycles_mean: float
     output_mb_mean: float
+    resident_memory_gb: float = 0.0
+    context_memory_gb: float = 0.0
+    reserved_contexts: int = 0
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,10 @@ class Service:
     stages: tuple[ServiceStage, ...]
     input_mb_mean: float
     deadline_s_mean: float
+    coherent_sampling: bool = False
+    input_sigma: float = .35
+    output_sigmas: tuple[float, ...] | None = None
+    output_input_coupling: tuple[bool, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,9 @@ def generate_realistic_scenario(
     wired_link_bandwidth_scale: float = 1.0,
     topology_k_nearest: int = 6,
     deadline_scale: float = 1.0,
+    service_calibration_mode: str = "legacy",
+    service_calibration_file: str | None = None,
+    service_calibration_document: dict | None = None,
 ) -> EdgeScenario:
     """Generate a city-scale MEC scenario with realistic heterogeneity.
 
@@ -199,6 +209,13 @@ def generate_realistic_scenario(
         deadline_scale=deadline_scale,
         service_workload_profile=service_workload_profile,
     )
+    if service_calibration_mode == "audited-v1":
+        if service_workload_profile != latency200.SERVICE_PROFILE:
+            raise ValueError("audited-v1 requires edge-ai-latency200 service profile")
+        from edge_drl.env.calibration import apply_service_budgets
+        services = apply_service_budgets(services, service_calibration_file, service_calibration_document)
+    elif service_calibration_mode != "legacy":
+        raise ValueError("unknown service calibration mode")
 
     base_service_popularity = demand_rng.dirichlet(np.linspace(2.2, 0.8, num_service_types))
     users: list[User] = []
@@ -355,13 +372,15 @@ def generate_grouped_request(
     task_data_scale: float = 1.0,
 ) -> TaskRequest:
     service = services[service_id]
-
+    input_sigma = service.input_sigma if service.coherent_sampling else .35
     input_mb = _sample_lognormal_group_mean(
         rng,
         service.input_mb_mean * task_data_scale,
-        0.35,
+        input_sigma,
         request_count,
     )
+    if service.coherent_sampling:
+        input_mb *= np.exp(-.5 * input_sigma ** 2)
     stage_compute = []
     stage_output = []
     for stage in service.stages:
@@ -373,14 +392,21 @@ def generate_grouped_request(
                 request_count,
             )
         )
+        if service.coherent_sampling:
+            stage_compute[-1] *= np.exp(-.5 * .30 ** 2)
         stage_output.append(
             _sample_lognormal_group_mean(
                 rng,
                 stage.output_mb_mean * task_data_scale,
-                0.35,
+                service.output_sigmas[stage.stage_id] if service.coherent_sampling else .35,
                 request_count,
             )
         )
+        if service.coherent_sampling:
+            sigma = service.output_sigmas[stage.stage_id]
+            stage_output[-1] *= np.exp(-.5 * sigma ** 2)
+            if service.output_input_coupling[stage.stage_id]:
+                stage_output[-1] = stage.output_mb_mean * task_data_scale * input_mb / max(service.input_mb_mean * task_data_scale, 1e-12)
 
     deadline_s = _sample_lognormal_group_mean(rng, service.deadline_s_mean, 0.18, request_count)
     deadline_s = float(np.clip(deadline_s, 0.05, 0.60))

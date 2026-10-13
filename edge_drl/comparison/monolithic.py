@@ -74,7 +74,10 @@ class MonolithicTemperatureGATPolicy(GraphAttentionNodeScoringActorCritic):
         pooled_nodes = (graph_emb * mask_float).sum(dim=1) / mask_float.sum(
             dim=1
         ).clamp_min(1.0)
-        values = self.critic(torch.cat([global_emb, pooled_nodes], dim=-1)).squeeze(-1)
+        critic_input = torch.cat([global_emb, pooled_nodes], dim=-1)
+        if self.detach_critic_backbone:
+            critic_input = critic_input.detach()
+        values = self.critic(critic_input).squeeze(-1)
         return dist, values
 
 
@@ -125,9 +128,21 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
         rewards: list[float],
         done: bool,
         weight: float = 1.0,
+        *, batch_end: bool | None = None, multiplicity: float = 1.0,
     ) -> None:
         """Treat every jointly settled request batch as one PPO trajectory."""
 
+        if self.batch_credit:
+            super().assign_schedule_rewards(rewards, done=done, weight=weight,
+                                            batch_end=batch_end, multiplicity=multiplicity)
+            # Keep the legacy specialization's diagnostic queue aligned,
+            # while the repaired controller uses explicit batch boundaries.
+            queue = self._batch_reward_queue()
+            if queue:
+                queue[0] -= 1
+                if queue[0] == 0:
+                    queue.pop(0)
+            return
         if getattr(self, "monolithic_fast_design", None) != MONOLITHIC_FAST_DESIGN:
             return super().assign_schedule_rewards(rewards, done=done, weight=weight)
         if len(rewards) != 1:
@@ -375,6 +390,14 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
             remaining_compute / full_compute,
             remaining_input / full_input,
         ]
+        if self.batch_credit:
+            count = max(tick_weight, 1.0)
+            global_features.extend([
+                count / max(float(total_request_weight), 1.0),
+                float(np.log1p(remaining_compute / max(sum(n.compute_gcycles_per_s for n in nodes), 1e-9))),
+                float(np.log1p(remaining_input / count)), 0.0,
+                service_weight / count, tick_events / max(len(env.current_requests), 1),
+            ])
         if self.policy_kind == "gat_node_scorer":
             node_features.extend(self._build_edge_features(env))
         state = np.asarray(global_features + node_features, dtype=np.float32)
@@ -382,6 +405,7 @@ class MonolithicFastSchedulingPPOAgent(FastSchedulingPPOAgent):
             self.num_nodes,
             self.policy_kind,
             self.chain_context,
+            self.batch_credit,
         )
         if state.shape != (expected_dim,):
             raise RuntimeError(
@@ -509,6 +533,8 @@ def collapse_scenario(base: EdgeScenario) -> EdgeScenario:
             storage_gb=sum(stage.storage_gb for stage in service.stages),
             compute_gcycles_mean=sum(stage.compute_gcycles_mean for stage in service.stages),
             output_mb_mean=0.0,
+            resident_memory_gb=sum(stage.resident_memory_gb for stage in service.stages),
+            context_memory_gb=sum(stage.context_memory_gb for stage in service.stages),
         )
         services.append(replace(service, stages=(aggregated,)))
     scenario.services = services

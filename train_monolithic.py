@@ -341,6 +341,7 @@ def _monolithic_rollout_args(
             base_args.get("fast_oracle_candidates_per_stage", 8)
         ),
         sampled_seconds_per_window=int(sampled_seconds_per_window),
+        sampling_max_interval_seconds=float(base_args.get("sampling_max_interval_seconds", 0.0)),
     )
 
 
@@ -420,7 +421,8 @@ def _synchronized_episode(
         schedule_window_seconds=1,
         request_stride_seconds=(
             1
-            if sampled_seconds_per_window <= 0 or sampled_seconds_per_window >= window_seconds
+            if config.temporal_sampling_mode == "stratified-jitter"
+            or sampled_seconds_per_window <= 0 or sampled_seconds_per_window >= window_seconds
             else max(int(round(window_seconds / sampled_seconds_per_window)), 1)
         ),
         reload_schedule_boundaries=True,
@@ -532,6 +534,9 @@ def main() -> None:
         if effective_sampled_seconds == 0
         else min(effective_sampled_seconds, window_seconds)
     )
+    sampling_cap = float(base_args.get("sampling_max_interval_seconds", 0.0))
+    if sampling_cap > 0:
+        effective_sampled_seconds = max(effective_sampled_seconds, int(np.ceil(window_seconds / sampling_cap)))
     windows_per_update = total_windows_per_episode * cli.episodes_per_update
     if resume_path is not None:
         expected_resume = {

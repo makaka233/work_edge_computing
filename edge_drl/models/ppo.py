@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from dataclasses import dataclass, field
 import math
 import sys
@@ -306,12 +308,14 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         edge_feature_dim: int,
         num_nodes: int,
         hidden_dim: int = 128,
+        detach_critic_backbone: bool = False,
     ):
         super().__init__()
         self.global_dim = global_dim
         self.node_feature_dim = node_feature_dim
         self.edge_feature_dim = edge_feature_dim
         self.num_nodes = num_nodes
+        self.detach_critic_backbone = bool(detach_critic_backbone)
         self.node_offset = global_dim
         self.edge_offset = global_dim + num_nodes * node_feature_dim
 
@@ -377,7 +381,10 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
 
         mask_float = safe_masks.float().unsqueeze(-1)
         pooled_nodes = (graph_emb * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1.0)
-        values = self.critic(torch.cat([global_emb, pooled_nodes], dim=-1)).squeeze(-1)
+        critic_input = torch.cat([global_emb, pooled_nodes], dim=-1)
+        if self.detach_critic_backbone:
+            critic_input = critic_input.detach()
+        values = self.critic(critic_input).squeeze(-1)
         return dist, values
 
     def _graph_attention(self, node_emb: torch.Tensor, edge_features: torch.Tensor) -> torch.Tensor:
@@ -623,6 +630,8 @@ class PPOAgent:
         group_balanced_updates: bool = False,
         group_weight_targets: tuple[float, ...] | None = None,
         full_batch_kl_stop: bool = False,
+        normalize_value_targets: bool = False,
+        guarded_epochs: bool = False,
         device: str = "cpu",
     ):
         self.gamma = gamma
@@ -646,6 +655,13 @@ class PPOAgent:
                 raise ValueError("group_weight_targets must be non-negative with positive total weight")
             self.group_weight_targets /= float(self.group_weight_targets.sum())
         self.full_batch_kl_stop = bool(full_batch_kl_stop)
+        self.normalize_value_targets = bool(normalize_value_targets)
+        self.guarded_epochs = bool(guarded_epochs)
+        self.value_return_mean = 0.0
+        self.value_return_std = 1.0
+        self.value_normalization_initialized = False
+        if self.guarded_epochs and not self.full_batch_kl_stop:
+            raise ValueError("guarded_epochs requires full_batch_kl_stop")
         self.device = torch.device(device)
         self.continuous_actions = policy_kind == "slow_gat_budget"
         self.last_group_diagnostics: dict[float, dict[str, float]] = {}
@@ -669,6 +685,7 @@ class PPOAgent:
                 edge_feature_dim=edge_feature_dim,
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
+                detach_critic_backbone=detach_critic_backbone,
             ).to(self.device)
         elif policy_kind in {
             "slow_gat_node",
@@ -701,6 +718,51 @@ class PPOAgent:
             raise ValueError(f"unknown policy_kind: {policy_kind}")
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
         self.buffer = RolloutBuffer()
+
+    def _raw_values(self, values: torch.Tensor) -> torch.Tensor:
+        if self.normalize_value_targets:
+            return values * self.value_return_std + self.value_return_mean
+        return values
+
+    def _normalized_value_targets(self, returns: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        """PopArt-style target normalization, preserving raw predictions."""
+        if not self.normalize_value_targets:
+            return returns
+        if not np.isfinite(returns).all():
+            raise ValueError("value targets must be finite")
+        batch_mean = float(np.average(returns, weights=weights))
+        batch_var = float(np.average((returns - batch_mean) ** 2, weights=weights))
+        old_mean, old_std = self.value_return_mean, self.value_return_std
+        rate = 0.1 if self.value_normalization_initialized else 1.0
+        new_mean = (1.0 - rate) * old_mean + rate * batch_mean
+        new_second = (1.0 - rate) * (old_std ** 2 + old_mean ** 2) + rate * (batch_var + batch_mean ** 2)
+        new_std = max(float(np.sqrt(max(new_second - new_mean ** 2, 0.0))), 1e-3)
+        output = self.policy.critic if isinstance(self.policy.critic, nn.Linear) else self.policy.critic[-1]
+        ratio = old_std / new_std
+        with torch.no_grad():
+            output.weight.mul_(ratio)
+            output.bias.mul_(old_std).add_(old_mean - new_mean).div_(new_std)
+            for parameter in (output.weight, output.bias):
+                state = self.optimizer.state.get(parameter, {})
+                if "exp_avg" in state:
+                    state["exp_avg"].mul_(ratio)
+                    state["exp_avg_sq"].mul_(ratio ** 2)
+                    if "max_exp_avg_sq" in state:
+                        state["max_exp_avg_sq"].mul_(ratio ** 2)
+        self.value_return_mean, self.value_return_std = new_mean, new_std
+        self.value_normalization_initialized = True
+        return (returns - new_mean) / new_std
+
+    def value_normalization_state(self) -> dict[str, float | bool]:
+        return {"mean": self.value_return_mean, "std": self.value_return_std,
+                "initialized": self.value_normalization_initialized}
+
+    def load_value_normalization_state(self, state: dict[str, float | bool]) -> None:
+        mean, std = float(state["mean"]), float(state["std"])
+        if not np.isfinite(mean) or not np.isfinite(std) or std <= 0.0:
+            raise ValueError("invalid value normalization checkpoint")
+        self.value_return_mean, self.value_return_std = mean, std
+        self.value_normalization_initialized = bool(state["initialized"])
 
     def _clip_policy_gradients(self, max_norm: float = 0.5) -> None:
         """Clip detached actor/backbone and critic gradients independently."""
@@ -735,7 +797,7 @@ class PPOAgent:
                 action_t = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
             logprob_t = dist.log_prob(action_t)
         action = float(action_t.item()) if self.continuous_actions else int(action_t.item())
-        return action, float(logprob_t.item()), float(value.item())
+        return action, float(logprob_t.item()), float(self._raw_values(value).item())
 
     def act_batch(
         self,
@@ -766,7 +828,7 @@ class PPOAgent:
                 np.float32 if self.continuous_actions else np.int64
             ),
             logprobs.detach().cpu().numpy().astype(np.float32),
-            values.detach().cpu().numpy().astype(np.float32),
+            self._raw_values(values).detach().cpu().numpy().astype(np.float32),
         )
 
     def action_stats(self, state: np.ndarray, mask: np.ndarray) -> dict[str, float | int]:
@@ -787,7 +849,7 @@ class PPOAgent:
             "entropy": entropy,
             "top1_prob": top1,
             "top1_margin": top1 - top2,
-            "value": float(value.item()),
+            "value": float(self._raw_values(value).item()),
         }
 
     def action_probabilities(self, state: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, float]:
@@ -980,6 +1042,13 @@ class PPOAgent:
             dtype=np.float32 if self.continuous_actions else np.int64,
         )
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
+        value_targets_np = self._normalized_value_targets(returns_np, weights_np)
+        if self.guarded_epochs:
+            return self._update_guarded_epochs(
+                actions_np, old_logprobs_np, advantages_np, value_targets_np,
+                weights_np, group_ids_np, advantage_mean, advantage_std,
+                progress_label, progress_interval_seconds,
+            )
         n = len(actions_np)
         minibatch_size = max(1, min(self.minibatch_size, n))
         batches_per_epoch = int(np.ceil(n / minibatch_size))
@@ -1031,7 +1100,7 @@ class PPOAgent:
                 )
                 old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
                 advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
-                returns = torch.as_tensor(returns_np[idx], dtype=torch.float32, device=self.device)
+                returns = torch.as_tensor(value_targets_np[idx], dtype=torch.float32, device=self.device)
                 sample_weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
                 sample_weights = sample_weights / sample_weights.mean().clamp_min(1e-8)
 
@@ -1137,6 +1206,104 @@ class PPOAgent:
         last_metrics["full_batch_kl_checks"] = float(full_batch_kl_checks)
         self.buffer.clear()
         return last_metrics
+
+    def _update_guarded_epochs(
+        self, actions_np, old_logprobs_np, advantages_np, value_targets_np,
+        weights_np, group_ids_np, advantage_mean, advantage_std,
+        progress_label, progress_interval_seconds,
+    ) -> dict[str, float]:
+        """One full-rollout gradient per epoch; minibatches only bound memory.
+
+        Every load group contributes before the first actor step. Reject an
+        excessive *post-step* KL, restoring both parameters and Adam moments,
+        and backtrack the same gradient. A rejected step is never committed.
+        """
+        n = len(actions_np)
+        size = max(1, min(self.minibatch_size, n))
+        batches = int(np.ceil(n / size))
+        denominator = max(float(weights_np.sum()), 1e-8)
+        accepted = retries = checks = consumed = 0
+        stopped = False
+        metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0}
+        accepted_lr = 0.0
+        progress = None
+        if tqdm is not None and progress_label and progress_interval_seconds > 0:
+            progress = tqdm(total=self.k_epochs * batches, desc=progress_label,
+                            unit="mb", mininterval=progress_interval_seconds, file=sys.stdout)
+        for _ in range(self.k_epochs):
+            self.optimizer.zero_grad()
+            totals = dict.fromkeys(metrics, 0.0)
+            for start in range(0, n, size):
+                idx = np.arange(start, min(start + size, n))
+                states = torch.as_tensor(np.stack([self.buffer.states[i] for i in idx]),
+                                         dtype=torch.float32, device=self.device)
+                masks = torch.as_tensor(np.stack([self.buffer.masks[i] for i in idx]),
+                                        dtype=torch.bool, device=self.device)
+                actions = torch.as_tensor(actions_np[idx], device=self.device,
+                                          dtype=torch.float32 if self.continuous_actions else torch.long)
+                old = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
+                advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
+                targets = torch.as_tensor(value_targets_np[idx], dtype=torch.float32, device=self.device)
+                weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
+                dist, values = self.policy(states, masks)
+                ratio = (dist.log_prob(actions) - old).exp()
+                surrogate = torch.minimum(ratio * advantages,
+                                          ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages)
+                actor = -(surrogate * weights).sum() / denominator
+                critic = ((values - targets).square() * weights).sum() / denominator
+                entropy = (dist.entropy() * weights).sum() / denominator
+                loss = actor + self.value_coef * critic - self.entropy_coef * entropy
+                loss.backward()
+                for key, value in (("loss", loss), ("policy_loss", actor), ("value_loss", critic)):
+                    totals[key] += float(value.detach().item())
+                consumed += 1
+                if progress is not None:
+                    progress.update(1)
+            self._clip_policy_gradients()
+            policy_before = copy.deepcopy(self.policy.state_dict())
+            optimizer_before = copy.deepcopy(self.optimizer.state_dict())
+            learning_rates = [float(group["lr"]) for group in self.optimizer.param_groups]
+            step_accepted = False
+            for attempt in range(7):
+                for group, lr in zip(self.optimizer.param_groups, learning_rates):
+                    group["lr"] = lr * (0.5 ** attempt)
+                self.optimizer.step()
+                diagnostics = self._buffer_policy_diagnostics(
+                    actions_np, old_logprobs_np, weights_np, group_ids_np)
+                checks += 1
+                kl = max(diagnostics["approx_kl"], diagnostics["max_group_approx_kl"])
+                parameters_finite = all(bool(torch.isfinite(p).all()) for p in self.policy.parameters())
+                if parameters_finite and np.isfinite(kl) and (self.target_kl is None or kl <= self.target_kl):
+                    step_accepted = True
+                    accepted += 1
+                    accepted_lr = learning_rates[0] * (0.5 ** attempt)
+                    metrics = totals
+                    # Backtracking is per-step, not a hidden persistent LR schedule.
+                    for group, lr in zip(self.optimizer.param_groups, learning_rates):
+                        group["lr"] = lr
+                    break
+                self.policy.load_state_dict(policy_before)
+                self.optimizer.load_state_dict(optimizer_before)
+                retries += 1
+            if not step_accepted:
+                stopped = True
+                break
+        if progress is not None:
+            progress.close()
+        metrics.update(self._buffer_policy_diagnostics(
+            actions_np, old_logprobs_np, weights_np, group_ids_np))
+        metrics.update({
+            "advantage_mean": advantage_mean, "advantage_std": advantage_std,
+            "epochs_completed": float(accepted), "optimizer_steps": float(accepted),
+            "kl_early_stop": float(stopped), "minibatches_completed": float(consumed),
+            "minibatches_planned": float(self.k_epochs * batches),
+            "samples_seen_fraction": 1.0, "min_group_seen_fraction": 1.0,
+            "full_batch_kl_checks": float(checks), "kl_backtracks": float(retries),
+            "accepted_step_lr": accepted_lr, "value_return_mean": self.value_return_mean,
+            "value_return_std": self.value_return_std,
+        })
+        self.buffer.clear()
+        return metrics
 
     def update_actor(
         self,
@@ -1268,6 +1435,7 @@ class PPOAgent:
         sample_weights: np.ndarray | None = None,
         advantage_group_ids: np.ndarray | None = None,
         actor_use_value_baseline: bool = True,
+        actor_baseline_values: np.ndarray | None = None,
         auxiliary_advantages: np.ndarray | None = None,
         auxiliary_advantage_coef: float = 0.0,
         auxiliary_attribution: np.ndarray | None = None,
@@ -1327,12 +1495,18 @@ class PPOAgent:
             if np.any(weights_np < 0.0) or not np.isfinite(weights_np).all():
                 raise ValueError("sample_weights must be finite and non-negative")
         weights_np = weights_np / max(float(weights_np.mean()), 1e-8)
+        value_targets_np = self._normalized_value_targets(returns_np, weights_np)
 
         # A poor component critic can make an otherwise useful Monte-Carlo
         # signal noisier. Count can therefore train its actor from direct
         # returns centered within comparable service stages, while the value
         # head still learns the original absolute returns below.
-        advantages_np = returns_np - old_values_np if actor_use_value_baseline else returns_np.copy()
+        baseline_np = old_values_np
+        if actor_baseline_values is not None:
+            baseline_np = np.asarray(actor_baseline_values, dtype=np.float32)
+            if baseline_np.shape != (n,) or not np.isfinite(baseline_np).all():
+                raise ValueError("actor baseline must be finite and match actions")
+        advantages_np = returns_np - baseline_np if actor_use_value_baseline else returns_np.copy()
         if advantage_group_ids is not None:
             group_ids_np = np.asarray(advantage_group_ids)
             if group_ids_np.shape != (n,):
@@ -1481,7 +1655,7 @@ class PPOAgent:
                 )
                 old_logprobs = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
                 advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
-                targets = torch.as_tensor(returns_np[idx], dtype=torch.float32, device=self.device)
+                targets = torch.as_tensor(value_targets_np[idx], dtype=torch.float32, device=self.device)
                 batch_weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
                 denominator = batch_weights.sum().clamp_min(1e-8)
 
@@ -1561,7 +1735,7 @@ class PPOAgent:
                     device=self.device,
                 )
                 _, values = self.policy(states, masks)
-                post_values_parts.append(values.detach().cpu().numpy())
+                post_values_parts.append(self._raw_values(values).detach().cpu().numpy())
         post_values_np = np.concatenate(post_values_parts).astype(np.float32, copy=False)
         post_residual = returns_np - post_values_np
         post_residual_variance = float(

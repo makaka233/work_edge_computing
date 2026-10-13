@@ -49,6 +49,27 @@ kept thin. The problem model is different, so the code is specialized for:
 
 ## Current Modules
 
+For fresh `mec-latency200` training, `batch-credit-v1` enables batch-wide Fast
+credit, detached normalized critics, guarded full-rollout PPO epochs, and
+Slow conditional window credit. The profile also enables audited workload
+budgets and full-duplex shared-NIC constraints. Old checkpoints retain their
+saved mode and observation dimensions. These changes require fresh training;
+they do not guarantee convergence or sub-200ms performance.
+
+Temporal samples are now stratified and capped at 15 represented seconds:
+requesting 6 samples in a 600-second window collects at least 40. Startup
+output reports both requested and effective counts. Budget and paired replay
+audits are available in `scripts/calibrate_environment.py`; implementation,
+measurement limits, and legacy controls are in
+[the repair record](docs/LATENCY200_TRAINING_REPAIR.md).
+
+`vector-features-v1` accelerates rollout with cached static graph observations,
+matrix-based all-node candidate features, and active-port NIC optimization.
+Exact sequential ledgers and shared-NIC settlement are unchanged. Repaired
+training skips unused legacy local-credit probes; fresh runs disable Oracle
+diagnostics by default. A same-policy 8-request CPU microbenchmark measured
+2.54x faster candidate-feature scheduling, not a full-training speed guarantee.
+
 Configuration is defined by the Python entrypoints and checkpoint metadata;
 the former documentation-only YAML files have been removed. Use each
 entrypoint's `--help` to inspect supported options.

@@ -14,6 +14,9 @@ from train_dual_ppo import load_checkpoint
 
 
 CRITICAL_ENV_KEYS = (
+    "network_constraint_mode",
+    "service_calibration_mode",
+    "service_calibration_document",
     "num_users",
     "num_edge_nodes",
     "num_service_types",

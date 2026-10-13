@@ -87,6 +87,10 @@ PRESSURE_PROFILE_DEFAULTS: dict[str, dict[str, float | str | bool]] = {
         "wireless_uplink_mbps": 300.0,
         "radio_rtt_ms": 10.0,
         "sampled_load_update_mode": "interval-average",
+        "network_constraint_mode": "shared-nic",
+        "service_calibration_mode": "audited-v1",
+        "temporal_sampling_mode": "stratified-jitter",
+        "sampling_max_interval_seconds": 15.0,
         # Keep deadline semantics identical to the archived constrained run.
         # Lower physical latency is never manufactured by relaxing deadlines.
         "deadline_scale": 2.75,
@@ -478,6 +482,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--link-imbalance-coef", type=float, default=0.0)
     parser.add_argument("--idle-deployed-node-coef", type=float, default=0.0)
     parser.add_argument("--fast-policy-kind", choices=["node_scorer", "gat_node_scorer"], default="gat_node_scorer")
+    parser.add_argument(
+        "--training-repair", choices=["auto", "legacy", "batch-credit-v1"], default="auto",
+        help="auto enables repaired credit for fresh mec-latency200 runs; checkpoints retain their saved version",
+    )
+    parser.add_argument("--slow-team-value-coef", type=float, default=0.5,
+                        help="detached normalized conditional critic loss weight in repaired mode")
+    parser.add_argument("--network-constraint-mode", choices=["edge-only", "shared-nic"], default="edge-only")
+    parser.add_argument("--service-calibration-mode", choices=["legacy", "audited-v1"], default="legacy")
+    parser.add_argument("--service-calibration-file", default=None, help="schema-1 measured/estimated budget JSON")
+    parser.add_argument("--temporal-sampling-mode", choices=["left-hold", "stratified-jitter"], default="left-hold")
+    parser.add_argument("--sampling-max-interval-seconds", type=float, default=0.0,
+                        help="0 disables cap; otherwise limit holding one sampled second over skipped time")
     parser.add_argument(
         "--fast-chain-context",
         choices=["auto", "legacy", "chain-v2", "chain-kkt-v3"],
@@ -1124,6 +1140,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--request-aggregation-window-seconds must remain exactly 1.0")
     if args.sampled_seconds_per_window < 0:
         parser.error("--sampled-seconds-per-window must be >= 0")
+    if not np.isfinite(args.sampling_max_interval_seconds) or (args.sampling_max_interval_seconds != 0 and args.sampling_max_interval_seconds < 1):
+        parser.error("--sampling-max-interval-seconds must be 0 or finite and >= 1")
+    if not np.isfinite(args.slow_team_value_coef) or args.slow_team_value_coef <= 0:
+        parser.error("--slow-team-value-coef must be positive and finite")
     if args.train_mode == "joint" and args.rollout_unit == "requests":
         parser.error("joint training requires --rollout-unit window or episode so each slow action receives a complete return")
     if args.training_design == "trajectory-simultaneous":
@@ -1431,6 +1451,11 @@ def build_env(args: argparse.Namespace, seed_offset: int = 0, *, group_scenario_
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
             sampled_load_update_mode=getattr(args, "sampled_load_update_mode", "legacy-repeat"),
+            network_constraint_mode=getattr(args, "network_constraint_mode", "edge-only"),
+            service_calibration_mode=getattr(args, "service_calibration_mode", "legacy"),
+            service_calibration_file=getattr(args, "service_calibration_file", None),
+            service_calibration_document=getattr(args, "service_calibration_document", None),
+            temporal_sampling_mode=getattr(args, "temporal_sampling_mode", "left-hold"),
             wireless_uplink_mbps=args.wireless_uplink_mbps,
             radio_rtt_ms=args.radio_rtt_ms,
         )
@@ -1491,6 +1516,11 @@ def build_training_env(
             request_aggregation_window_seconds=args.request_aggregation_window_seconds,
             load_ewma_tau_minutes=args.load_ewma_tau_minutes,
             sampled_load_update_mode=getattr(args, "sampled_load_update_mode", "legacy-repeat"),
+            network_constraint_mode=getattr(args, "network_constraint_mode", "edge-only"),
+            service_calibration_mode=getattr(args, "service_calibration_mode", "legacy"),
+            service_calibration_file=getattr(args, "service_calibration_file", None),
+            service_calibration_document=getattr(args, "service_calibration_document", None),
+            temporal_sampling_mode=getattr(args, "temporal_sampling_mode", "left-hold"),
             wireless_uplink_mbps=args.wireless_uplink_mbps,
             radio_rtt_ms=args.radio_rtt_ms,
         )
@@ -1845,6 +1875,9 @@ def rollout(
         window_seconds = float(env.config.deployment_interval_minutes * 60)
         if 0 < sampled_seconds < window_seconds:
             represented_seconds = window_seconds / float(sampled_seconds)
+            hold_cap = float(getattr(args, "sampling_max_interval_seconds", 0.0))
+            if hold_cap > 0:
+                represented_seconds = min(represented_seconds, hold_cap)
     if rollout_unit == "requests":
         target_requests = max_requests
     elif rollout_unit == "window":
@@ -1885,6 +1918,8 @@ def rollout(
                 env.current_time_minute = stop_time_minute
                 break
             step_represented_seconds = min(step_represented_seconds, remaining_seconds)
+        if record:
+            env.sample_interval_requests(step_represented_seconds)
         requests = list(env.current_requests)
         if train_mode == "fast-only":
             if env.needs_deployment_update:
@@ -1908,7 +1943,7 @@ def rollout(
                 agent.fast_agent.stage_counterfactual_regrets(env, request, schedule)
                 for request, schedule in zip(requests, actions)
             ]
-            if record_fast and fast_counterfactual_coef > 0.0
+            if record_fast and not agent.fast_agent.batch_credit and fast_counterfactual_coef > 0.0
             else [[] for _ in requests]
         )
         batch_slow_marginal_values = (
@@ -1921,10 +1956,11 @@ def rollout(
                 for request, schedule in zip(requests, actions)
             ]
             if record_slow
+            and not agent.slow_agent.team_window_credit
             and float(getattr(args, "slow_counterfactual_credit_coef", 0.0)) > 0.0
             else [None for _ in requests]
         )
-        if record_slow and getattr(args, "slow_replica_ablation_samples", 0) > 0:
+        if record_slow and not agent.slow_agent.team_window_credit and getattr(args, "slow_replica_ablation_samples", 0) > 0:
             agent.observe_replica_ablation(env, requests)
         if oracle_requests_remaining > 0:
             for request, schedule in zip(requests, actions):
@@ -2018,6 +2054,8 @@ def rollout(
                     done=bool(done and group_idx == len(group_infos) - 1),
                     weight=request_count,
                     fast_stage_rewards=fast_stage_rewards,
+                    fast_batch_end=group_idx == len(group_infos) - 1,
+                    fast_multiplicity=float(request.request_count),
                     slow_reward=-float(info["latency_s"]) * reward_scale,
                     latency_s=float(info["latency_s"]),
                     penalty_latency_s=float(info["penalty_latency_s"]),
@@ -2706,6 +2744,10 @@ def build_episode_metrics_row(
         "total_reward": float(stats["avg_reward"] * requests),
         "total_train_reward": float(stats["avg_train_reward"] * requests),
         **stats,
+        "first_window_avg_latency_s": float(rollouts[0]["first_window_avg_latency_s"]),
+        "last_window_avg_latency_s": float(rollouts[-1]["last_window_avg_latency_s"]),
+        "window_latency_delta_s": float(rollouts[-1]["last_window_avg_latency_s"])
+        - float(rollouts[0]["first_window_avg_latency_s"]),
     }
 
 
@@ -3338,6 +3380,7 @@ def save_checkpoint(
         "cached_gaussian": float(numpy_state[4]),
     }
     checkpoint = {
+            "training_repair": "batch-credit-v1" if agent.fast_agent.batch_credit else "legacy",
             # The global incremental Count head has a different action space
             # and network topology from the legacy per-stage Count head.  Save
             # the architecture tag so resume failures are explicit instead of
@@ -3389,6 +3432,12 @@ def save_checkpoint(
             "pending_slow_collection": _serialize_pending_slow_collection(agent),
             "fast_agent": agent.fast_agent.ppo.policy.state_dict(),
             "fast_optimizer": agent.fast_agent.ppo.optimizer.state_dict(),
+            "fast_value_normalization": agent.fast_agent.ppo.value_normalization_state(),
+            "slow_component_value_normalization": {
+                "count": agent.slow_agent.count_ppo.value_normalization_state(),
+                "stage": None if agent.slow_agent.stage_ppo is None else agent.slow_agent.stage_ppo.value_normalization_state(),
+                "placement": agent.slow_agent.placement_ppo.value_normalization_state(),
+            },
             "fast_entropy_current_coef": agent.fast_agent.entropy_current_coef,
             "training_random_streams": None if random_streams is None else random_streams.state_dict(),
             "numpy_random_state": safe_numpy_state,
@@ -3411,6 +3460,13 @@ def load_checkpoint(
     # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
     # copy their tensors to the parameter device themselves.
     checkpoint = torch.load(path, map_location="cpu")
+    requested_repair = "batch-credit-v1" if agent.fast_agent.batch_credit else "legacy"
+    if str(checkpoint.get("training_repair", "legacy")) != requested_repair:
+        raise ValueError("checkpoint training repair version differs; use --training-repair auto to resume or start a fresh run")
+    if agent.fast_agent.batch_credit and "fast_value_normalization" not in checkpoint:
+        raise ValueError("repaired checkpoint is missing Fast value normalization state")
+    if agent.slow_agent.team_window_credit and "slow_component_value_normalization" not in checkpoint:
+        raise ValueError("repaired checkpoint is missing Slow conditional value normalization")
     saved_allocation_mode = checkpoint.get("slow_allocation_mode")
     if saved_allocation_mode is None and "slow_count_agent" in checkpoint:
         count_state = checkpoint["slow_count_agent"]
@@ -3510,6 +3566,14 @@ def load_checkpoint(
         agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"])
     if "fast_optimizer" in checkpoint:
         agent.fast_agent.ppo.optimizer.load_state_dict(checkpoint["fast_optimizer"])
+    if "fast_value_normalization" in checkpoint:
+        agent.fast_agent.ppo.load_value_normalization_state(checkpoint["fast_value_normalization"])
+    if "slow_component_value_normalization" in checkpoint:
+        for name, ppo in (("count", agent.slow_agent.count_ppo), ("stage", agent.slow_agent.stage_ppo),
+                          ("placement", agent.slow_agent.placement_ppo)):
+            state = checkpoint["slow_component_value_normalization"].get(name)
+            if ppo is not None and state is not None:
+                ppo.load_value_normalization_state(state)
     if "slow_placement_updates_completed" in checkpoint:
         agent.slow_agent.placement_updates_completed = int(checkpoint["slow_placement_updates_completed"])
     if "slow_placement_entropy_current_coef" in checkpoint:
@@ -3954,9 +4018,44 @@ def resolve_fast_chain_context(args: argparse.Namespace) -> str:
     return str(checkpoint_args.get("fast_chain_context", "legacy"))
 
 
+def resolve_training_repair(args: argparse.Namespace) -> str:
+    requested = str(getattr(args, "training_repair", "auto"))
+    if requested != "auto":
+        return requested
+    checkpoint_path = getattr(args, "load_checkpoint", None)
+    if checkpoint_path:
+        checkpoint = torch.load(Path(checkpoint_path), map_location="cpu")
+        return str(checkpoint.get("training_repair", "legacy"))
+    return "batch-credit-v1" if args.pressure_profile == "mec-latency200" else "legacy"
+
+
 def main() -> None:
     args = parse_args()
     args.fast_chain_context = resolve_fast_chain_context(args)
+    args.training_repair = resolve_training_repair(args)
+    args.rollout_acceleration_version = "vector-features-v1"
+    args.network_allocator_version = "shared-nic-certified-v3"
+    if args.training_repair == "batch-credit-v1":
+        explicit_controls = {token.split("=", 1)[0] for token in sys.argv[1:]}
+        for name in ("slow_counterfactual_credit_coef", "slow_replica_ablation_samples", "fast_oracle_diagnostic_requests",
+                     "fast_counterfactual_credit_coef", "fast_counterfactual_credit_final_coef"):
+            if "--" + name.replace("_", "-") not in explicit_controls:
+                setattr(args, name, 0)
+    if args.load_checkpoint:
+        saved = torch.load(Path(args.load_checkpoint), map_location="cpu")
+        saved_args = saved.get("metadata", {}).get("args", {})
+        explicit = {t.split("=", 1)[0] for t in sys.argv[1:]}
+        for name, default in (("network_constraint_mode", "edge-only"), ("service_calibration_mode", "legacy"),
+                              ("service_calibration_file", None), ("temporal_sampling_mode", "left-hold"),
+                              ("sampling_max_interval_seconds", 0.0)):
+            if "--" + name.replace("_", "-") not in explicit:
+                setattr(args, name, saved_args.get(name, default))
+        args.service_calibration_document = saved_args.get("service_calibration_document")
+        if "--service-calibration-file" in explicit:
+            args.service_calibration_document = None
+    if args.service_calibration_mode == "audited-v1" and getattr(args, "service_calibration_document", None) is None:
+        from edge_drl.env.calibration import load_budget_document
+        args.service_calibration_document = load_budget_document(args.service_calibration_file)
     eval_rollout_unit = resolve_eval_rollout_unit(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -4016,6 +4115,8 @@ def main() -> None:
         fast_minibatch_size=args.fast_minibatch_size,
         fast_policy_kind=args.fast_policy_kind,
         fast_chain_context=args.fast_chain_context,
+        training_repair=args.training_repair,
+        slow_team_value_coef=args.slow_team_value_coef,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
         fast_load_balanced_updates=args.fast_load_balanced_updates,
         fast_load_group_weights=_load_probabilities_for_args(
@@ -4083,6 +4184,7 @@ def main() -> None:
     print(f"  eval_rollout_unit={eval_rollout_unit}")
     print(f"  physical_seed={args.seed if args.physical_seed is None else args.physical_seed}")
     print(f"  pressure_profile={args.pressure_profile}")
+    print(f"  training_repair={args.training_repair}")
     hardware_counts: dict[str, int] = {}
     assert env.scenario is not None
     for node in env.scenario.nodes:
@@ -4171,7 +4273,8 @@ def main() -> None:
     )
     print(
         f"  slow_count_value_coef={args.slow_count_value_coef:.3f} "
-        "(0 isolates Count actor from failed critic gradients)"
+        f"effective_conditional_coef={args.slow_team_value_coef if agent.slow_agent.team_window_credit else args.slow_count_value_coef:.3f} "
+        "(repaired critics use detached backbones and normalized targets)"
     )
     print(
         f"  slow_count_lr={args.slow_count_lr:.6f} count_target_kl={args.slow_count_target_kl:.4f} "
@@ -4189,9 +4292,12 @@ def main() -> None:
         if args.sampled_seconds_per_window == 0
         else min(args.sampled_seconds_per_window, window_seconds)
     )
+    if args.sampled_seconds_per_window > 0 and args.sampling_max_interval_seconds > 0:
+        effective_sampled_seconds = max(effective_sampled_seconds, int(np.ceil(window_seconds / args.sampling_max_interval_seconds)))
     print(
         f"  temporal_sampling train={effective_sampled_seconds}/{window_seconds}s "
-        f"({effective_sampled_seconds / window_seconds:.1%}) eval=full "
+        f"({effective_sampled_seconds / window_seconds:.1%}) eval=full requested={args.sampled_seconds_per_window} "
+        f"hold_cap={args.sampling_max_interval_seconds:g}s temporal_mode={args.temporal_sampling_mode} "
         f"load_update={args.sampled_load_update_mode}"
     )
     print(f"  arrival_profile={args.arrival_profile}")
@@ -4742,6 +4848,13 @@ def main() -> None:
             "fast_samples_seen_fraction": 0.0,
             "fast_min_group_seen_fraction": 0.0,
             "fast_full_batch_kl_checks": 0.0,
+            "fast_batch_credit": int(agent.fast_agent.batch_credit),
+            "fast_kl_backtracks": 0.0,
+            "fast_accepted_step_lr": 0.0,
+            "fast_value_return_mean": agent.fast_agent.ppo.value_return_mean,
+            "fast_value_return_std": agent.fast_agent.ppo.value_return_std,
+            "slow_team_window_credit": int(agent.slow_agent.team_window_credit),
+            "slow_stage_team_credit_fraction": 0.0,
             "fast_group_count": 0.0,
             "fast_max_group_approx_kl": 0.0,
             "fast_min_group_approx_kl": 0.0,
@@ -5656,6 +5769,13 @@ def main() -> None:
             "fast_samples_seen_fraction": losses["fast"].get("samples_seen_fraction", 0.0),
             "fast_min_group_seen_fraction": losses["fast"].get("min_group_seen_fraction", 0.0),
             "fast_full_batch_kl_checks": losses["fast"].get("full_batch_kl_checks", 0.0),
+            "fast_batch_credit": int(agent.fast_agent.batch_credit),
+            "fast_kl_backtracks": losses["fast"].get("kl_backtracks", 0.0),
+            "fast_accepted_step_lr": losses["fast"].get("accepted_step_lr", 0.0),
+            "fast_value_return_mean": agent.fast_agent.ppo.value_return_mean,
+            "fast_value_return_std": agent.fast_agent.ppo.value_return_std,
+            "slow_team_window_credit": int(agent.slow_agent.team_window_credit),
+            "slow_stage_team_credit_fraction": losses["slow"].get("stage_team_credit_fraction", 0.0),
             "fast_group_count": losses["fast"].get("group_count", 0.0),
             "fast_max_group_approx_kl": losses["fast"].get("max_group_approx_kl", 0.0),
             "fast_min_group_approx_kl": losses["fast"].get("min_group_approx_kl", 0.0),

@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from edge_drl.allocators.kkt import ComputeDemand, LinkDemand, allocate_compute_kkt, allocate_link_kkt
+from edge_drl.allocators.nic_kkt import allocate_link_nic_kkt
 from edge_drl.allocators.equal_share import allocate_compute_equal_share, allocate_link_equal_share
 from edge_drl.allocators.learned_share import (
     allocate_compute_learned_share,
@@ -102,6 +103,8 @@ def _allocate_serial_compute_kkt(
 def _allocate_serial_link_kkt(
     demands: list[LinkDemand],
     capacities: np.ndarray,
+    nic_capacities: np.ndarray | None = None,
+    allocation_mode: str = "kkt",
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Settle ingress and inter-stage transfers in causal chain phases."""
 
@@ -112,9 +115,35 @@ def _allocate_serial_link_kkt(
         by_phase.setdefault(int(demand.serial_phase), []).append(demand)
     for phase in sorted(by_phase):
         phase_demands = by_phase[phase]
-        _, phase_delays, _ = allocate_link_kkt(phase_demands, capacities)
+        if nic_capacities is None:
+            _, phase_delays, _ = allocate_link_kkt(phase_demands, capacities)
+        else:
+            if allocation_mode == "kkt":
+                _, phase_delays, _ = allocate_link_nic_kkt(phase_demands, capacities, nic_capacities)
+            else:
+                base_allocator = {"equal-share": allocate_link_equal_share,
+                                  "learned-share": allocate_link_learned_share}[allocation_mode]
+                rates, _, _ = base_allocator(phase_demands, capacities)
+                port_rates = np.zeros_like(capacities)
+                for demand in phase_demands:
+                    port_rates[demand.src_node, demand.dst_node] += rates[demand.demand_id]
+                outgoing = np.minimum(1.0, nic_capacities / np.maximum(port_rates.sum(axis=1), 1e-30))
+                incoming = np.minimum(1.0, nic_capacities / np.maximum(port_rates.sum(axis=0), 1e-30))
+                phase_delays = {}
+                for demand in phase_demands:
+                    rate = rates[demand.demand_id] * min(outgoing[demand.src_node], incoming[demand.dst_node])
+                    phase_delays[demand.demand_id] = demand.data_mb * demand.multiplicity / rate if rate > 0 else 0.0
         delays.update(phase_delays)
-        externalities.update(_link_kkt_externality_delays(phase_demands, capacities))
+        if nic_capacities is None:
+            externalities.update(_link_kkt_externality_delays(phase_demands, capacities))
+        else:
+            # Diagnostic excess over an isolated link, NOT exact cross-port
+            # externality. Repaired Slow learns from actual team returns.
+            for demand in phase_demands:
+                cap = min(capacities[demand.src_node, demand.dst_node],
+                          nic_capacities[demand.src_node], nic_capacities[demand.dst_node])
+                isolated = demand.data_mb / cap if demand.data_mb > 0 and np.isfinite(cap) and cap > 0 else 0.0
+                externalities[demand.demand_id] = max(phase_delays[demand.demand_id] - isolated, 0.0)
     return delays, externalities
 
 
@@ -334,8 +363,19 @@ class EdgeEnvConfig:
     invalid_action_penalty: float = 10.0
     compute_allocation_mode: str = "kkt"
     link_allocation_mode: str = "kkt"
+    network_constraint_mode: str = "edge-only"
+    service_calibration_mode: str = "legacy"
+    service_calibration_file: str | None = None
+    service_calibration_document: dict | None = None
+    temporal_sampling_mode: str = "left-hold"
 
     def __post_init__(self) -> None:
+        if self.network_constraint_mode not in {"edge-only", "shared-nic"}:
+            raise ValueError("unknown network_constraint_mode")
+        if self.service_calibration_mode not in {"legacy", "audited-v1"}:
+            raise ValueError("unknown service calibration mode")
+        if self.temporal_sampling_mode not in {"left-hold", "stratified-jitter"}:
+            raise ValueError("unknown temporal sampling mode")
         if not 10_000 <= self.num_users <= 15_000:
             raise ValueError("num_users must be in [10000, 15000].")
         if self.max_service_stages > 3:
@@ -430,6 +470,7 @@ class EdgeComputingEnv:
 
     def reset(self) -> dict[str, Any]:
         self.rng = np.random.default_rng(self.config.seed)
+        self._sampling_rng = np.random.default_rng(np.random.SeedSequence([self.config.seed, 20261012]))
         physical_rng = np.random.default_rng(
             self.config.seed if self.config.physical_seed is None else self.config.physical_seed
         )
@@ -449,6 +490,9 @@ class EdgeComputingEnv:
             wired_link_bandwidth_scale=self.config.wired_link_bandwidth_scale,
             topology_k_nearest=self.config.topology_k_nearest,
             deadline_scale=self.config.deadline_scale,
+            service_calibration_mode=self.config.service_calibration_mode,
+            service_calibration_file=self.config.service_calibration_file,
+            service_calibration_document=self.config.service_calibration_document,
         )
         self.deployment = np.zeros(
             (self.config.num_service_types, self.config.max_service_stages, self.config.num_edge_nodes),
@@ -652,6 +696,11 @@ class EdgeComputingEnv:
             mask[stage_id] = self.deployment[request.service_id, stage_id]
         return mask
 
+    def node_nic_capacities(self) -> np.ndarray:
+        """Full-duplex per-direction usable NIC rate in MB/s."""
+        assert self.scenario is not None
+        return np.asarray([n.network_uplink_mb_s for n in self.scenario.nodes], dtype=np.float64) * self.config.wired_link_bandwidth_scale
+
     def service_memory_capacities(self) -> np.ndarray:
         self._require_ready()
         assert self.scenario is not None
@@ -764,9 +813,12 @@ class EdgeComputingEnv:
                 "equal-share": _allocate_serial_link_equal_share,
                 "learned-share": _allocate_serial_link_learned_share,
             }[self.config.link_allocation_mode]
-            joint_link_delays, joint_link_externalities = link_allocator(
-                all_link_demands, link_capacity
-            )
+            if self.config.network_constraint_mode == "shared-nic":
+                joint_link_delays, joint_link_externalities = _allocate_serial_link_kkt(
+                    all_link_demands, link_capacity, self.node_nic_capacities(), self.config.link_allocation_mode)
+            else:
+                joint_link_delays, joint_link_externalities = link_allocator(
+                    all_link_demands, link_capacity)
         except ValueError:
             joint_link_delays = {}
             joint_link_externalities = {}
@@ -1051,6 +1103,25 @@ class EdgeComputingEnv:
         self._route_cache[cache_key] = path
         self._route_cache[(dst_node, src_node)] = tuple(reversed(path))
         return path
+
+    def sample_interval_requests(self, represented_seconds: float) -> None:
+        """Uniform second inside one temporal stratum; logical clock unchanged.
+
+        Does not turn skipped seconds into a real task queue. Short-hold caps
+        and paired replay calibration quantify the remaining dynamic bias.
+        """
+        if self.config.temporal_sampling_mode != "stratified-jitter" or represented_seconds <= 1:
+            return
+        if not hasattr(self, "_sampling_rng"):
+            self._sampling_rng = np.random.default_rng(np.random.SeedSequence([self.config.seed, 20261012]))
+        offset = int(self._sampling_rng.integers(max(int(np.floor(represented_seconds)), 1)))
+        original_time = self.current_time_minute
+        try:
+            self.current_time_minute += offset / 60.0
+            self.current_requests = self._generate_current_second_requests()
+            self.current_request = self.current_requests[0] if self.current_requests else None
+        finally:
+            self.current_time_minute = original_time
 
     def _generate_current_second_requests(self) -> list[TaskRequest]:
         expected_requests = self._arrival_rate_per_minute() / 60.0

@@ -22,6 +22,7 @@ class TraceReplayEnv(EdgeComputingEnv):
 
     def reset(self) -> dict[str, Any]:
         self.rng = np.random.default_rng(self.config.seed)
+        self._sampling_rng = np.random.default_rng(np.random.SeedSequence([self.config.seed, 20261012]))
         self.scenario = deepcopy(self._comparison_scenario)
         self.deployment = np.zeros(
             (self.config.num_service_types, self.config.max_service_stages, self.config.num_edge_nodes),
