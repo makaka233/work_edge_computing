@@ -34,6 +34,7 @@ from edge_drl.comparison.scenario_transforms import formal_experiment_points, tr
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
 from edge_drl.comparison.trace import generate_comparison_trace
 from edge_drl.comparison.types import ExperimentPoint
+from edge_drl.comparison.window_feedback import SLOW_FEEDBACK_PROTOCOL
 from edge_drl.env.environment import EdgeComputingEnv
 
 
@@ -206,6 +207,8 @@ def run_comparison(
         ),
         "logical_steps_per_episode": episode_minutes * 60,
         "eval_seeds": eval_seeds,
+        "slow_window_feedback_protocol": SLOW_FEEDBACK_PROTOCOL,
+        "slow_window_feedback_schemes": [name for name in schemes if name in {"Proposed", "HEFT", "MSO"}],
         "scenario_families": list(dict.fromkeys(point.family for point in points)),
         "scenario_point_count": len(points),
         "standard_phase_design": is_standard_design,

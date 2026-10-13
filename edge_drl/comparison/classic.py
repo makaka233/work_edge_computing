@@ -6,6 +6,7 @@ import numpy as np
 
 from edge_drl.comparison.checkpoint import build_proposed_agent
 from edge_drl.comparison.scheme import BaseComparisonScheme
+from edge_drl.comparison.window_feedback import SlowWindowFeedbackMixin
 
 
 class HEFTScheduler:
@@ -121,7 +122,7 @@ class HEFTScheduler:
         return schedules
 
 
-class HEFTScheme(BaseComparisonScheme):
+class HEFTScheme(SlowWindowFeedbackMixin, BaseComparisonScheme):
     """Frozen Proposed Slow policy with HEFT-style Fast scheduling."""
 
     name = "Heterogeneous Earliest Finish Time Scheduling (HEFT)"
@@ -132,11 +133,14 @@ class HEFTScheme(BaseComparisonScheme):
             env, checkpoint_path, checkpoint_args, device=device
         )
         self.scheduler = HEFTScheduler()
+        self._initialize_window_feedback()
 
     def maybe_plan(self, env):
         if not env.needs_deployment_update:
             return
+        self._before_slow_plan(env)
         self.agent.maybe_update_deployment(env, deterministic=True, record=False)
+        self._capture_deployment_usage(env)
         self.diagnostics.planning.append(
             {"time_minute": env.current_time_minute, "planner": "frozen_proposed_slow_heft"}
         )

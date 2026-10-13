@@ -137,6 +137,9 @@ def evaluate_scheme_episode(
         )
         link_load_max = max(link_load_max, float(np.max(finite_links))) if finite_links.size else link_load_max
 
+    finish_episode = getattr(scheme, "finish_evaluation_episode", None)
+    if finish_episode is not None:
+        finish_episode(env)
     logical_steps = env._comparison_trace.logical_steps
     mean_latency = total_latency / max(total_requests, 1.0)
     p95 = _weighted_percentile(latencies, request_weights, 95.0)

@@ -17,6 +17,7 @@ from edge_drl.agents.drl import (
 from edge_drl.models.ppo import GraphAttentionNodeScoringActorCritic
 from edge_drl.comparison.checkpoint import load_checkpoint_configuration
 from edge_drl.comparison.scheme import BaseComparisonScheme
+from edge_drl.comparison.window_feedback import SlowWindowFeedbackMixin
 from edge_drl.comparison.trace import ComparisonTrace, rehash_trace
 from edge_drl.env.environment import EdgeComputingEnv
 from edge_drl.env.scenario import EdgeScenario, Service, TaskRequest
@@ -632,7 +633,7 @@ def _copy_runtime_state(source: EdgeComputingEnv, target: EdgeComputingEnv) -> N
     target.last_load_update_minute = source.last_load_update_minute
 
 
-class MSOScheme(BaseComparisonScheme):
+class MSOScheme(SlowWindowFeedbackMixin, BaseComparisonScheme):
     """DRL counterpart whose only structural change is stage aggregation.
 
     PPO architecture, optimizer, reward path, two time scales, and KKT
@@ -662,15 +663,7 @@ class MSOScheme(BaseComparisonScheme):
         self._planning_env.deployment = np.zeros_like(env.deployment)
         self._planning_env._route_cache.clear()
         self.agent = self._load_agent(self._planning_env, checkpoint_args, device)
-        self._window_latency_samples: list[tuple[float, float]] = []
-        self._window_penalty_latency_sum = 0.0
-        self._window_deadline_violations = 0.0
-        self._window_invalid_actions = 0.0
-        self._window_weight = 0.0
-        self._window_max_node_load = 0.0
-        self._window_max_link_load = 0.0
-        self._window_memory_fraction = 0.0
-        self._window_storage_fraction = 0.0
+        self._initialize_window_feedback()
 
     def _load_agent(
         self, planning_env: EdgeComputingEnv, checkpoint_args: dict[str, Any], device: str
@@ -706,11 +699,7 @@ class MSOScheme(BaseComparisonScheme):
     def maybe_plan(self, env: EdgeComputingEnv) -> None:
         if not env.needs_deployment_update:
             return
-        if env.current_time_minute > 1e-9:
-            self._finalize_window_feedback()
-        else:
-            self.agent.slow_agent.last_window_feedback = {}
-            self._reset_window_feedback()
+        self._before_slow_plan(env)
         _copy_runtime_state(env, self._planning_env)
         assert env.scenario is not None and env.deployment is not None
         self._planning_env.deployment = collapse_deployment_for_monolithic(
@@ -729,87 +718,7 @@ class MSOScheme(BaseComparisonScheme):
             for stage in service.stages:
                 projected[service.service_id, stage.stage_id] = source
         env.apply_deployment(projected)
-        self._window_memory_fraction, self._window_storage_fraction = (
-            self.agent._deployment_resource_fractions(env)
-        )
-
-    def _finalize_window_feedback(self) -> None:
-        if self._window_weight <= 0.0:
-            self.agent.slow_agent.last_window_feedback = {}
-            self._reset_window_feedback()
-            return
-        ordered = sorted(self._window_latency_samples, key=lambda item: item[0])
-        cutoff = 0.95 * self._window_weight
-        cumulative = 0.0
-        p95 = ordered[-1][0]
-        for value, weight in ordered:
-            cumulative += weight
-            if cumulative >= cutoff:
-                p95 = value
-                break
-        mean_latency = sum(
-            value * weight for value, weight in self._window_latency_samples
-        ) / self._window_weight
-        self.agent.slow_agent.last_window_feedback = {
-            "avg_latency_s": float(mean_latency),
-            "p95_latency_s": float(p95),
-            "avg_penalty_latency_s": float(
-                self._window_penalty_latency_sum / self._window_weight
-            ),
-            "deadline_violation_rate": float(
-                self._window_deadline_violations / self._window_weight
-            ),
-            "invalid_action_rate": float(
-                self._window_invalid_actions / self._window_weight
-            ),
-            "max_node_compute_load": float(self._window_max_node_load),
-            "max_link_load": float(self._window_max_link_load),
-            "deployment_memory_fraction": float(self._window_memory_fraction),
-            "deployment_storage_fraction": float(self._window_storage_fraction),
-        }
-        self._reset_window_feedback()
-
-    def _reset_window_feedback(self) -> None:
-        self._window_latency_samples.clear()
-        self._window_penalty_latency_sum = 0.0
-        self._window_deadline_violations = 0.0
-        self._window_invalid_actions = 0.0
-        self._window_weight = 0.0
-        self._window_max_node_load = 0.0
-        self._window_max_link_load = 0.0
-
-    def observe_step(
-        self,
-        env: EdgeComputingEnv,
-        requests: list[TaskRequest],
-        schedules: list[list[int]],
-        info: dict[str, Any],
-    ) -> None:
-        del schedules
-        for request, group_info in zip(requests, info.get("group_infos", [])):
-            weight = float(group_info.get("request_count", request.request_count))
-            latency = float(group_info["latency_s"])
-            self._window_latency_samples.append((latency, weight))
-            self._window_penalty_latency_sum += float(
-                group_info.get("penalty_latency_s", 0.0)
-            ) * weight
-            self._window_deadline_violations += float(
-                latency > float(request.deadline_s)
-            ) * weight
-            self._window_invalid_actions += float(
-                not bool(group_info.get("valid", False))
-            ) * weight
-            self._window_weight += weight
-        self._window_max_node_load = max(
-            self._window_max_node_load,
-            float(np.max(env.node_compute_load)),
-        )
-        finite_links = env.link_load[np.isfinite(env.link_load)]
-        if finite_links.size:
-            self._window_max_link_load = max(
-                self._window_max_link_load,
-                float(np.max(finite_links)),
-            )
+        self._capture_deployment_usage(env)
 
     def adapt_requests(self, requests: list[TaskRequest]) -> list[TaskRequest]:
         return [adapt_request_for_monolithic_evaluation(request) for request in requests]

@@ -16,6 +16,7 @@ from edge_drl.comparison.io import write_csv, write_json
 from edge_drl.comparison.proposed import ProposedScheme
 from edge_drl.comparison.replay_env import TraceReplayEnv
 from edge_drl.comparison.runner import configured_phase_design
+from edge_drl.comparison.window_feedback import SLOW_FEEDBACK_PROTOCOL
 from edge_drl.comparison.scenario_transforms import transform_scenario, transform_trace
 from edge_drl.comparison.statistics import paired_differences, summarize_seed_rows
 from edge_drl.comparison.trace import generate_comparison_trace
@@ -126,6 +127,8 @@ def run_kkt_action_replay(
             for name, (compute, link) in ALLOCATION_MODES.items()
         },
         "protocol": "frozen Proposed KKT trajectory with identical deployment and Fast actions replayed",
+        "slow_window_feedback_protocol": SLOW_FEEDBACK_PROTOCOL,
+        "slow_window_feedback_source": "Proposed controller only; other allocations cannot affect frozen actions",
         "sampled_seconds_per_window": int(sampled_seconds_per_window),
         "eval_seeds": eval_seeds,
         "scenario_families": sorted({point.family for point in points}),
@@ -199,6 +202,9 @@ def run_kkt_action_replay(
                     _, _, _, info = env.step(schedules, represented_seconds=step_seconds)
                     accumulators[name]["settlement_time_s"] += time.perf_counter() - started
                     _accumulate(accumulators[name], requests, info)
+                    if name == "Proposed":
+                        scheme.observe_step(env, requests, schedules, info)
+            scheme.finish_evaluation_episode(controller)
             action_hash = action_digest.hexdigest()
             for name, accumulator in accumulators.items():
                 rows.append(_finalize_row(

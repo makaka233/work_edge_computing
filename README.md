@@ -421,6 +421,13 @@ repair; old models remain evaluable but cannot silently resume with the changed
 request process. Proposed and comparison evaluation are unchanged. See
 [Monolithic sampling repair and test command](docs/MONOLITHIC_SAMPLING_REPAIR.md).
 
+For the selected comparison use `--schemes Proposed DARP HEFT DPMS MSO`.
+Proposed, HEFT and MSO evaluation now receive their own preceding-window Slow
+feedback through a common evaluation-only adapter, without training updates.
+New outputs mark `own-window-weighted-feedback-v1`; retain old results but rerun
+the comparison before using it as a final result. Existing training checkpoints
+remain usable. See [evaluation feedback repair](docs/EVALUATION_SLOW_FEEDBACK_REPAIR.md).
+
 `UniformFirstFitDeploy` is a separate demand-independent deployment baseline.
 It adds replicas to the feasible stage with the fewest replicas, with fixed
 service/stage ordering and ascending-node First-Fit placement. It reuses the

@@ -1,4 +1,5 @@
 import numpy as np
+from types import SimpleNamespace
 
 from edge_drl.comparison.classic import HEFTFastScheme, HEFTScheduler
 from tests.comparison_helpers import tiny_replay_env
@@ -26,6 +27,8 @@ def test_heft_fast_reuses_frozen_proposed_slow(monkeypatch):
     calls = []
 
     class SlowOnlyAgent:
+        slow_agent = SimpleNamespace(last_window_feedback={})
+
         def maybe_update_deployment(self, current_env, *, deterministic, record):
             calls.append((deterministic, record))
             placement = np.zeros_like(current_env.deployment)
