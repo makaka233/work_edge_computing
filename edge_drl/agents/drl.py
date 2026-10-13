@@ -180,7 +180,6 @@ class SlowDeploymentPPOAgent:
     team_window_credit: bool = False
     team_value_coef: float = 0.5
     deployment_context: str = "legacy"
-    ppo_update_design: str = "full-rollout-v1"
     device: str = "cpu"
     _active_context: SlowDeploymentContext | None = field(default=None, init=False, repr=False)
     last_deployment_diagnostics: list[dict] = field(default_factory=list, init=False)
@@ -377,7 +376,6 @@ class SlowDeploymentPPOAgent:
             critic_extra_epochs=max(self.critic_k_epochs - self.k_epochs, 0) if self.deployment_aware else 0,
             full_batch_kl_stop=self.deployment_aware,
             guarded_epochs=self.deployment_aware,
-            guarded_minibatch_epochs=self.deployment_aware and self.ppo_update_design == "guarded-minibatch-v2",
             device=self.device,
         )
         self.placement_ppo = PPOAgent(
@@ -407,7 +405,6 @@ class SlowDeploymentPPOAgent:
             critic_extra_epochs=max(self.critic_k_epochs - self.placement_ppo_epochs, 0) if self.deployment_aware else 0,
             full_batch_kl_stop=self.deployment_aware,
             guarded_epochs=self.deployment_aware,
-            guarded_minibatch_epochs=self.deployment_aware and self.ppo_update_design == "guarded-minibatch-v2",
             device=self.device,
         )
         self.ppo = self.placement_ppo
@@ -462,7 +459,6 @@ class SlowDeploymentPPOAgent:
                 critic_extra_epochs=max(self.critic_k_epochs - (self.stage_k_epochs or self.k_epochs), 0) if self.deployment_aware else 0,
                 full_batch_kl_stop=self.deployment_aware,
                 guarded_epochs=self.deployment_aware,
-                guarded_minibatch_epochs=self.deployment_aware and self.ppo_update_design == "guarded-minibatch-v2",
                 device=self.device,
             )
 
@@ -1525,8 +1521,7 @@ class SlowDeploymentPPOAgent:
                 for head, metrics in (("count", count_metrics), ("stage", stage_metrics), ("placement", placement_metrics))
                 for key in ("optimizer_steps", "samples_seen_fraction", "approx_kl", "normalized_entropy",
                             "kl_backtracks", "accepted_step_lr", "critic_extra_optimizer_steps",
-                            "value_return_std", "explained_variance", "post_explained_variance",
-                            "exact_kl", "max_group_exact_kl", "actor_grad_norm", "epochs_completed")
+                            "value_return_std", "explained_variance", "post_explained_variance")
             }
         critic_metrics = self._update_window_critic(trajectory_returns)
         self.last_window_critic_holdout_ev = float(
@@ -2296,7 +2291,6 @@ class FastSchedulingPPOAgent:
     load_group_weights: tuple[float, ...] | None = None
     full_batch_kl_stop: bool = True
     batch_credit: bool = False
-    ppo_update_design: str = "full-rollout-v1"
     vectorized_features: bool = True
     device: str = "cpu"
     ppo: PPOAgent = field(init=False)
@@ -2349,10 +2343,6 @@ class FastSchedulingPPOAgent:
             detach_critic_backbone=self.batch_credit,
             normalize_value_targets=self.batch_credit,
             guarded_epochs=self.batch_credit,
-            guarded_minibatch_epochs=self.batch_credit and self.ppo_update_design == "guarded-minibatch-v2",
-            independent_critic=self.batch_credit and self.ppo_update_design == "guarded-minibatch-v2",
-            critic_lr=5e-4 if self.batch_credit and self.ppo_update_design == "guarded-minibatch-v2" else None,
-            critic_extra_epochs=4 if self.batch_credit and self.ppo_update_design == "guarded-minibatch-v2" else 0,
             device=self.device,
         )
 
@@ -3649,17 +3639,10 @@ class HierarchicalPPOAgent:
         training_repair: str = "legacy",
         slow_team_value_coef: float = 0.5,
         slow_deployment_context: str = "legacy",
-        ppo_update_design: str = "full-rollout-v1",
     ) -> "HierarchicalPPOAgent":
         if training_repair not in {"legacy", "batch-credit-v1"}:
             raise ValueError("unknown training repair version")
         repair = training_repair == "batch-credit-v1"
-        if ppo_update_design == "auto":
-            ppo_update_design = "full-rollout-v1"
-        if ppo_update_design not in {"full-rollout-v1", "guarded-minibatch-v2"}:
-            raise ValueError("unknown PPO update design")
-        if ppo_update_design == "guarded-minibatch-v2" and not repair:
-            raise ValueError("guarded-minibatch-v2 requires batch-credit-v1")
         # Unresolved parser metadata in legacy adapters is not authority to
         # silently change architecture. The training entry point resolves auto.
         if slow_deployment_context == "auto":
@@ -3712,7 +3695,6 @@ class HierarchicalPPOAgent:
                 team_window_credit=repair,
                 team_value_coef=slow_team_value_coef,
                 deployment_context=slow_deployment_context,
-                ppo_update_design=ppo_update_design,
                 device=device,
             ),
             fast_agent=FastSchedulingPPOAgent(
@@ -3735,7 +3717,6 @@ class HierarchicalPPOAgent:
                 load_group_weights=fast_load_group_weights,
                 full_batch_kl_stop=fast_full_batch_kl_stop,
                 batch_credit=repair,
-                ppo_update_design=ppo_update_design,
                 device=device,
             ),
             slow_reward_scale=slow_reward_scale,

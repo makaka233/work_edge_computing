@@ -309,7 +309,6 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         num_nodes: int,
         hidden_dim: int = 128,
         detach_critic_backbone: bool = False,
-        independent_critic: bool = False,
     ):
         super().__init__()
         self.global_dim = global_dim
@@ -317,7 +316,6 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         self.edge_feature_dim = edge_feature_dim
         self.num_nodes = num_nodes
         self.detach_critic_backbone = bool(detach_critic_backbone)
-        self.independent_critic = bool(independent_critic)
         self.node_offset = global_dim
         self.edge_offset = global_dim + num_nodes * node_feature_dim
 
@@ -347,7 +345,7 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         self.critic = nn.Sequential(
-            nn.Linear((self.edge_offset + hidden_dim * 2) if independent_critic else hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -386,10 +384,6 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         critic_input = torch.cat([global_emb, pooled_nodes], dim=-1)
         if self.detach_critic_backbone:
             critic_input = critic_input.detach()
-        if self.independent_critic:
-            # Decision-time ledger/candidate features, never the selected action
-            # or its settlement. Own trainable encoder bypasses actor features.
-            critic_input = torch.cat([states[:, :self.edge_offset], critic_input], dim=-1)
         values = self.critic(critic_input).squeeze(-1)
         return dist, values
 
@@ -644,7 +638,6 @@ class PPOAgent:
         full_batch_kl_stop: bool = False,
         normalize_value_targets: bool = False,
         guarded_epochs: bool = False,
-        guarded_minibatch_epochs: bool = False,
         independent_critic: bool = False,
         critic_lr: float | None = None,
         critic_extra_epochs: int = 0,
@@ -673,7 +666,6 @@ class PPOAgent:
         self.full_batch_kl_stop = bool(full_batch_kl_stop)
         self.normalize_value_targets = bool(normalize_value_targets)
         self.guarded_epochs = bool(guarded_epochs)
-        self.guarded_minibatch_epochs = bool(guarded_minibatch_epochs)
         self.critic_extra_epochs = int(critic_extra_epochs)
         if self.critic_extra_epochs < 0:
             raise ValueError("critic_extra_epochs must be nonnegative")
@@ -684,8 +676,6 @@ class PPOAgent:
         self.value_normalization_initialized = False
         if self.guarded_epochs and not self.full_batch_kl_stop:
             raise ValueError("guarded_epochs requires full_batch_kl_stop")
-        if self.guarded_minibatch_epochs and not self.guarded_epochs:
-            raise ValueError("guarded minibatch epochs require guarded_epochs")
         self.device = torch.device(device)
         self.continuous_actions = policy_kind == "slow_gat_budget"
         self.last_group_diagnostics: dict[float, dict[str, float]] = {}
@@ -710,7 +700,6 @@ class PPOAgent:
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
                 detach_critic_backbone=detach_critic_backbone,
-                independent_critic=independent_critic,
             ).to(self.device)
         elif policy_kind in {
             "slow_gat_node",
@@ -815,9 +804,6 @@ class PPOAgent:
         ]
         nn.utils.clip_grad_norm_(actor_parameters, max_norm)
         nn.utils.clip_grad_norm_(critic_parameters, max_norm)
-
-    def _policy_parameters_finite(self) -> bool:
-        return bool(torch.stack([torch.isfinite(p).all() for p in self.policy.parameters()]).all())
 
     def act(
         self,
@@ -1049,7 +1035,6 @@ class PPOAgent:
             raise ValueError("buffer contains pending transitions without rewards")
 
         advantages_np, returns_np = self._gae_advantages_and_returns()
-        pre_update_values_np = np.asarray(self.buffer.values, dtype=np.float32) if self.guarded_minibatch_epochs else None
         if self.buffer.weights:
             if len(self.buffer.weights) != len(self.buffer.actions):
                 raise ValueError("buffer sample weights do not match actions")
@@ -1084,17 +1069,11 @@ class PPOAgent:
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
         value_targets_np = self._normalized_value_targets(returns_np, weights_np)
         if self.guarded_epochs:
-            metrics = self._update_guarded_epochs(
+            return self._update_guarded_epochs(
                 actions_np, old_logprobs_np, advantages_np, value_targets_np,
                 weights_np, group_ids_np, advantage_mean, advantage_std,
                 progress_label, progress_interval_seconds,
             )
-            if self.guarded_minibatch_epochs:
-                variance = float(np.average((returns_np - np.average(returns_np, weights=weights_np)) ** 2, weights=weights_np))
-                residual = returns_np - pre_update_values_np
-                residual_variance = float(np.average((residual - np.average(residual, weights=weights_np)) ** 2, weights=weights_np))
-                metrics["explained_variance"] = 1 - residual_variance / variance if variance > 1e-8 else 0.0
-            return metrics
         n = len(actions_np)
         minibatch_size = max(1, min(self.minibatch_size, n))
         batches_per_epoch = int(np.ceil(n / minibatch_size))
@@ -1265,12 +1244,6 @@ class PPOAgent:
         excessive *post-step* KL, restoring both parameters and Adam moments,
         and backtrack the same gradient. A rejected step is never committed.
         """
-        if self.guarded_minibatch_epochs:
-            return self._update_guarded_minibatch_epochs(
-                actions_np, old_logprobs_np, advantages_np, value_targets_np,
-                weights_np, group_ids_np, advantage_mean, advantage_std,
-                progress_label, progress_interval_seconds, critic_weights_np,
-            )
         n = len(actions_np)
         size = max(1, min(self.minibatch_size, n))
         batches = int(np.ceil(n / size))
@@ -1324,14 +1297,11 @@ class PPOAgent:
                 for group, lr in zip(self.optimizer.param_groups, learning_rates):
                     group["lr"] = lr * (0.5 ** attempt)
                 self.optimizer.step()
-                parameters_finite = self._policy_parameters_finite()
-                if parameters_finite:
-                    diagnostics = self._buffer_policy_diagnostics(
-                        actions_np, old_logprobs_np, weights_np, group_ids_np)
-                    kl = max(diagnostics["approx_kl"], diagnostics["max_group_approx_kl"])
-                else:
-                    kl = float("inf")
+                diagnostics = self._buffer_policy_diagnostics(
+                    actions_np, old_logprobs_np, weights_np, group_ids_np)
                 checks += 1
+                kl = max(diagnostics["approx_kl"], diagnostics["max_group_approx_kl"])
+                parameters_finite = all(bool(torch.isfinite(p).all()) for p in self.policy.parameters())
                 if parameters_finite and np.isfinite(kl) and (self.target_kl is None or kl <= self.target_kl):
                     step_accepted = True
                     accepted += 1
@@ -1342,9 +1312,7 @@ class PPOAgent:
                         group["lr"] = lr
                     break
                 self.policy.load_state_dict(policy_before)
-                # Adam loaders can retain references to supplied moment tensors.
-                # Never let a retried step mutate the rollback snapshot itself.
-                self.optimizer.load_state_dict(copy.deepcopy(optimizer_before))
+                self.optimizer.load_state_dict(optimizer_before)
                 retries += 1
             if not step_accepted:
                 stopped = True
@@ -1362,145 +1330,6 @@ class PPOAgent:
             "full_batch_kl_checks": float(checks), "kl_backtracks": float(retries),
             "accepted_step_lr": accepted_lr, "value_return_mean": self.value_return_mean,
             "value_return_std": self.value_return_std,
-        })
-        if self.critic_extra_epochs:
-            metrics.update(self._fit_conditional_critic(value_targets_np, critic_weights_np))
-        self.buffer.clear()
-        return metrics
-
-    def _exact_buffer_kl(self, reference_policy, weights_np, group_ids_np):
-        """Old-to-new distribution KL on all candidates (also supports Beta)."""
-        divergences = []
-        with torch.no_grad():
-            for start in range(0, len(weights_np), max(self.minibatch_size, 1)):
-                end = start + max(self.minibatch_size, 1)
-                states = torch.as_tensor(np.stack(self.buffer.states[start:end]), dtype=torch.float32, device=self.device)
-                masks = torch.as_tensor(np.stack(self.buffer.masks[start:end]), dtype=torch.bool, device=self.device)
-                previous = reference_policy(states, masks)[0]
-                current = self.policy(states, masks)[0]
-                divergences.extend(torch.distributions.kl_divergence(previous, current).cpu().tolist())
-        values = np.asarray(divergences)
-        return {
-            "exact_kl": float(np.average(values, weights=weights_np)),
-            "max_group_exact_kl": max(float(np.average(values[group_ids_np == g], weights=weights_np[group_ids_np == g]))
-                                      for g in np.unique(group_ids_np) if weights_np[group_ids_np == g].sum() > 0),
-        }
-
-    def _update_guarded_minibatch_epochs(
-        self, actions_np, old_logprobs_np, advantages_np, value_targets_np,
-        weights_np, group_ids_np, advantage_mean, advantage_std,
-        progress_label, progress_interval_seconds, critic_weights_np=None,
-    ):
-        """Ordinary shuffled minibatch PPO inside an atomic, KL-guarded epoch.
-
-        Rejected epochs restore ALL their steps and Adam moments. Thus an
-        accepted epoch has complete coverage, never a load-dependent prefix.
-        Backtracking replays the same permutation, not a lucky new minibatch.
-        """
-        n = len(actions_np)
-        size = max(1, min(self.minibatch_size, n))
-        batches = int(np.ceil(n / size))
-        group_ids_np = np.zeros(n, dtype=np.float32) if group_ids_np is None else np.asarray(group_ids_np)
-        critic_weights_np = weights_np if critic_weights_np is None else critic_weights_np
-        denominator = max(float(weights_np.sum()), 1e-8)
-        critic_denominator = max(float(critic_weights_np.sum()), 1e-8)
-        reference_policy = copy.deepcopy(self.policy).eval()
-        accepted = steps = retries = checks = consumed = 0
-        accepted_lr = actor_grad_norm = 0.0
-        stopped = False
-        seen = np.zeros(n, dtype=bool)
-        metrics = dict.fromkeys(("loss", "policy_loss", "value_loss"), 0.0)
-        progress = None
-        if tqdm is not None and progress_label and progress_interval_seconds > 0:
-            progress = tqdm(total=self.k_epochs * batches, desc=progress_label,
-                            unit="mb", mininterval=progress_interval_seconds, file=sys.stdout)
-        for _ in range(self.k_epochs):
-            # Stratification affects ordering only; no dropped/duplicated data.
-            epoch_batches = _stratified_minibatches(n, size, group_ids_np)
-            policy_before = copy.deepcopy(self.policy.state_dict())
-            optimizer_before = copy.deepcopy(self.optimizer.state_dict())
-            learning_rates = [float(g["lr"]) for g in self.optimizer.param_groups]
-            step_accepted = False
-            for attempt in range(7):
-                for group, lr in zip(self.optimizer.param_groups, learning_rates):
-                    group["lr"] = lr * (.5 ** attempt)
-                totals = dict.fromkeys(metrics, 0.0)
-                norms = []
-                for idx in epoch_batches:
-                    states = torch.as_tensor(np.stack([self.buffer.states[i] for i in idx]), dtype=torch.float32, device=self.device)
-                    masks = torch.as_tensor(np.stack([self.buffer.masks[i] for i in idx]), dtype=torch.bool, device=self.device)
-                    actions = torch.as_tensor(actions_np[idx], device=self.device,
-                                              dtype=torch.float32 if self.continuous_actions else torch.long)
-                    old = torch.as_tensor(old_logprobs_np[idx], dtype=torch.float32, device=self.device)
-                    advantages = torch.as_tensor(advantages_np[idx], dtype=torch.float32, device=self.device)
-                    targets = torch.as_tensor(value_targets_np[idx], dtype=torch.float32, device=self.device)
-                    weights = torch.as_tensor(weights_np[idx], dtype=torch.float32, device=self.device)
-                    value_weights = torch.as_tensor(critic_weights_np[idx], dtype=torch.float32, device=self.device)
-                    dist, values = self.policy(states, masks)
-                    ratio = (dist.log_prob(actions) - old).exp()
-                    surrogate = torch.minimum(ratio * advantages,
-                                              ratio.clamp(1 - self.eps_clip, 1 + self.eps_clip) * advantages)
-                    # Global denominators retain the configured load objective
-                    # and equal-window critic weighting, even for short batches.
-                    actor = -(surrogate * weights).sum() * batches / denominator
-                    critic = ((values - targets).square() * value_weights).sum() * batches / critic_denominator
-                    entropy = (dist.entropy() * weights).sum() * batches / denominator
-                    loss = actor + self.value_coef * critic - self.entropy_coef * entropy
-                    self.optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    norm_terms = [p.grad.detach().square().sum() for name, p in self.policy.named_parameters()
-                                  if not name.startswith("critic.") and p.grad is not None]
-                    norms.append(float(torch.stack(norm_terms).sum().sqrt()) if norm_terms else 0.0)
-                    self._clip_policy_gradients()
-                    self.optimizer.step()
-                    for key, value in (("loss", loss), ("policy_loss", actor), ("value_loss", critic)):
-                        totals[key] += float(value.detach()) / batches
-                    consumed += 1
-                    if progress is not None and attempt == 0:
-                        progress.update(1)
-                    # Do not enter the next minibatch's Categorical/Beta
-                    # constructor with a rejected nonfinite parameter set.
-                    if not self._policy_parameters_finite():
-                        break
-                finite = self._policy_parameters_finite()
-                if finite:
-                    diagnostics = self._buffer_policy_diagnostics(actions_np, old_logprobs_np, weights_np, group_ids_np)
-                    diagnostics.update(self._exact_buffer_kl(reference_policy, weights_np, group_ids_np))
-                    kl = max(diagnostics[k] for k in ("approx_kl", "max_group_approx_kl", "exact_kl", "max_group_exact_kl"))
-                else:
-                    kl = float("inf")
-                checks += 1
-                if finite and np.isfinite(kl) and (self.target_kl is None or kl <= self.target_kl):
-                    step_accepted = True
-                    accepted += 1
-                    steps += len(epoch_batches)
-                    seen[:] = True
-                    accepted_lr = learning_rates[0] * (.5 ** attempt)
-                    actor_grad_norm = float(np.mean(norms))
-                    metrics = totals
-                    for group, lr in zip(self.optimizer.param_groups, learning_rates):
-                        group["lr"] = lr
-                    break
-                self.policy.load_state_dict(policy_before)
-                self.optimizer.load_state_dict(copy.deepcopy(optimizer_before))
-                retries += 1
-            if not step_accepted:
-                stopped = True
-                break
-        if progress is not None:
-            progress.close()
-        metrics.update(self._buffer_policy_diagnostics(actions_np, old_logprobs_np, weights_np, group_ids_np))
-        metrics.update(self._exact_buffer_kl(reference_policy, weights_np, group_ids_np))
-        metrics.update({
-            "advantage_mean": advantage_mean, "advantage_std": advantage_std,
-            "epochs_completed": float(accepted), "optimizer_steps": float(steps),
-            "kl_early_stop": float(stopped), "minibatches_completed": float(consumed),
-            "minibatches_planned": float(self.k_epochs * batches),
-            "samples_seen_fraction": float(seen.mean()),
-            "min_group_seen_fraction": min(float(seen[group_ids_np == g].mean()) for g in np.unique(group_ids_np)),
-            "full_batch_kl_checks": float(checks), "kl_backtracks": float(retries),
-            "accepted_step_lr": accepted_lr, "actor_grad_norm": actor_grad_norm,
-            "value_return_mean": self.value_return_mean, "value_return_std": self.value_return_std,
         })
         if self.critic_extra_epochs:
             metrics.update(self._fit_conditional_critic(value_targets_np, critic_weights_np))

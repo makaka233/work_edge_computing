@@ -65,14 +65,6 @@ Old checkpoints automatically retain `legacy` dimensions and behavior.
 into a fresh Slow run; it is not a resume. No environment, KKT, reward objective
 or baseline algorithm is changed. See the [Slow audit and training command](docs/SLOW_DEPLOYMENT_CONTEXT_REPAIR.md).
 
-Fresh repaired Proposed training now resolves `--ppo-update-design auto` to
-`guarded-minibatch-v2`: actual minibatch PPO steps, atomic full-epoch KL
-backtracking, and an independent decision-state Fast critic. Existing checkpoints
-retain their saved update design (missing tags mean `full-rollout-v1`); start a
-fresh joint run for the new Fast critic architecture. Environment parameters,
-KKT credit, sampling and comparison algorithms are unchanged. See the
-[learning-signal diagnosis and joint training command](docs/PPO_LEARNING_SIGNAL_REPAIR.md).
-
 Temporal samples are now stratified and capped at 15 represented seconds:
 requesting 6 samples in a 600-second window collects at least 40. Startup
 output reports both requested and effective counts. Budget and paired replay
