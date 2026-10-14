@@ -40,7 +40,7 @@ def nic_link_rates(sqrt_loads, link_capacities, nic_capacities, *, initial_duals
     def rates(u, v):
         return np.minimum(caps, loads / np.sqrt(np.maximum(u[:, None] + v[None, :], 1e-30)))
 
-    def port_duals(other, axis):
+    def port_duals(other, axis, *, bisections=35):
         # At zero opposite-port dual, this upper bound would satisfy the
         # NIC even without link caps. Nonnegative other duals only reduce rates.
         upper = np.square(np.divide(loads.sum(axis=axis), nic,
@@ -57,7 +57,7 @@ def nic_link_rates(sqrt_loads, link_capacities, nic_capacities, *, initial_duals
         port_loads = loads[selected] if axis == 1 else loads[:, selected].T
         port_caps = caps[selected] if axis == 1 else caps[:, selected].T
         lower, upper = lower[selected], upper[selected]
-        for _ in range(35):
+        for _ in range(bisections):
             middle = (lower + upper) * 0.5
             candidate = np.minimum(port_caps, port_loads / np.sqrt(np.maximum(middle[:, None] + other[None, :], 1e-30)))
             excessive = candidate.sum(axis=1) > nic[selected]
@@ -124,6 +124,21 @@ def nic_link_rates(sqrt_loads, link_capacities, nic_capacities, *, initial_duals
         value = (-objective + np.dot(x * dual_scales, residuals)) / objective_scale
         return value, residuals / budgets
 
+    def dual_hessian(x):
+        u, v = unpack(x)
+        combined = u[:, None] + v[None, :]
+        raw = loads / np.sqrt(np.maximum(combined, 1e-30))
+        free = active & (raw < caps)
+        curvature = np.zeros_like(loads)
+        np.divide(.5 * raw, combined, out=curvature, where=free & (combined > 0))
+        split = len(selected_out)
+        hessian = np.zeros((len(budgets), len(budgets)))
+        hessian[:split, :split] = np.diag(curvature.sum(axis=1)[selected_out])
+        hessian[split:, split:] = np.diag(curvature.sum(axis=0)[selected_in])
+        hessian[:split, split:] = curvature[np.ix_(selected_out, selected_in)]
+        hessian[split:, :split] = hessian[:split, split:].T
+        return hessian * dual_scales[:, None] * dual_scales[None, :] / objective_scale
+
     x0 = np.concatenate((outgoing[selected_out], incoming[selected_in])) / dual_scales
     result = minimize(negative_dual, x0, jac=True, method="L-BFGS-B",
                       bounds=[(0.0, None)] * len(x0),
@@ -162,6 +177,81 @@ def nic_link_rates(sqrt_loads, link_capacities, nic_capacities, *, initial_duals
         feasible, feasible_objective, gap, violation = certificate(outgoing, incoming)
         if certified(gap, feasible_objective):
             return feasible, feasible_objective, (outgoing, incoming)
+
+    # A single port can combine large traffic and tiny uncapped flows. The
+    # 35-step absolute root bracket then has a resolution floor: joint dual
+    # optimization followed by ordinary polishing can stall above the gap
+    # tolerance. Refine these same port roots in float64; never relax the
+    # independent primal-dual acceptance certificate or physical capacities.
+    for _ in range(max_iterations):
+        outgoing = port_duals(incoming, 1, bisections=64)
+        incoming = port_duals(outgoing, 0, bisections=64)
+        feasible, feasible_objective, gap, violation = certificate(outgoing, incoming)
+        if certified(gap, feasible_objective):
+            return feasible, feasible_objective, (outgoing, incoming)
+
+    # Near-dependent send/receive constraints can also defeat L-BFGS history
+    # and alternating coordinates, even after the roots reach float64
+    # precision. Use a different joint convex-dual optimizer on the SAME
+    # variables/objective/gradient, then certify independently as before.
+    x0 = np.concatenate((outgoing[selected_out], incoming[selected_in])) / dual_scales
+    result = minimize(negative_dual, x0, jac=True, method="SLSQP",
+                      bounds=[(0.0, None)] * len(x0),
+                      options={"ftol": 1e-14, "maxiter": 2000})
+    outgoing, incoming = unpack(result.x)
+    for iteration in range(max_iterations + 1):
+        if iteration:
+            outgoing = port_duals(incoming, 1, bisections=64)
+            incoming = port_duals(outgoing, 0, bisections=64)
+        feasible, feasible_objective, gap, violation = certificate(outgoing, incoming)
+        if certified(gap, feasible_objective):
+            return feasible, feasible_objective, (outgoing, incoming)
+    # Second-order joint refinement, diagonally equilibrated to avoid losing
+    # tiny-flow directions next to heavily loaded ports. A port component may
+    # have a send/receive gauge nullspace, so solve its Newton system by SVD;
+    # do NOT perturb the physical objective with a regularization penalty.
+    x = np.concatenate((outgoing[selected_out], incoming[selected_in])) / dual_scales
+    for _ in range(128):
+        value, gradient = negative_dual(x)
+        hessian = dual_hessian(x)
+        working = (x > 0) | (gradient < 0)
+        direction = np.zeros_like(x)
+        for _ in range(len(x) + 1):
+            ids = np.flatnonzero(working)
+            if not len(ids):
+                break
+            block = hessian[np.ix_(ids, ids)]
+            scale = np.sqrt(np.maximum(np.diag(block), 1e-30))
+            system = block / scale[:, None] / scale[None, :]
+            direction[:] = 0
+            direction[ids] = np.linalg.lstsq(system, -gradient[ids] / scale, rcond=1e-14)[0] / scale
+            blocked = (x == 0) & (direction < 0) & working
+            if not blocked.any():
+                break
+            working[blocked] = False
+        if not np.isfinite(direction).all() or np.dot(gradient, direction) >= 0:
+            direction = -gradient / np.maximum(np.diag(hessian), 1e-12)
+            direction[(x == 0) & (direction < 0)] = 0
+        negative = direction < 0
+        step = min(1., float(np.min(-x[negative] / direction[negative]))) if negative.any() else 1.
+        improved = False
+        for _ in range(64):
+            candidate = np.maximum(x + step * direction, 0)
+            u, v = unpack(candidate)
+            trial_feasible, trial_objective, trial_gap, trial_violation = certificate(u, v)
+            if certified(trial_gap, trial_objective):
+                return trial_feasible, trial_objective, (u, v)
+            trial_value, _ = negative_dual(candidate)
+            if (trial_value <= value + 1e-4 * step * np.dot(gradient, direction)
+                    and trial_gap < gap):
+                x = candidate
+                outgoing, incoming = u, v
+                feasible, feasible_objective, gap, violation = trial_feasible, trial_objective, trial_gap, trial_violation
+                improved = True
+                break
+            step *= .5
+        if not improved:
+            break
     raise RuntimeError("aggregate NIC KKT solver did not converge: "
                        f"max_port_capacity_ratio={violation:.9g}, "
                        f"relative_gap={gap/max(feasible_objective,1e-12):.3g}, "

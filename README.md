@@ -65,6 +65,13 @@ Old checkpoints automatically retain `legacy` dimensions and behavior.
 into a fresh Slow run; it is not a resume. No environment, KKT, reward objective
 or baseline algorithm is changed. See the [Slow audit and training command](docs/SLOW_DEPLOYMENT_CONTEXT_REPAIR.md).
 
+Shared-NIC rare ill-conditioned failures now use high-precision port roots and
+a joint second-order convex-dual fallback, retaining the original `1e-7`
+primal-dual certificate and every physical capacity constraint. Resume also
+recovers legacy checkpoint args from the original run metadata; new checkpoints
+embed args so a missing configuration cannot silently disable shared NIC or
+change workload/sampling. See [strict NIC precision repair](docs/SHARED_NIC_PRECISION_REPAIR.md).
+
 Temporal samples are now stratified and capped at 15 represented seconds:
 requesting 6 samples in a 600-second window collects at least 40. Startup
 output reports both requested and effective counts. Budget and paired replay

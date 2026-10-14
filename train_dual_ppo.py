@@ -4091,6 +4091,28 @@ def initialize_fast_checkpoint(agent, path: Path, args) -> dict[str, object]:
             "scope": "fast_weights_and_value_scale_only", "resume": False}
 
 
+def checkpoint_run_args(path: Path, checkpoint: dict) -> dict:
+    """Recover the ORIGINAL run configuration, including legacy sidecars.
+
+    Older training checkpoints omitted args even though metadata.json saved
+    them. Missing embedded args are not permission to revert shared-NIC,
+    audited workloads or temporal sampling to the legacy defaults on resume.
+    """
+    embedded = checkpoint.get("metadata", {}).get("args", {})
+    if embedded:
+        return dict(embedded)
+    for parent in list(path.resolve().parents)[:3]:
+        metadata_path = parent / "metadata.json"
+        if metadata_path.is_file():
+            with metadata_path.open(encoding="utf-8") as handle:
+                saved_args = json.load(handle).get("args", {})
+            if saved_args:
+                return dict(saved_args)
+    if checkpoint.get("training_repair", "legacy") != "legacy":
+        raise ValueError("repaired checkpoint is missing original run args/metadata.json; cannot safely restore the physical environment")
+    return {}
+
+
 def main() -> None:
     args = parse_args()
     args.fast_chain_context = resolve_fast_chain_context(args)
@@ -4099,7 +4121,7 @@ def main() -> None:
     if args.load_checkpoint and args.init_fast_checkpoint:
         raise ValueError("--load-checkpoint and --init-fast-checkpoint are mutually exclusive")
     args.rollout_acceleration_version = "vector-features-v1"
-    args.network_allocator_version = "shared-nic-certified-v3"
+    args.network_allocator_version = "shared-nic-certified-v4"
     if args.training_repair == "batch-credit-v1":
         explicit_controls = {token.split("=", 1)[0] for token in sys.argv[1:]}
         for name in ("slow_counterfactual_credit_coef", "slow_replica_ablation_samples", "fast_oracle_diagnostic_requests",
@@ -4108,7 +4130,7 @@ def main() -> None:
                 setattr(args, name, 0)
     if args.load_checkpoint:
         saved = torch.load(Path(args.load_checkpoint), map_location="cpu")
-        saved_args = saved.get("metadata", {}).get("args", {})
+        saved_args = checkpoint_run_args(Path(args.load_checkpoint), saved)
         explicit = {t.split("=", 1)[0] for t in sys.argv[1:]}
         for name, default in (("network_constraint_mode", "edge-only"), ("service_calibration_mode", "legacy"),
                               ("service_calibration_file", None), ("temporal_sampling_mode", "left-hold"),
@@ -6046,6 +6068,7 @@ def main() -> None:
             or (checkpoint_ready == best_checkpoint_ready and checkpoint_score < best_checkpoint_score)
         )
         common_checkpoint_metadata: dict[str, object] = {
+            "args": vars(args).copy(),
             "update": update + 1,
             "completed_updates": update + 1,
             "completed_rollouts": training_rollout_idx,
@@ -6151,6 +6174,7 @@ def main() -> None:
             agent,
             save_dir / "last.pt",
             {
+                "args": vars(args).copy(),
                 "update": target_update,
                 "completed_updates": target_update,
                 "completed_rollouts": training_rollout_idx,

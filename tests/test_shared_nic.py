@@ -155,6 +155,64 @@ def test_sequential_prefix_warm_starts_preserve_cost_and_constraints():
             previous = cost
 
 
+@pytest.mark.parametrize("warm", [False, True])
+def test_second_order_fallback_certifies_wide_scale_failure(warm, monkeypatch):
+    data = np.load(Path(__file__).parent / "fixtures/shared_nic_wide_scale_stress.npz")
+    calls = []
+    original = np.linalg.lstsq
+    def track(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(np.linalg, "lstsq", track)
+    initial = (data["outgoing"], data["incoming"]) if warm else None
+    rates, cost, (u, v) = nic_link_rates(data["loads"], data["capacities"], data["nic"], initial_duals=initial)
+    assert calls  # must exercise the actual joint second-order fallback
+    assert np.all(rates.sum(axis=0) <= data["nic"] + 1e-9)
+    assert np.all(rates.sum(axis=1) <= data["nic"] + 1e-9)
+    assert np.all(rates <= data["capacities"])
+    active = data["loads"] > 0
+    raw = np.minimum(np.where(active, data["capacities"], 0),
+                     data["loads"] / np.sqrt(np.maximum(u[:, None] + v, 1e-30)))
+    dual = np.sum(np.divide(data["loads"]**2, raw, out=np.zeros_like(raw), where=active))
+    dual += np.dot(u, raw.sum(axis=1) - data["nic"]) + np.dot(v, raw.sum(axis=0) - data["nic"])
+    assert -1e-10 <= (cost - dual) / cost <= 1e-7
+
+
+def test_wide_dynamic_range_ports_have_same_precision_certificate():
+    rng = np.random.default_rng(518)
+    for _ in range(64):
+        loads = np.exp(rng.uniform(-14, 4, (12, 12)))
+        loads *= rng.random((12, 12)) < .3
+        np.fill_diagonal(loads, 0)
+        capacities = rng.choice([50., 125., 250., 500.], (12, 12))
+        nic = rng.choice([125., 250., 1250.], 12)
+        rates, cost, (u, v) = nic_link_rates(loads, capacities, nic)
+        active = loads > 0
+        raw = np.minimum(np.where(active, capacities, 0), loads / np.sqrt(np.maximum(u[:, None] + v, 1e-30)))
+        dual = np.sum(np.divide(loads**2, raw, out=np.zeros_like(raw), where=active))
+        dual += np.dot(u, raw.sum(axis=1) - nic) + np.dot(v, raw.sum(axis=0) - nic)
+        assert -1e-10 <= (cost - dual) / cost <= 1e-7
+        assert np.all(rates.sum(axis=0) <= nic + 1e-9)
+        assert np.all(rates.sum(axis=1) <= nic + 1e-9)
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_exact_user_update50_failure_keeps_original_tolerance(warm):
+    # Old solver reproduces ratio=1.0000386 and gap=2.15e-6 on this matrix.
+    data = np.load(Path(__file__).parent / "fixtures/shared_nic_update50_failure.npz")
+    initial = (data["outgoing"], data["incoming"]) if warm else None
+    rates, cost, (u, v) = nic_link_rates(data["loads"], data["capacities"], data["nic"], initial_duals=initial)
+    active = data["loads"] > 0
+    raw = np.minimum(np.where(active, data["capacities"], 0),
+                     data["loads"] / np.sqrt(np.maximum(u[:, None] + v, 1e-30)))
+    dual = np.sum(np.divide(data["loads"]**2, raw, out=np.zeros_like(raw), where=active))
+    dual += np.dot(u, raw.sum(axis=1) - data["nic"]) + np.dot(v, raw.sum(axis=0) - data["nic"])
+    assert -1e-10 <= (cost - dual) / cost <= 1e-7
+    assert np.all(rates.sum(axis=0) <= data["nic"] + 1e-9)
+    assert np.all(rates.sum(axis=1) <= data["nic"] + 1e-9)
+    assert np.all(rates <= data["capacities"])
+
+
 @pytest.mark.parametrize("mode", ["kkt", "equal-share", "learned-share"])
 def test_shared_nic_supports_resource_comparison_modes(mode):
     demands = [LinkDemand("a", 0, 1, 1.0), LinkDemand("b", 0, 2, 1.0)]
