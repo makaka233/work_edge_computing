@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from edge_drl.comparison.runner import ACCEPTED_SCHEMES, FORMAL_SCENARIO_FAMILIES, FORMAL_SCHEMES, run_comparison
+from edge_drl.comparison.greedy import BASELINE_IMPLEMENTATIONS, GREEDY_IMPLEMENTATION
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +40,11 @@ def parse_args() -> argparse.Namespace:
         help="Required for Phase 3; path to a successfully completed Phase 2 result directory",
     )
     parser.add_argument("--schemes", nargs="+", choices=ACCEPTED_SCHEMES, default=list(FORMAL_SCHEMES))
+    parser.add_argument(
+        "--baseline-implementation", choices=BASELINE_IMPLEMENTATIONS,
+        default=GREEDY_IMPLEMENTATION,
+        help="DARP/DPMS design version; legacy-v1 reproduces the archived MILP/path schemes",
+    )
     parser.add_argument(
         "--eval-seeds",
         nargs="+",
@@ -86,6 +92,7 @@ def main() -> None:
         output_root=args.output_root,
         run_id=args.run_id,
         schemes=tuple(args.schemes),
+        baseline_implementation=args.baseline_implementation,
         phase2_validation_run=args.phase2_validation_run,
         monolithic_checkpoint=args.monolithic_checkpoint,
         monolithic_checkpoint_mode=args.monolithic_checkpoint_mode,

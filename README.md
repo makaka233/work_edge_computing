@@ -1,5 +1,11 @@
 # Edge DRL for Staged Edge Services
 
+Comparison update (2026-10-15): DARP and DPMS retain their scheme names but
+default to the versioned `demand-greedy-v2` design. Pass
+`--baseline-implementation legacy-v1` to reproduce their archived implementations.
+See [DARP/DPMS scheme definitions and compatibility](docs/DARP_DPMS_V2.md).
+Proposed training, physical resources and common KKT settlement are unchanged.
+
 This project implements the first runnable scaffold for the staged edge-service
 optimization model described in `数学模型.docx` and `KKT条件推导.docx`.
 

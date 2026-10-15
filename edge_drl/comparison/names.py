@@ -1,7 +1,8 @@
 """Stable comparison identifiers and publication-facing scheme names.
 
 Legacy identifiers remain accepted so archived commands and results can still
-be read without changing the algorithms or old checkpoints.
+be read. DARP/DPMS implementation versions are selected separately by the
+comparison runner; name canonicalization never rewrites archived results.
 """
 
 SCHEME_LABELS = {

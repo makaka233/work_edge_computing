@@ -15,6 +15,9 @@ import torch
 
 from edge_drl.comparison.checkpoint import edge_config_from_checkpoint, load_checkpoint_configuration
 from edge_drl.comparison.algorithmic import DPMSScheme, HybridScheme
+from edge_drl.comparison.greedy import (
+    BASELINE_IMPLEMENTATIONS, GREEDY_IMPLEMENTATION, GreedyDARPScheme, GreedyDPMSScheme,
+)
 from edge_drl.comparison.heuristic import (
     DARPScheme,
     FitDeployScheme,
@@ -110,10 +113,14 @@ def run_comparison(
     sampled_seconds_per_window: int = 0,
     learned_fast_eval_mode: str = "deterministic",
     routing_repeats_override: int | None = None,
+    baseline_implementation: str = GREEDY_IMPLEMENTATION,
 ) -> Path:
     schemes = tuple(canonical_scheme_id(name) for name in schemes)
+    if baseline_implementation not in BASELINE_IMPLEMENTATIONS:
+        raise ValueError(f"unknown baseline implementation: {baseline_implementation}")
     if phase == 3:
-        _require_phase2_validation(phase2_validation_run, schemes=schemes)
+        _require_phase2_validation(phase2_validation_run, schemes=schemes,
+                                   baseline_implementation=baseline_implementation)
     if "MSO" in schemes and monolithic_checkpoint is None:
         raise ValueError(
             "MSO is trainable and requires --mso-checkpoint; "
@@ -191,7 +198,14 @@ def run_comparison(
         "phase": phase,
         "formal_schemes": list(schemes),
         "scheme_display_names": {name: SCHEME_LABELS.get(name, name) for name in schemes},
-        "greedy_in_main_results": False,
+        "greedy_in_main_results": (
+            baseline_implementation == GREEDY_IMPLEMENTATION and bool(set(schemes) & {"DARP", "DPMS"})
+        ),
+        "baseline_implementation": baseline_implementation,
+        "scheme_implementations": {
+            name: baseline_implementation if name in {"DARP", "DPMS"} else "unchanged"
+            for name in schemes
+        },
         "episode_minutes": episode_minutes,
         "sampled_seconds_per_window": sampled_seconds_per_window,
         "represented_seconds_per_settlement": represented_seconds,
@@ -210,7 +224,10 @@ def run_comparison(
         "eval_seeds": eval_seeds,
         "slow_window_feedback_protocol": SLOW_FEEDBACK_PROTOCOL,
         "slow_window_feedback_schemes": [name for name in schemes if name in {"Proposed", "HEFT", "MSO"}],
-        "dpms_cost_implementation": DPMS_COST_IMPLEMENTATION if "DPMS" in schemes else None,
+        "dpms_cost_implementation": (
+            ("stage-local-kkt-increment-v2" if baseline_implementation == GREEDY_IMPLEMENTATION
+             else DPMS_COST_IMPLEMENTATION) if "DPMS" in schemes else None
+        ),
         "scenario_families": list(dict.fromkeys(point.family for point in points)),
         "scenario_point_count": len(points),
         "standard_phase_design": is_standard_design,
@@ -247,7 +264,14 @@ def run_comparison(
             "UnifiedPPO": "one shared PPO actor-critic for deployment, routing, and learned resource priorities; no KKT optimization",
         },
     }
+    if baseline_implementation == GREEDY_IMPLEMENTATION:
+        metadata["labels"].update({
+            "DARP": "demand-proportional greedy locality placement with frozen Proposed Fast PPO and unchanged KKT",
+            "DPMS": "the same demand-proportional greedy placement with stage-local marginal-cost scheduling and unchanged KKT",
+        })
     write_json(output / "metadata.json", metadata)
+    if set(schemes) & {"DARP", "DPMS"}:
+        print(f"DARP/DPMS implementation={baseline_implementation}", flush=True)
 
     for point in points:
         for eval_seed in eval_seeds:
@@ -311,6 +335,7 @@ def run_comparison(
                             unified_checkpoint=unified_checkpoint,
                             point=point,
                             learned_fast_deterministic=learned_fast_eval_mode == "deterministic",
+                            baseline_implementation=baseline_implementation,
                         )
                         # Checkpoint construction consumes RNG state. Reseed only after
                         # loading so each learned scheduler receives the same explicit,
@@ -319,6 +344,7 @@ def run_comparison(
                         torch.manual_seed(routing_seed)
                         if torch.cuda.is_available():
                             torch.cuda.manual_seed_all(routing_seed)
+                        service_rows_start = len(service_latency_rows)
                         result = evaluate_scheme_episode(
                             scheme=scheme,
                             env=env,
@@ -328,10 +354,13 @@ def run_comparison(
                             sampled_seconds_per_window=sampled_seconds_per_window,
                             service_latency_rows=service_latency_rows,
                         )
+                        for service_row in service_latency_rows[service_rows_start:]:
+                            service_row["scheme_implementation"] = metadata["scheme_implementations"][scheme_name]
                         row = result.to_dict()
                         row.update(
                             {
                                 "experiment": point.family,
+                                "scheme_implementation": metadata["scheme_implementations"][scheme_name],
                                 "parameter": point.value,
                                 "physical_seed": trace.physical_seed,
                                 "demand_seed": trace.demand_seed,
@@ -350,6 +379,7 @@ def run_comparison(
                             solver_diagnostics.append(
                                 {
                                     "scheme": scheme_display,
+                                    "scheme_implementation": metadata["scheme_implementations"][scheme_name],
                                     "scenario_family": point.family,
                                     "scenario_value": point.value,
                                     "eval_seed": eval_seed,
@@ -362,6 +392,7 @@ def run_comparison(
                     except Exception as error:
                         failure = {
                             "scheme": scheme_display,
+                            "scheme_implementation": metadata["scheme_implementations"][scheme_name],
                             "scenario_family": point.family,
                             "scenario_value": point.value,
                             "eval_seed": eval_seed,
@@ -400,13 +431,15 @@ def run_comparison(
                 "completed_rows": len(raw_rows),
                 "expected_rows": len(points) * len(eval_seeds) * len(schemes) * routing_repeats,
                 "schemes": list(schemes),
+                "baseline_implementation": baseline_implementation,
             },
         )
     return output
 
 
 def _require_phase2_validation(
-    run: str | Path | None, *, schemes: tuple[str, ...] = FORMAL_SCHEMES
+    run: str | Path | None, *, schemes: tuple[str, ...] = FORMAL_SCHEMES,
+    baseline_implementation: str = "legacy-v1",
 ) -> None:
     if run is None:
         raise ValueError("Phase 3 requires --phase2-validation-run from a successful complete Phase 2 run")
@@ -421,6 +454,9 @@ def _require_phase2_validation(
         or [canonical_scheme_id(name) for name in payload.get("schemes", [])] != list(schemes)
     ):
         raise ValueError(f"invalid Phase 2 validation marker: {marker}")
+    if (set(map(canonical_scheme_id, schemes)) & {"DARP", "DPMS"}
+            and payload.get("baseline_implementation", "legacy-v1") != baseline_implementation):
+        raise ValueError("Phase 2 baseline implementation differs from the requested Phase 3 design")
 
 
 def _make_scheme(
@@ -435,7 +471,10 @@ def _make_scheme(
     unified_checkpoint: str | Path | None = None,
     point: ExperimentPoint | None = None,
     learned_fast_deterministic: bool = True,
+    baseline_implementation: str = GREEDY_IMPLEMENTATION,
 ):
+    if baseline_implementation not in BASELINE_IMPLEMENTATIONS:
+        raise ValueError(f"unknown baseline implementation: {baseline_implementation}")
     if name == "Proposed":
         return ProposedScheme(
             env,
@@ -448,7 +487,7 @@ def _make_scheme(
         return HybridScheme(env, checkpoint_path, checkpoint_args, device=device)
     name = canonical_scheme_id(name)
     if name == "DPMS":
-        return DPMSScheme()
+        return GreedyDPMSScheme() if baseline_implementation == GREEDY_IMPLEMENTATION else DPMSScheme()
     if name == "PopularityEFT":
         return PopularityEFTScheme()
     if name == "PopularityNearest":
@@ -457,7 +496,7 @@ def _make_scheme(
         return HEFTScheme(env, checkpoint_path, checkpoint_args, device=device)
     if name in {"DARP", "FitDeploy", "UniformFirstFitDeploy"}:
         scheme_class = {
-            "DARP": DARPScheme,
+            "DARP": GreedyDARPScheme if baseline_implementation == GREEDY_IMPLEMENTATION else DARPScheme,
             "FitDeploy": FitDeployScheme,
             "UniformFirstFitDeploy": UniformFirstFitDeployScheme,
         }[name]
