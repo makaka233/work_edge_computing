@@ -1,0 +1,26 @@
+{
+  "source": "runs\\joint_credit_v2_s6_u320_20261015_144010\\checkpoints\\snapshots\\update_0140.pt",
+  "source_sha256": "da4dc1bbddab497b84af7d7f90eccc708638c2379de1e43c3ac4d3fcb6c5e6d3",
+  "arms": [
+    {
+      "run": "count_beta_control_from140_s6_u6_20261015_1822",
+      "initial_sha256": "0a3ec0790eb8e3ad4c74ea72ea938cab63871494f1b579ec7c46b6d811c586a0",
+      "allocation": "stage-budget-v3",
+      "decode": "mean",
+      "matched_slow_actor_tensors": 60,
+      "zero_extended_encoders": 0,
+      "fast_actor_equal": true,
+      "optimizers_fresh": true
+    },
+    {
+      "run": "count_binned_from140_s6_u6_20261015_1822",
+      "initial_sha256": "4caa064a63df67ef93b5418a6d9bbef48e7d0495684c73f89aea40d4f7f9d7ac",
+      "allocation": "stage-budget-v5",
+      "decode": "categorical-mean",
+      "matched_slow_actor_tensors": 60,
+      "zero_extended_encoders": 3,
+      "fast_actor_equal": true,
+      "optimizers_fresh": true
+    }
+  ]
+}

@@ -2,15 +2,23 @@ param(
     [ValidateRange(1, 100000)][int]$Updates = 80,
     [ValidateRange(1, 600)][int]$SampledSeconds = 6,
     [ValidateSet('cuda', 'cpu')][string]$Device = 'cuda',
+    [int]$Seed = 2026,
+    [int]$PhysicalSeed = 2026,
     [string]$RunName = '',
     [string]$InitFastCheckpoint = 'runs/slow_repair_scratch_s6_u320_20261014_162352/checkpoints/latest.pt',
-    [switch]$FromScratch
+    [ValidateSet('joint-credit-v2', 'joint-credit-v3', 'joint-credit-v4', 'joint-credit-v5')][string]$ProposedDesign = 'joint-credit-v2',
+    [ValidateSet('auto', 'deployment-aware-v2', 'deployment-chain-v3')][string]$SlowDeploymentContext = 'auto',
+    [string]$InitSlowCheckpoint = '',
+    [ValidateSet('all', 'stage-placement')][string]$InitSlowActorScope = 'all',
+    [ValidateSet(1, 3)][int]$StagePlacementLrMultiplier = 1,
+    [switch]$FromScratch,
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if (-not $RunName) {
-    $RunName = 'joint_credit_v2_s' + $SampledSeconds + '_u' + $Updates + '_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+    $RunName = $ProposedDesign.Replace('-', '_') + '_s' + $SampledSeconds + '_u' + $Updates + '_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
 }
 Push-Location -LiteralPath $projectRoot
 try {
@@ -24,8 +32,8 @@ try {
     $env:MKL_NUM_THREADS = '1'
     $env:OPENBLAS_NUM_THREADS = '1'
     $trainingArguments = @(
-        '-u', '.\train_dual_ppo.py', '--seed', '2026',
-        '--pressure-profile', 'mec-latency200', '--proposed-design', 'joint-credit-v2',
+        '-u', '.\train_dual_ppo.py', '--seed', "$Seed", '--physical-seed', "$PhysicalSeed",
+        '--pressure-profile', 'mec-latency200', '--proposed-design', $ProposedDesign,
         '--training-design', 'trajectory-simultaneous', '--rollout-unit', 'window',
         '--updates', "$Updates", '--episode-minutes', '60', '--deployment-interval-minutes', '10',
         '--fast-windows-per-update', '12', '--slow-windows-per-update', '12',
@@ -40,6 +48,20 @@ try {
     )
     if (-not $FromScratch) {
         $trainingArguments += @('--init-fast-checkpoint', $InitFastCheckpoint, '--init-fast-actor-only')
+    }
+    if ($SlowDeploymentContext -ne 'auto') {
+        $trainingArguments += @('--slow-deployment-context', $SlowDeploymentContext)
+    }
+    if ($InitSlowCheckpoint) {
+        $trainingArguments += @('--init-slow-checkpoint', $InitSlowCheckpoint, '--init-slow-actor-scope', $InitSlowActorScope)
+    }
+    if ($StagePlacementLrMultiplier -ne 1) {
+        $trainingArguments += @('--slow-stage-lr', (0.0002 * $StagePlacementLrMultiplier).ToString([System.Globalization.CultureInfo]::InvariantCulture),
+            '--slow-placement-lr', (0.0001 * $StagePlacementLrMultiplier).ToString([System.Globalization.CultureInfo]::InvariantCulture))
+    }
+    if ($DryRun) {
+        [ordered]@{ executable='python'; working_directory=$projectRoot; arguments=$trainingArguments } | ConvertTo-Json -Depth 4
+        return
     }
     & python @trainingArguments
     if ($LASTEXITCODE -ne 0) { throw "Training exited with code $LASTEXITCODE" }

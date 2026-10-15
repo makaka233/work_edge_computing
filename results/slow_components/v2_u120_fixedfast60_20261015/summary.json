@@ -1,0 +1,24 @@
+{
+  "protocol": "slow-component-paired-v1",
+  "failed_evaluations": 0,
+  "candidates": [
+    {
+      "candidate": "Slow-01-checkpoint",
+      "complete": true,
+      "points": 2,
+      "slow_mean_latency_ms": 184.73763002642252,
+      "darp_mean_latency_ms": 183.58088059772518,
+      "relative_gap_percent": 0.6301034317577336,
+      "wins": 1
+    },
+    {
+      "candidate": "Slow-01-integer-mode",
+      "complete": true,
+      "points": 2,
+      "slow_mean_latency_ms": 190.15268433915708,
+      "darp_mean_latency_ms": 183.58088059772518,
+      "relative_gap_percent": 3.579786587816014,
+      "wins": 0
+    }
+  ]
+}

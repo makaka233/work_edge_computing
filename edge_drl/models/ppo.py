@@ -430,9 +430,10 @@ class GraphAttentionActorCritic(nn.Module):
         hidden_dim: int = 128,
         detach_critic_backbone: bool = False,
         independent_critic: bool = False,
+        structured_critic: bool = False,
     ):
         super().__init__()
-        if action_mode not in {"node", "count", "budget", "stage"}:
+        if action_mode not in {"node", "count", "budget", "stage", "quota", "quota-beta"}:
             raise ValueError("action_mode must be 'node', 'count', 'budget', or 'stage'")
         if action_mode == "stage" and (stage_feature_dim is None or stage_feature_dim < 1):
             raise ValueError("stage action mode requires a positive stage_feature_dim")
@@ -446,6 +447,9 @@ class GraphAttentionActorCritic(nn.Module):
         self.stage_action_count = action_dim - 1 if action_mode == "stage" else 0
         self.detach_critic_backbone = detach_critic_backbone
         self.independent_critic = independent_critic
+        self.structured_critic = bool(structured_critic)
+        if structured_critic and (not independent_critic or not detach_critic_backbone):
+            raise ValueError("structured Slow critic requires isolated value gradients")
         self.count_min_scale = max(float(action_dim) / 12.0, 1.0)
         self.node_offset = global_dim
         self.stage_offset = global_dim + num_nodes * node_feature_dim
@@ -502,6 +506,22 @@ class GraphAttentionActorCritic(nn.Module):
             )
             with torch.no_grad():
                 self.actor[-1].bias.zero_()
+        elif action_mode == "quota-beta":
+            self.actor = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 2))
+            # Keep the learned Beta parameter network transferable. The policy
+            # itself is categorical over normalized numerical bin masses.
+            with torch.no_grad():
+                self.actor[-1].bias.zero_()
+            points, weights = np.polynomial.legendre.leggauss(32)
+            self.register_buffer("quota_quadrature_points", torch.tensor(points, dtype=torch.float32))
+            self.register_buffer("quota_quadrature_log_weights", torch.tensor(np.log(weights), dtype=torch.float32))
+        elif action_mode == "quota":
+            self.actor = nn.Sequential(
+                nn.Linear(hidden_dim * 2 + 4, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
         else:
             self.stage_encoder = nn.Sequential(
                 nn.Linear(self.stage_feature_dim, hidden_dim),
@@ -527,6 +547,11 @@ class GraphAttentionActorCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        if self.structured_critic:
+            from edge_drl.models.slow_value import StructuredSlowCritic
+            self.critic = StructuredSlowCritic(global_dim=global_dim, node_feature_dim=node_feature_dim,
+                edge_feature_dim=edge_feature_dim, num_nodes=num_nodes, stage_feature_dim=self.stage_feature_dim,
+                stage_count=self.stage_action_count)
 
     def forward(self, states: torch.Tensor, masks: torch.Tensor) -> tuple[Distribution, torch.Tensor]:
         global_features = states[:, : self.global_dim]
@@ -568,6 +593,29 @@ class GraphAttentionActorCritic(nn.Module):
                 device=graph_context.device,
             ).unsqueeze(0)
             logits = -0.5 * torch.square((count_indices - center.unsqueeze(1)) / scale.unsqueeze(1))
+        elif self.action_mode == "quota-beta":
+            concentrations = torch.nn.functional.softplus(self.actor(graph_context)) + 1.
+            quotas = torch.arange(self.action_dim, dtype=states.dtype, device=states.device)[None, :]
+            maximum = (masks.to(states.dtype) * quotas).max(dim=1, keepdim=True).values
+            x = ((quotas[..., None] + .5 + .5*self.quota_quadrature_points)
+                 / (maximum[..., None] + 1)).clamp(1e-7, 1-1e-7)
+            alpha, beta = concentrations[:, :1, None], concentrations[:, 1:2, None]
+            log_density = ((alpha-1)*x.log() + (beta-1)*torch.log1p(-x)
+                           - torch.lgamma(alpha) - torch.lgamma(beta) + torch.lgamma(alpha+beta))
+            logits = torch.logsumexp(log_density + self.quota_quadrature_log_weights, dim=-1)
+            logits = logits - torch.log(2*(maximum+1))
+            peak = logits.masked_fill(~masks.bool(), -1e9).max(dim=1, keepdim=True).values
+            # Positive numerical support for all legal integers; the physical
+            # mask remains authoritative. Training uses these actual masses.
+            logits = (logits - peak).clamp_min(-60.)
+        elif self.action_mode == "quota":
+            quotas = torch.arange(self.action_dim, dtype=states.dtype, device=states.device)
+            quotas = quotas.unsqueeze(0).expand(states.shape[0], -1)
+            maximum = (masks.to(states.dtype) * quotas).max(dim=1, keepdim=True).values.clamp_min(1.)
+            quota_features = torch.stack([quotas / self.num_nodes, quotas / maximum,
+                                          (maximum - quotas) / maximum, (quotas == 0).to(states.dtype)], dim=-1)
+            context = graph_context.unsqueeze(1).expand(-1, self.action_dim, -1)
+            logits = self.actor(torch.cat([context, quota_features], dim=-1)).squeeze(-1)
         elif self.action_mode == "stage":
             stage_features = states[:, self.stage_offset : self.edge_offset].reshape(
                 -1,
@@ -599,13 +647,15 @@ class GraphAttentionActorCritic(nn.Module):
             # Direct pre-action inventory/budget/stage inputs have their OWN
             # trained encoder, rather than depending only on detached actor features.
             critic_context = torch.cat([states[:, :self.edge_offset], critic_context], dim=-1)
-        values = self.critic(critic_context).squeeze(-1)
+        values = self.critic(states if self.structured_critic else critic_context).squeeze(-1)
         return dist, values
 
     def conditional_critic_features(self, states: torch.Tensor) -> torch.Tensor:
         """Value-only encoding; callers detach it before fitting the critic."""
         if not self.independent_critic:
             raise ValueError("conditional value-only replay requires an independent critic")
+        if self.structured_critic:
+            return states.detach()
         global_emb = self.global_encoder(states[:, :self.global_dim])
         nodes = states[:, self.node_offset:self.stage_offset].reshape(-1, self.num_nodes, self.node_feature_dim)
         edges = states[:, self.edge_offset:].reshape(-1, self.num_nodes, self.num_nodes, self.edge_feature_dim)
@@ -662,6 +712,7 @@ class PPOAgent:
         conditional_replay_windows: int = 96,
         conditional_replay_decay: float = .9,
         prefix_credit: bool = False,
+        structured_critic: bool = False,
         guarded_update_chunks: int = 1,
         device: str = "cpu",
     ):
@@ -738,6 +789,8 @@ class PPOAgent:
             "slow_gat_node",
             "slow_gat_count",
             "slow_gat_budget",
+            "slow_gat_quota",
+            "slow_gat_beta_quota",
             "slow_gat_stage",
         }:
             if global_dim is None or node_feature_dim is None or edge_feature_dim is None or num_nodes is None:
@@ -753,6 +806,10 @@ class PPOAgent:
                     if policy_kind == "slow_gat_node"
                     else "budget"
                     if policy_kind == "slow_gat_budget"
+                    else "quota"
+                    if policy_kind == "slow_gat_quota"
+                    else "quota-beta"
+                    if policy_kind == "slow_gat_beta_quota"
                     else "stage"
                     if policy_kind == "slow_gat_stage"
                     else "count"
@@ -761,6 +818,7 @@ class PPOAgent:
                 hidden_dim=hidden_dim,
                 detach_critic_backbone=detach_critic_backbone,
                 independent_critic=independent_critic,
+                structured_critic=structured_critic,
             ).to(self.device)
         else:
             raise ValueError(f"unknown policy_kind: {policy_kind}")
@@ -843,6 +901,9 @@ class PPOAgent:
         state: np.ndarray,
         mask: np.ndarray,
         deterministic: bool = False,
+        *,
+        beta_quota_maximum: int | None = None,
+        categorical_quota_mean: bool = False,
     ) -> tuple[int | float, float, float]:
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         mask_t = torch.as_tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
@@ -850,9 +911,19 @@ class PPOAgent:
             dist, value = self.policy(state_t, mask_t)
             if self.continuous_actions:
                 action_t = dist.mean if deterministic else dist.sample()
+                if deterministic and beta_quota_maximum is not None:
+                    from edge_drl.models.quota import beta_modal_fraction
+                    fraction = beta_modal_fraction(float(dist.concentration1.item()),
+                                                   float(dist.concentration0.item()), beta_quota_maximum)
+                    action_t = torch.full_like(action_t, fraction)
                 action_t = action_t.clamp(1e-6, 1.0 - 1e-6)
             else:
                 action_t = torch.argmax(dist.probs, dim=-1) if deterministic else dist.sample()
+                if deterministic and categorical_quota_mean:
+                    quotas = torch.arange(dist.probs.shape[-1], dtype=dist.probs.dtype, device=self.device)
+                    action_t = torch.floor((dist.probs * quotas).sum(dim=-1) + .5).long()
+                    if not bool(mask_t.gather(1, action_t[:, None]).all()):
+                        raise ValueError("categorical quota mean requires contiguous physical integer support")
             logprob_t = dist.log_prob(action_t)
         action = float(action_t.item()) if self.continuous_actions else int(action_t.item())
         return action, float(logprob_t.item()), float(self._raw_values(value).item())

@@ -1,0 +1,15 @@
+{
+  "protocol": "slow-component-paired-v1",
+  "failed_evaluations": 0,
+  "candidates": [
+    {
+      "candidate": "Slow-01-checkpoint",
+      "complete": true,
+      "points": 2,
+      "slow_mean_latency_ms": 229.68026867972873,
+      "darp_mean_latency_ms": 183.58088059772518,
+      "relative_gap_percent": 25.11121415907118,
+      "wins": 0
+    }
+  ]
+}

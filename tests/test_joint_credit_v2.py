@@ -266,9 +266,14 @@ def test_comparison_training_protocol_honors_cap_and_samples_same_seconds(monkey
     assert samples[0]==samples[1]
 
 
-def test_real_entrypoint_joint_updates_probe_and_same_directory_resume(tmp_path):
+@pytest.mark.parametrize('design,allocation,context', [('joint-credit-v2','stage-budget-v3','deployment-aware-v2'),
+                                               ('joint-credit-v3','stage-budget-v4','deployment-aware-v2'),
+                                               ('joint-credit-v3','stage-budget-v4','deployment-chain-v3'),
+                                               ('joint-credit-v4','stage-budget-v5','deployment-aware-v2'),
+                                               ('joint-credit-v5','stage-budget-v6','deployment-chain-v3')])
+def test_real_entrypoint_joint_updates_probe_and_same_directory_resume(tmp_path, design, allocation, context):
     command=[sys.executable,'train_dual_ppo.py','--pressure-profile','mec-latency200',
-        '--proposed-design','joint-credit-v2','--training-design','trajectory-simultaneous',
+        '--proposed-design',design,'--training-design','trajectory-simultaneous',
         '--updates','2','--num-users','10000','--num-edge-nodes','6','--num-service-types','2',
         '--topology-k-nearest','2',
         '--mean-requests-per-minute','600','--episode-minutes','60',
@@ -281,16 +286,18 @@ def test_real_entrypoint_joint_updates_probe_and_same_directory_resume(tmp_path)
         '--slow-critic-holdout-episodes','1','--checkpoint-probe-interval','1',
         '--eval-interval','0','--device','cpu','--progress-interval-seconds','0',
         '--run-root',str(tmp_path),'--run-name','joint']
+    command += ['--slow-deployment-context', context]
     completed=subprocess.run(command,capture_output=True,text=True,timeout=180)
     assert completed.returncode==0, completed.stdout+'\n'+completed.stderr
     run=tmp_path/'joint'
     best=torch.load(run/'checkpoints/best.pt',map_location='cpu')
     assert best['metadata']['selection_kind']=='post_update_nominal_probe_v2'
     assert best['fast_independent_critic']
-    assert best['slow_allocation_mode']=='stage-budget-v3'
+    assert best['slow_allocation_mode']==allocation
     assert best['metadata']['probe_result']['sampled_steps']==1
     command[command.index('--updates')+1]='1'
     command[command.index('--proposed-design')+1]='auto'
+    command[command.index('--slow-deployment-context')+1]='auto'
     command += ['--load-checkpoint',str(run/'checkpoints/latest.pt'),'--append-log']
     completed=subprocess.run(command,capture_output=True,text=True,timeout=180)
     assert completed.returncode==0, completed.stdout+'\n'+completed.stderr
@@ -301,4 +308,83 @@ def test_real_entrypoint_joint_updates_probe_and_same_directory_resume(tmp_path)
     assert all(float(row['sampled_request_events']) < float(row['request_events']) for row in rows)
     latest=torch.load(run/'checkpoints/latest.pt',map_location='cpu')
     assert latest['metadata']['completed_updates']==3
-    assert latest['metadata']['args']['proposed_design']=='joint-credit-v2'
+    assert latest['metadata']['args']['proposed_design']==design
+    assert latest['slow_deployment_context']==context
+    assert latest['slow_quota_decode']=={'joint-credit-v2':'mean','joint-credit-v3':'categorical-mode','joint-credit-v4':'categorical-mean','joint-credit-v5':'categorical-mean'}[design]
+    evaluation=[sys.executable,'evaluate_slow.py','--fast-checkpoint',str(run/'checkpoints/latest.pt'),
+        '--seeds','2031','--loads','1.0','--episode-minutes','10',
+        '--sampled-seconds-per-window','1','--sampling-max-interval-seconds','600',
+        '--output',str(tmp_path/'component_eval')]
+    if design=='joint-credit-v2':
+        evaluation += ['--quota-decoders','checkpoint','integer-mode']
+    elif design in {'joint-credit-v4','joint-credit-v5'}:
+        evaluation += ['--quota-decoders','checkpoint','categorical-mode']
+    completed=subprocess.run(evaluation,capture_output=True,text=True,timeout=180)
+    assert completed.returncode==0, completed.stdout+'\n'+completed.stderr
+    import json
+    summary=json.loads((tmp_path/'component_eval/summary.json').read_text())
+    assert summary['failed_evaluations']==0
+    assert all(row['complete'] and row['points']==1 for row in summary['candidates'])
+    with (tmp_path/'component_eval/raw.csv').open() as stream:
+        evaluated=list(csv.DictReader(stream))
+    assert len({row['trace_hash'] for row in evaluated})==1
+    assert len({row['request_count'] for row in evaluated})==1
+    assert len({row['fast_policy_sha256'] for row in evaluated})==1
+    with (tmp_path/'component_eval/deployment_windows.csv').open() as stream:
+        windows=list(csv.DictReader(stream))
+    assert len(windows)==len(evaluated)
+    assert {row['candidate'] for row in windows}=={row['candidate'] for row in evaluated}
+    assert all(float(row['remaining_memory_gb']) >= -1e-7 for row in windows)
+    assert all(int(row['individually_feasible_additions']) >= 0 for row in windows)
+    with (tmp_path/'component_eval/quota_actions.csv').open() as stream:
+        quotas=[row for row in csv.DictReader(stream) if row.get('action_kind') != 'stop']
+    assert quotas and all(0 <= int(row['extra_replicas']) <= int(row['feasible_extra_replicas']) for row in quotas)
+    if design in {'joint-credit-v3','joint-credit-v4','joint-credit-v5'}:
+        assert all(float(row['count_action'])==int(row['extra_replicas']) for row in quotas)
+    if design=='joint-credit-v3' and context=='deployment-aware-v2':
+        checkpoint_path=str(run/'checkpoints/latest.pt')
+        transfer_command=command.copy()
+        index=transfer_command.index('--load-checkpoint')
+        del transfer_command[index:index+2]
+        transfer_command.remove('--append-log')
+        transfer_command[transfer_command.index('--run-name')+1]='chain_transfer'
+        transfer_command[transfer_command.index('--proposed-design')+1]='joint-credit-v3'
+        transfer_command[transfer_command.index('--slow-deployment-context')+1]='deployment-chain-v3'
+        transfer_command += ['--init-slow-checkpoint',checkpoint_path,
+                             '--init-fast-checkpoint',checkpoint_path,'--init-fast-actor-only']
+        completed=subprocess.run(transfer_command,capture_output=True,text=True,timeout=180)
+        assert completed.returncode==0, completed.stdout+'\n'+completed.stderr
+        transferred=torch.load(tmp_path/'chain_transfer/checkpoints/latest.pt',map_location='cpu')
+        initialization=transferred['metadata']['args']['slow_initialization']
+        assert initialization['source_update']==3 and initialization['resume'] is False
+        assert initialization['source_context']=='deployment-aware-v2'
+        assert initialization['target_context']=='deployment-chain-v3'
+        assert transferred['metadata']['completed_updates']==1
+        resume_transfer=transfer_command.copy()
+        for flag in ('--init-slow-checkpoint','--init-fast-checkpoint'):
+            index=resume_transfer.index(flag)
+            del resume_transfer[index:index+2]
+        resume_transfer.remove('--init-fast-actor-only')
+        resume_transfer += ['--load-checkpoint',str(tmp_path/'chain_transfer/checkpoints/latest.pt'),'--append-log']
+        completed=subprocess.run(resume_transfer,capture_output=True,text=True,timeout=180)
+        assert completed.returncode==0, completed.stdout+'\n'+completed.stderr
+        resumed=torch.load(tmp_path/'chain_transfer/checkpoints/latest.pt',map_location='cpu')
+        assert resumed['metadata']['completed_updates']==2
+        assert resumed['metadata']['args']['slow_initialization']==initialization
+        assert resumed['metadata']['args']['fast_initialization']==transferred['metadata']['args']['fast_initialization']
+    if design=='joint-credit-v2':
+        source_checkpoint=str(run/'checkpoints/latest.pt')
+        fresh=command.copy()
+        index=fresh.index('--load-checkpoint'); del fresh[index:index+2]
+        fresh.remove('--append-log')
+        fresh[fresh.index('--run-name')+1]='binned_transfer'
+        fresh[fresh.index('--proposed-design')+1]='joint-credit-v4'
+        fresh += ['--init-slow-checkpoint',source_checkpoint,'--init-fast-checkpoint',source_checkpoint,'--init-fast-actor-only']
+        completed=subprocess.run(fresh,capture_output=True,text=True,timeout=180)
+        assert completed.returncode==0, completed.stdout+'\n'+completed.stderr
+        initial=torch.load(tmp_path/'binned_transfer/checkpoints/initial.pt',map_location='cpu')
+        assert initial['metadata']['completed_updates']==0
+        assert initial['metadata']['selection_kind']=='actor_initialization_only'
+        assert initial['metadata']['args']['slow_initialization']['source_allocation']=='stage-budget-v3'
+        assert initial['metadata']['args']['slow_initialization']['target_allocation']=='stage-budget-v5'
+        assert initial['slow_quota_decode']=='categorical-mean'

@@ -1,0 +1,498 @@
+{
+  "protocol": "slow-component-paired-v1",
+  "fast_checkpoint": "C:\\Users\\1\\Desktop\\work_edge_computing\\runs\\joint_credit_v2_s6_u320_20261015_144010\\checkpoints\\snapshots\\update_0140.pt",
+  "fast_checkpoint_sha256": "da4dc1bbddab497b84af7d7f90eccc708638c2379de1e43c3ac4d3fcb6c5e6d3",
+  "fast_update": 140,
+  "fast_policy_sha256": "dd9a99159c8c1edec6f5bc8dfd010bca91c739ddf302b9b95fb2cfa5d990efe9",
+  "fast_evaluation": "deterministic",
+  "baseline_implementation": "demand-greedy-v2",
+  "slow_candidates": [
+    {
+      "label": "Slow-01-checkpoint",
+      "checkpoint": "C:\\Users\\1\\Desktop\\work_edge_computing\\runs\\count_beta_control_from140_s6_u6_20261015_1822\\checkpoints\\last.pt",
+      "sha256": "62a5b5b3b7e2429f49e17417cf878bdca0f03c8544f631247e2a909bb0afc0af",
+      "update": 6,
+      "allocation_mode": "stage-budget-v3",
+      "deployment_context": "deployment-aware-v2",
+      "training_seed": 2026,
+      "slow_initialization": {
+        "path": "C:\\Users\\1\\Desktop\\work_edge_computing\\runs\\joint_credit_v2_s6_u320_20261015_144010\\checkpoints\\snapshots\\update_0140.pt",
+        "sha256": "da4dc1bbddab497b84af7d7f90eccc708638c2379de1e43c3ac4d3fcb6c5e6d3",
+        "source_update": 140,
+        "source_context": "deployment-aware-v2",
+        "target_context": "deployment-aware-v2",
+        "source_allocation": "stage-budget-v3",
+        "target_allocation": "stage-budget-v3",
+        "scope": "three_slow_actors_only_new_critics_and_optimizers",
+        "new_observation_columns": "zero_initialized",
+        "resume": false,
+        "action_sampling_seed": 7002045
+      },
+      "fast_initialization": {
+        "path": "C:\\Users\\1\\Desktop\\work_edge_computing\\runs\\joint_credit_v2_s6_u320_20261015_144010\\checkpoints\\snapshots\\update_0140.pt",
+        "source_update": 140,
+        "scope": "fast_actor_only_new_critic",
+        "resume": false
+      },
+      "saved_quota_decode": "mean",
+      "evaluated_quota_decode": "mean"
+    },
+    {
+      "label": "Slow-02-checkpoint",
+      "checkpoint": "C:\\Users\\1\\Desktop\\work_edge_computing\\runs\\count_binned_from140_s6_u6_20261015_1822\\checkpoints\\last.pt",
+      "sha256": "d23c7babdd0347accdaca7797b2d25a919dc1312009c12a65c478cf0296fa846",
+      "update": 6,
+      "allocation_mode": "stage-budget-v5",
+      "deployment_context": "deployment-aware-v2",
+      "training_seed": 2026,
+      "slow_initialization": {
+        "path": "C:\\Users\\1\\Desktop\\work_edge_computing\\runs\\joint_credit_v2_s6_u320_20261015_144010\\checkpoints\\snapshots\\update_0140.pt",
+        "sha256": "da4dc1bbddab497b84af7d7f90eccc708638c2379de1e43c3ac4d3fcb6c5e6d3",
+        "source_update": 140,
+        "source_context": "deployment-aware-v2",
+        "target_context": "deployment-aware-v2",
+        "source_allocation": "stage-budget-v3",
+        "target_allocation": "stage-budget-v5",
+        "scope": "three_slow_actors_only_new_critics_and_optimizers",
+        "new_observation_columns": "zero_initialized",
+        "resume": false,
+        "action_sampling_seed": 7002045
+      },
+      "fast_initialization": {
+        "path": "C:\\Users\\1\\Desktop\\work_edge_computing\\runs\\joint_credit_v2_s6_u320_20261015_144010\\checkpoints\\snapshots\\update_0140.pt",
+        "source_update": 140,
+        "scope": "fast_actor_only_new_critic",
+        "resume": false
+      },
+      "saved_quota_decode": "categorical-mean",
+      "evaluated_quota_decode": "categorical-mean"
+    }
+  ],
+  "seeds": [
+    2030,
+    2031
+  ],
+  "loads": [
+    1.0
+  ],
+  "episode_minutes": 60,
+  "sampled_seconds_per_window": 6,
+  "sampling_max_interval_seconds": 100.0,
+  "sampling_protocol": "training-equivalent-v2",
+  "equal_cell_summary": true,
+  "environment": {
+    "seed": 2002029,
+    "physical_seed": 2026,
+    "scenario_seed": 2030,
+    "num_users": 12000,
+    "num_edge_nodes": 32,
+    "num_service_types": 10,
+    "max_service_stages": 3,
+    "episode_minutes": 60,
+    "episode_hours": null,
+    "deployment_interval_minutes": 10,
+    "arrival_profile": "stationary",
+    "mean_requests_per_minute": null,
+    "active_user_ratio": 0.2,
+    "active_user_request_rate_per_minute": 1.75,
+    "traffic_scale": 1.0,
+    "demand_load_multiplier": 1.0,
+    "demand_load_group": null,
+    "task_compute_scale": 1.0,
+    "task_data_scale": 1.0,
+    "edge_node_profile": "jetson-ai-edge",
+    "service_workload_profile": "edge-ai-latency200",
+    "node_compute_capacity_scale": 1.0,
+    "wired_link_bandwidth_scale": 0.8,
+    "topology_k_nearest": 6,
+    "deadline_scale": 2.75,
+    "service_resource_fraction": 0.6,
+    "request_aggregation_window_seconds": 1.0,
+    "load_ewma_tau_minutes": 1.0,
+    "sampled_load_update_mode": "interval-average",
+    "wireless_uplink_mbps": 300.0,
+    "radio_rtt_ms": 10.0,
+    "load_penalty_weight": 0.08,
+    "migration_cost_weight": 0.0,
+    "invalid_action_penalty": 10.0,
+    "compute_allocation_mode": "kkt",
+    "link_allocation_mode": "kkt",
+    "network_constraint_mode": "shared-nic",
+    "service_calibration_mode": "audited-v1",
+    "service_calibration_file": null,
+    "service_calibration_document": {
+      "schema": 1,
+      "reference_compute_gcycles_s": 72.0,
+      "units": {
+        "data": "MB",
+        "memory": "GB",
+        "time": "ms",
+        "compute": "Gcycle/s"
+      },
+      "provenance": {
+        "status": "estimated",
+        "references": {
+          "runtime": "https://docs.nvidia.com/deeplearning/tensorrt/latest/architecture/how-trt-works.html",
+          "speech": "https://github.com/openai/whisper",
+          "detector": "https://docs.ultralytics.com/models/yolov8/",
+          "medical": "https://physionet.org/content/ptb-xl/1.0.3/",
+          "cloud": "https://pointclouds.org/documentation/tutorials/compression.html"
+        },
+        "note": "effective compute and execution-context budgets require device profiling"
+      },
+      "services": [
+        {
+          "name": "speech-recognition",
+          "input_mb": 0.352,
+          "stages": [
+            {
+              "compute_ms": 5.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.068,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 0.96,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 300.00000000000006,
+              "resident_memory_gb": 0.276,
+              "context_memory_gb": 0.612,
+              "contexts": 2,
+              "storage_gb": 0.3,
+              "output_mb": 0.004,
+              "weights_gb": 0.148,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "ar-overlay",
+          "input_mb": 0.3,
+          "stages": [
+            {
+              "compute_ms": 4.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.057999999999999996,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 1.229,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 6.0,
+              "resident_memory_gb": 0.0704,
+              "context_memory_gb": 0.31479999999999997,
+              "contexts": 2,
+              "storage_gb": 0.04,
+              "output_mb": 0.0016,
+              "weights_gb": 0.0064,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 3.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.027999999999999997,
+              "contexts": 2,
+              "storage_gb": 0.02,
+              "output_mb": 0.002,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "video-object-detection",
+          "input_mb": 0.152,
+          "stages": [
+            {
+              "compute_ms": 4.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.057999999999999996,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 1.229,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 18.000000000000004,
+              "resident_memory_gb": 0.0864,
+              "context_memory_gb": 0.4568,
+              "contexts": 2,
+              "storage_gb": 0.1,
+              "output_mb": 0.0032,
+              "weights_gb": 0.0224,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 4.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.057999999999999996,
+              "contexts": 2,
+              "storage_gb": 0.03,
+              "output_mb": 0.0048,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "industrial-inspection",
+          "input_mb": 1.049,
+          "stages": [
+            {
+              "compute_ms": 6.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.093,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 1.049,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 40.0,
+              "resident_memory_gb": 0.0874,
+              "context_memory_gb": 0.5063000000000001,
+              "contexts": 2,
+              "storage_gb": 0.1,
+              "output_mb": 0.1311,
+              "weights_gb": 0.0234,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 3.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.057999999999999996,
+              "contexts": 2,
+              "storage_gb": 0.03,
+              "output_mb": 0.004,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "traffic-perception",
+          "input_mb": 0.3,
+          "stages": [
+            {
+              "compute_ms": 4.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.057999999999999996,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 1.229,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 18.000000000000004,
+              "resident_memory_gb": 0.0864,
+              "context_memory_gb": 0.4568,
+              "contexts": 2,
+              "storage_gb": 0.1,
+              "output_mb": 0.0064,
+              "weights_gb": 0.0224,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 6.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.088,
+              "contexts": 2,
+              "storage_gb": 0.04,
+              "output_mb": 0.002,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "smart-retail-event",
+          "input_mb": 0.25,
+          "stages": [
+            {
+              "compute_ms": 4.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.057999999999999996,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 1.229,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 18.000000000000004,
+              "resident_memory_gb": 0.0864,
+              "context_memory_gb": 0.4568,
+              "contexts": 2,
+              "storage_gb": 0.1,
+              "output_mb": 0.0032,
+              "weights_gb": 0.0224,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 5.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.068,
+              "contexts": 2,
+              "storage_gb": 0.03,
+              "output_mb": 0.004,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "robot-control",
+          "input_mb": 0.21,
+          "stages": [
+            {
+              "compute_ms": 8.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.118,
+              "contexts": 2,
+              "storage_gb": 0.08,
+              "output_mb": 3.084,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 15.000000000000002,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.218,
+              "contexts": 2,
+              "storage_gb": 0.1,
+              "output_mb": 0.04,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 5.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.093,
+              "contexts": 2,
+              "storage_gb": 0.08,
+              "output_mb": 0.002,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "medical-vital-anomaly",
+          "input_mb": 0.12,
+          "stages": [
+            {
+              "compute_ms": 4.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.027999999999999997,
+              "contexts": 2,
+              "storage_gb": 0.03,
+              "output_mb": 0.24,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 8.0,
+              "resident_memory_gb": 0.084,
+              "context_memory_gb": 0.158,
+              "contexts": 2,
+              "storage_gb": 0.08,
+              "output_mb": 0.000284,
+              "weights_gb": 0.02,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 2.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.018000000000000002,
+              "contexts": 2,
+              "storage_gb": 0.02,
+              "output_mb": 0.001,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "drone-inspection",
+          "input_mb": 0.148,
+          "stages": [
+            {
+              "compute_ms": 8.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.118,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 4.915,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 65.0,
+              "resident_memory_gb": 0.0864,
+              "context_memory_gb": 0.7068,
+              "contexts": 2,
+              "storage_gb": 0.15,
+              "output_mb": 0.0064,
+              "weights_gb": 0.0224,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 6.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.093,
+              "contexts": 2,
+              "storage_gb": 0.05,
+              "output_mb": 0.008,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        },
+        {
+          "name": "connected-vehicle-planning",
+          "input_mb": 0.801,
+          "stages": [
+            {
+              "compute_ms": 5.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.093,
+              "contexts": 2,
+              "storage_gb": 0.08,
+              "output_mb": 1.6,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 40.0,
+              "resident_memory_gb": 0.084,
+              "context_memory_gb": 0.5579999999999999,
+              "contexts": 2,
+              "storage_gb": 0.1,
+              "output_mb": 0.0064,
+              "weights_gb": 0.02,
+              "status": "estimated"
+            },
+            {
+              "compute_ms": 10.0,
+              "resident_memory_gb": 0.064,
+              "context_memory_gb": 0.143,
+              "contexts": 2,
+              "storage_gb": 0.08,
+              "output_mb": 0.002,
+              "weights_gb": 0.0,
+              "status": "estimated"
+            }
+          ]
+        }
+      ]
+    },
+    "temporal_sampling_mode": "stratified-jitter"
+  }
+}

@@ -1,9 +1,20 @@
 # Proposed 独立训练迁移包
 
+改进候选 `joint-credit-v5` 已加入可学习尾部追加部署、上一窗口真实路由/时延观测、
+独立图Critic和诊断。正式性能训练由用户启动，尚未证明超过对比方案。
+详见 `docs/JOINT_CREDIT_V5.md`；显式选择新版：
+
+```powershell
+.\train_proposed.ps1 -ProposedDesign joint-credit-v5 -Updates 320 -Device cuda -Seed 2026 -PhysicalSeed 2026
+```
+
+上面命令从头初始化两个PPO。包不含旧模型。现有默认版本保持兼容，使用新版时需显式指定。
+
 本包保留当前项目 Proposed 的原始训练代码与功能：Slow PPO（Count、Stage、
 Placement）+ Fast PPO、串行服务链、计算KKT与共享NIC连续带宽分配。
 核心 Python 文件未经裁剪或重写。包含 shared-nic-certified-v4 严格精度修复和
-最新 `joint-credit-v2`：阶段额度、部署前缀信用、竞争观测、独立 Fast Critic、
+最新 `joint-credit-v3` 增加完整物理可行整数额度Count与版本化解码；详见 `docs/JOINT_CREDIT_V3.md`。
+继承 `joint-credit-v2`：阶段额度、部署前缀信用、竞争观测、独立 Fast Critic、
 完整epoch内的受控多步PPO、更新后checkpoint探针与版本化抽样流程。
 实现与适用边界见 `docs/JOINT_CREDIT_V2.md`；不是之前撤回的实验版本。
 
@@ -17,6 +28,10 @@ python -m pip install -r requirements.txt
 python -c "import torch; print(torch.__version__); print('CUDA available:', torch.cuda.is_available())"
 python .\verify_bundle.py
 ```
+
+仅验证新版的完整性、环境签名、NIC约束和无更新推理：
+`python .\verify_bundle.py --proposed-design joint-credit-v5 --inference-only`。
+此命令不执行优化器更新、不创建训练运行；完整验证命令会执行微型功能训练。
 
 `requirements.txt` 使用打包机器已验证的版本；Torch写主版本号，已有匹配CUDA
 构建可保留。GPU运行需要可用的CUDA版PyTorch与兼容驱动；如果CUDA不可用，
@@ -47,7 +62,7 @@ python .\verify_bundle.py --imports-only
 - seed2026，mec-latency200，12000用户、32节点、10服务；
 - 60分钟episode、10分钟部署窗口；每update十二窗口（两个完整episode）；
 - 每窗口六个抽样秒，维持上限100秒，stratified-jitter；
-- joint-credit-v2、batch-credit-v1、deployment-aware-v2、stage-budget-v3、prefix-credit-v2；
+- joint-credit-v3、batch-credit-v1、deployment-aware-v2、stage-budget-v4、prefix-credit-v2；
 - Slow/Fast始终joint，Count/Stage/Placement/Fast分别2/3/3/4 epochs；
 - masked GAT Fast、chain-kkt-v3、独立Critic；4个epochs最多16个接受的优化步骤；
 - 共同目标默认为平均时延，不额外收取P95/RAM/SSD/违约价格，物理硬约束不变；
@@ -96,7 +111,7 @@ python .\train_dual_ppo.py --help
 
 其他历史场景请使用原入口并传入它们原本的完整训练参数，不套用当前配置脚本。
 续训脚本使用 `--proposed-design auto` 保留checkpoint的设计版本。
-旧budget-continuous-v2模型不能完整续训成stage-budget-v3；想启用新版必须新开运行，
+旧budget-continuous-v2/stage-budget-v3模型不能完整续训成stage-budget-v4；想启用新版必须新开运行，
 可用上面的Fast Actor迁移方式，不能伪称完整续训。
 `--append-log`不可遗漏，否则原主日志被清空。
 如果异常中断留下了超过checkpoint更新编号的部分rollout/episode记录，

@@ -7,6 +7,7 @@ import numpy as np
 
 from edge_drl.env.environment import EdgeComputingEnv
 from edge_drl.env.scenario import TaskRequest
+from edge_drl.agents.slow_history import SlowRouteHistory
 
 
 SLOW_FEEDBACK_PROTOCOL = "own-window-weighted-feedback-v1"
@@ -33,10 +34,12 @@ class SlowWindowFeedbackMixin:
         self._window_weight = 0.0
         self._window_max_node_load = 0.0
         self._window_max_link_load = 0.0
+        self._window_route_history = None
 
     def _before_slow_plan(self, env: EdgeComputingEnv) -> None:
         if env.current_time_minute <= 1e-9:
             self.agent.slow_agent.last_window_feedback = {}
+            self.agent.slow_agent.last_route_history = {}
             self._reset_window_feedback()
             self._window_memory_fraction = 0.0
             self._window_storage_fraction = 0.0
@@ -67,6 +70,7 @@ class SlowWindowFeedbackMixin:
     def _finalize_window_feedback(self) -> None:
         if self._window_weight <= 0.0:
             self.agent.slow_agent.last_window_feedback = {}
+            self.agent.slow_agent.last_route_history = {}
             self._reset_window_feedback()
             return
         ordered = sorted(self._window_latency_samples, key=lambda item: item[0])
@@ -89,6 +93,8 @@ class SlowWindowFeedbackMixin:
             "deployment_memory_fraction": float(self._window_memory_fraction),
             "deployment_storage_fraction": float(self._window_storage_fraction),
         }
+        if getattr(self.agent.slow_agent,"tail_reallocation",False):
+            self.agent.slow_agent.last_route_history = self._window_route_history.snapshot() if self._window_route_history is not None else {}
         self._reset_window_feedback()
 
     def observe_step(self, env: EdgeComputingEnv, requests: list[TaskRequest],
@@ -109,6 +115,10 @@ class SlowWindowFeedbackMixin:
             self._window_deadline_violations += float(latency > float(request.deadline_s)) * weight
             self._window_invalid_actions += float(not bool(group.get("valid", False))) * weight
             self._window_weight += weight
+            if getattr(self.agent.slow_agent,"tail_reallocation",False):
+                if self._window_route_history is None:
+                    self._window_route_history = SlowRouteHistory(env.config.num_edge_nodes)
+                self._window_route_history.add(request.service_id,group['stage_nodes'],group,weight)
         self._window_max_node_load = max(self._window_max_node_load, float(np.max(env.node_compute_load)))
         finite_links = env.link_load[np.isfinite(env.link_load)]
         if finite_links.size:

@@ -1,0 +1,46 @@
+[
+  {
+    "decode": "mode",
+    "actions": 348,
+    "normalized_entropy_mean": 0.9999936004452564,
+    "probability_gap_median": 8.799135684967041e-06,
+    "selected_endpoint_fraction": 0.6609195402298851,
+    "mode_endpoint_fraction": 0.6609195402298851,
+    "mode_differs_from_rounded_mean_fraction": 0.9741379310344828,
+    "protocol": "slow-component-paired-v1",
+    "failed_evaluations": 0,
+    "candidates": [
+      {
+        "candidate": "Slow-01-checkpoint",
+        "complete": true,
+        "points": 2,
+        "slow_mean_latency_ms": 243.12979676292306,
+        "darp_mean_latency_ms": 183.58088059772518,
+        "relative_gap_percent": 32.437428108695855,
+        "wins": 0
+      }
+    ]
+  },
+  {
+    "decode": "rounded-mean",
+    "actions": 348,
+    "normalized_entropy_mean": 0.9999962229651637,
+    "probability_gap_median": 9.279698133468628e-06,
+    "selected_endpoint_fraction": 0.0,
+    "mode_endpoint_fraction": 0.8362068965517241,
+    "mode_differs_from_rounded_mean_fraction": 0.9971264367816092,
+    "protocol": "slow-component-paired-v1",
+    "failed_evaluations": 0,
+    "candidates": [
+      {
+        "candidate": "Slow-01-checkpoint",
+        "complete": true,
+        "points": 2,
+        "slow_mean_latency_ms": 229.68026867972873,
+        "darp_mean_latency_ms": 183.58088059772518,
+        "relative_gap_percent": 25.11121415907118,
+        "wins": 0
+      }
+    ]
+  }
+]

@@ -152,7 +152,7 @@ def run_comparison(
         )
     checkpoint_path, checkpoint_args, checkpoint_internal = load_checkpoint_configuration(checkpoint)
     if sampling_protocol == "auto":
-        sampling_protocol = ("training-equivalent-v2" if checkpoint_args.get("proposed_design") == "joint-credit-v2"
+        sampling_protocol = ("training-equivalent-v2" if checkpoint_args.get("proposed_design") in {"joint-credit-v2", "joint-credit-v3", "joint-credit-v4", "joint-credit-v5"}
                              else "legacy-left-hold")
     if sampling_protocol not in {"legacy-left-hold", "training-equivalent-v2"}:
         raise ValueError("unknown comparison sampling protocol")

@@ -98,10 +98,11 @@ class SlowDeploymentContext:
         phase_ids = np.arange(self.size) % self.stages
         return pooled_roots[phase_ids], own, pooled_h[phase_ids]-h
 
-    def candidate_gains(self, deployment, pooled, proxy):
+    def candidate_gains(self, deployment, pooled, proxy, *, clip=True):
         if not self.competition_aware:
             after = self.numerators[:,None] / np.maximum(pooled[:,None]+self.capacities,1e-9)
-            return np.maximum(proxy[:,None]-after,0.)
+            gain = proxy[:,None]-after
+            return np.maximum(gain,0.) if clip else gain
         selected = deployment.reshape(self.size,self.nodes)
         roots, own, other_h = self._competition(deployment,pooled)
         others = roots-own
@@ -115,7 +116,8 @@ class SlowDeploymentContext:
         previous = (selected*self.capacities*other_h).sum(axis=1)
         externality = root[:,None]*(previous[:,None]*(1/after_pool-1/np.maximum(pooled[:,None],1e-9))
                                    + self.capacities*other_h/after_pool)
-        return np.maximum(proxy[:,None]-after_own-externality,0.)
+        gain = proxy[:,None]-after_own-externality
+        return np.maximum(gain,0.) if clip else gain
 
     def stage_costs(self, deployment, remaining_memory, remaining_storage):
         selected = deployment.reshape(self.size, self.nodes)

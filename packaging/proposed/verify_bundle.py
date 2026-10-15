@@ -4,6 +4,7 @@ import csv
 from dataclasses import asdict
 import hashlib
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,9 @@ def physical_signature():
 def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--imports-only", action="store_true")
+    parser.add_argument("--inference-only", action="store_true", help="Verify a fresh policy without optimizer steps or training runs")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--proposed-design", choices=["joint-credit-v3", "joint-credit-v4", "joint-credit-v5"], default="joint-credit-v3")
     parser.add_argument("--output", type=Path, default=ROOT / "verification_report.json")
     options = parser.parse_args()
     sys.path.insert(0, str(ROOT))
@@ -86,8 +89,32 @@ def main():
         if result.returncode:
             raise RuntimeError(result.stdout + "\n" + result.stderr)
         return result.stdout
-    if not options.imports_only:
-        common = ["train_dual_ppo.py", "--pressure-profile", "mec-latency200", "--proposed-design", "joint-credit-v2",
+    if options.inference_only:
+        import train_dual_ppo as training
+        from edge_drl.agents.drl import HierarchicalPPOAgent
+        previous = sys.argv
+        try:
+            sys.argv = ['train_dual_ppo.py','--seed','2026','--pressure-profile','mec-latency200',
+                        '--proposed-design',options.proposed_design,'--device',options.device]
+            args = training.apply_proposed_design(training.parse_args())
+        finally:
+            sys.argv = previous
+        env = training.build_env(args); env.reset()
+        kwargs = {name:getattr(args,name) for name in inspect.signature(HierarchicalPPOAgent.from_env).parameters
+                  if name not in {'env','cls'} and hasattr(args,name) and getattr(args,name) is not None}
+        torch.manual_seed(2026)
+        agent = HierarchicalPPOAgent.from_env(env,**kwargs)
+        deployment = agent.slow_agent.plan_deployment(env,deterministic=True,record=False)
+        assert env.check_deployment_feasible(deployment)[0]
+        env.apply_deployment(deployment)
+        agent.fast_agent.schedule_batch(env,env.current_requests[:1],deterministic=True,record=False)
+        for ppo in [agent.slow_agent.count_ppo,agent.slow_agent.stage_ppo,agent.slow_agent.placement_ppo,agent.fast_agent.ppo]:
+            assert not ppo.optimizer.state and len(ppo.buffer) == 0
+        report['proposed_design'] = args.proposed_design
+        report['inference_smoke_verified'] = True
+        report['optimizer_steps'] = 0
+    if not options.imports_only and not options.inference_only:
+        common = ["train_dual_ppo.py", "--pressure-profile", "mec-latency200", "--proposed-design", options.proposed_design,
                   "--train-mode", "joint", "--rollout-unit", "window", "--replicas-per-stage", "0",
                   "--num-users", "10000", "--num-edge-nodes", "8", "--num-service-types", "2",
                   "--mean-requests-per-minute", "600",
@@ -109,9 +136,13 @@ def main():
         assert args["network_constraint_mode"] == "shared-nic"
         assert args["service_calibration_mode"] == "audited-v1"
         assert args["temporal_sampling_mode"] == "stratified-jitter"
-        assert args["proposed_design"] == "joint-credit-v2"
-        assert args["slow_allocation_mode"] == "stage-budget-v3"
-        assert args["slow_learning_repair"] == "prefix-credit-v2"
+        assert args["proposed_design"] == options.proposed_design
+        assert args["slow_allocation_mode"] == {"joint-credit-v3":"stage-budget-v4", "joint-credit-v4":"stage-budget-v5", "joint-credit-v5":"stage-budget-v6"}[options.proposed_design]
+        assert data["slow_quota_decode"] == ("categorical-mode" if options.proposed_design == "joint-credit-v3" else "categorical-mean")
+        assert args["slow_learning_repair"] == ("prefix-structured-v3" if options.proposed_design == "joint-credit-v5" else "prefix-credit-v2")
+        if options.proposed_design == "joint-credit-v5":
+            assert args["slow_deployment_context"] == "deployment-chain-v3"
+            assert (target/'logs/slow_update_metrics_prefix_structured_v3.csv').is_file()
         assert data["fast_independent_critic"]
         assert data["fast_update_chunks"] == 4
         best = torch.load(target / "checkpoints/best.pt", map_location="cpu", weights_only=False)
@@ -135,6 +166,13 @@ def main():
         # Fast-only initialization exercises a lazy import not used by fresh training.
         run(common + ["--run-name", "fast_init", "--init-fast-checkpoint", str(checkpoint), "--init-fast-actor-only"])
         report["fast_initialization_verified"] = True
+        run(common + ["--run-name", "slow_init", "--init-fast-checkpoint", str(checkpoint),
+                      "--init-fast-actor-only", "--init-slow-checkpoint", str(checkpoint)])
+        initial = torch.load(ROOT / "_verification_runs/slow_init/checkpoints/initial.pt", map_location="cpu", weights_only=False)
+        assert initial["metadata"]["completed_updates"] == 0
+        assert initial["metadata"]["args"]["slow_initialization"]["source_update"] == 2
+        report["slow_actor_initialization_verified"] = True
+        report["initial_checkpoint_verified"] = True
         report["proposed_design"] = args["proposed_design"]
         report["post_update_probe_selection_verified"] = True
         from edge_drl.comparison.checkpoint import build_proposed_agent

@@ -1,4 +1,4 @@
-"""Learned stage ordering and per-stage continuous replica quotas.
+"""Learned stage ordering and per-stage continuous or integer replica quotas.
 
 No template, candidate truncation, expert action, or latency proxy reward.
 Coverage and RAM/SSD are hard constraints. All remaining stage/node choices
@@ -7,6 +7,8 @@ are made by the three heads of the same Slow PPO agent.
 from __future__ import annotations
 
 import numpy as np
+
+from edge_drl.agents.tail_reallocation import record_stage, reallocate
 
 
 def plan_stage_budgets(slow, env, deployment, memory, storage, demand,
@@ -27,20 +29,12 @@ def plan_stage_budgets(slow, env, deployment, memory, storage, demand,
             replica_idx=0, window_id=window_id, deterministic=deterministic, record=record)
         if node is None:
             # Never train log probabilities against a heuristic replacement.
-            raise RuntimeError("stage-budget-v3 coverage fragmented: no feasible learned placement")
+            raise RuntimeError(f"{slow.allocation_mode} coverage fragmented: no feasible learned placement")
 
     visited = np.zeros(slow.num_service_types * slow.max_service_stages + 1, dtype=bool)
     slow._stage_budget_visited = visited[:-1]
-    for _ in stages:
-        mask = slow._build_incremental_stage_mask(env, memory, storage, deployment)
-        mask[-1] = False
-        mask &= ~visited
-        if not mask.any():
-            break
-        state = slow._build_incremental_state(env, demand, memory, storage, deployment)
-        stage_action, lp, value = slow.stage_ppo.act(state, mask, deterministic=deterministic)
-        stage_action = int(stage_action)
-        visited[stage_action] = True
+
+    def allocate(stage_action, phase):
         service_id, stage_id = divmod(stage_action, slow.max_service_stages)
         key = (service_id, stage_id)
         stage = by_key[key]
@@ -49,32 +43,36 @@ def plan_stage_budgets(slow, env, deployment, memory, storage, demand,
         maximum = min(int(feasible.sum()), slow.replicas_per_stage - int(deployment[key].sum()))
         if maximum <= 0:
             raise RuntimeError("Stage mask admitted an infeasible quota")
-        if record:
-            slow.stage_ppo.buffer.states.append(state)
-            slow.stage_ppo.buffer.masks.append(mask.copy())
-            slow.stage_ppo.buffer.actions.append(stage_action)
-            slow.stage_ppo.buffer.logprobs.append(lp)
-            slow.stage_ppo.buffer.values.append(value)
-            slow.pending_stage_indices.append(len(slow.stage_ppo.buffer.actions)-1)
-            slow.pending_stage_keys.append(key)
-            # Stage credit is window-team credit, not a particular node ablation.
-            slow.pending_stage_node_ids.append(-1)
-            slow.stage_window_ids.append(window_id)
-
         # Count observes the stage chosen BEFORE its own action. The current
         # stage's compute/data/placement context is explicit in this state.
+        slow._quota_state = (maximum, 0, 0, "count")
         count_state = slow._build_state(env, demand, memory, storage, service_id, stage_id,
                                        int(deployment[key].sum()), planned_deployment=deployment)
-        count_mask = np.ones(1, dtype=bool)
-        fraction, lp, value = slow.count_ppo.act(count_state, count_mask, deterministic=deterministic)
-        fraction = float(fraction)
-        # A continuous action is sampled and stored with its exact Beta density;
-        # the environment deterministically converts it to an integer quota.
-        # This is not a fixed list of deployment/budget candidates.
-        quota = min(int(np.floor(fraction * (maximum+1))), maximum)
+        count_mask = (np.arange(slow.num_nodes + 1) <= maximum if slow.integer_quotas
+                      else np.ones(1, dtype=bool))
+        decode_options = ({"beta_quota_maximum": maximum}
+                          if deterministic and slow.quota_decode == "integer-mode" else {})
+        if deterministic and slow.quota_decode == "categorical-mean":
+            decode_options["categorical_quota_mean"] = True
+        action, lp, value = slow.count_ppo.act(count_state, count_mask,
+                                              deterministic=deterministic, **decode_options)
+        if slow.integer_quotas:
+            quota = int(action)
+            if quota != action or not 0 <= quota <= maximum:
+                raise RuntimeError("Integer Count sampled an invalid physical quota")
+            fraction = quota / maximum
+        else:
+            # Legacy latent-continuous policy keeps its original density and
+            # observation semantics; only an explicit decoder changes inference.
+            fraction = float(action)
+            quota = min(int(np.floor(fraction * (maximum+1))), maximum)
         slow.last_stage_budget_diagnostics.append({
-            "service_id":service_id, "stage_id":stage_id, "order":int(visited.sum()),
+            "service_id":service_id, "stage_id":stage_id, "order":len(slow.last_stage_budget_diagnostics)+1,
             "fraction":fraction, "feasible_extra_replicas":maximum, "extra_replicas":quota,
+            "count_action":int(action) if slow.integer_quotas else float(action),
+            "action_kind":"integer-quota" if slow.integer_quotas else "beta-fraction",
+            "phase":phase,
+            "quota_decode":slow.quota_decode,
             "remaining_memory_gb":float(memory.sum()), "remaining_storage_gb":float(storage.sum())})
         slow.pending_budget_fraction += fraction / max(len(stages), 1)
         slow.pending_budget_requested_replicas += quota
@@ -85,14 +83,15 @@ def plan_stage_budgets(slow, env, deployment, memory, storage, demand,
         if record:
             slow.count_ppo.buffer.states.append(count_state)
             slow.count_ppo.buffer.masks.append(count_mask)
-            slow.count_ppo.buffer.actions.append(fraction)
+            slow.count_ppo.buffer.actions.append(int(action) if slow.integer_quotas else float(action))
             slow.count_ppo.buffer.logprobs.append(lp)
             slow.count_ppo.buffer.values.append(value)
             slow.pending_count_indices.append(len(slow.count_ppo.buffer.actions)-1)
             slow.pending_count_stage_keys.append(key)
             slow.pending_count_node_ids.append(None)
             slow.count_window_ids.append(window_id)
-        for _ in range(quota):
+        for position in range(quota):
+            slow._quota_state = (maximum, quota, quota - position, "placement")
             node = slow._place_slow_replica(
                 env, deployment=deployment, remaining_memory=memory, remaining_storage=storage,
                 demand=demand, service_id=service_id, stage_id=stage_id,
@@ -102,7 +101,28 @@ def plan_stage_budgets(slow, env, deployment, memory, storage, demand,
                 raise RuntimeError("A physically feasible stage quota was not executable")
             slow.pending_budget_used_memory_gb += stage.memory_gb
             slow.pending_budget_used_storage_gb += stage.storage_gb
+        slow._quota_state = (0, 0, 0, "stage")
+        return quota
+
+    for _ in stages:
+        slow._quota_state = (0, 0, 0, "stage")
+        mask = slow._build_incremental_stage_mask(env, memory, storage, deployment)
+        mask[-1] = False
+        mask &= ~visited
+        if not mask.any():
+            break
+        state = slow._build_incremental_state(env, demand, memory, storage, deployment)
+        stage_action, lp, value = slow.stage_ppo.act(state, mask, deterministic=deterministic)
+        stage_action = int(stage_action)
+        if not 0 <= stage_action < len(mask) or not mask[stage_action]:
+            raise RuntimeError("Stage sampled an illegal action")
+        visited[stage_action] = True
+        record_stage(slow, state, mask, stage_action, lp, value, window_id, record)
+        allocate(stage_action, "primary")
+    if slow.tail_reallocation:
+        reallocate(slow, env, deployment, memory, storage, demand, window_id,
+                   deterministic, record, allocate)
     valid, reason = env.check_deployment_feasible(deployment)
     if not valid:
-        raise RuntimeError(f"stage-budget-v3 deployment invalid: {reason}")
+        raise RuntimeError(f"{slow.allocation_mode} deployment invalid: {reason}")
     return deployment

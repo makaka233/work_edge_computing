@@ -70,11 +70,20 @@ def main():
     source_mapping = {relative: relative for relative in closure}
     for name in ["LATENCY200_SCENARIO.md", "LATENCY200_TRAINING_REPAIR.md",
                  "SLOW_DEPLOYMENT_CONTEXT_REPAIR.md", "SHARED_NIC_PRECISION_REPAIR.md", "SLOW_LEARNING_REPAIR.md",
-                 "JOINT_CREDIT_V2.md"]:
+                 "JOINT_CREDIT_V2.md", "JOINT_CREDIT_V3.md", "JOINT_CREDIT_V4.md", "JOINT_CREDIT_V5.md", "SLOW_CHAIN_OBSERVATIONS_20261015.md"]:
         relative = "docs/" + name
         payload[relative] = (ROOT / relative).read_bytes()
         source_mapping[relative] = relative
     relative = "scripts/train_joint_credit_v2.ps1"
+    payload[relative] = (ROOT / relative).read_bytes()
+    source_mapping[relative] = relative
+    relative = "scripts/train_joint_credit_v3.ps1"
+    payload[relative] = (ROOT / relative).read_bytes()
+    source_mapping[relative] = relative
+    relative = "scripts/train_joint_credit_v4.ps1"
+    payload[relative] = (ROOT / relative).read_bytes()
+    source_mapping[relative] = relative
+    relative = "scripts/train_joint_credit_v5.ps1"
     payload[relative] = (ROOT / relative).read_bytes()
     source_mapping[relative] = relative
     for name in ["README.md", "verify_bundle.py", "train_proposed.ps1"]:
@@ -99,7 +108,8 @@ def main():
         "source_is_working_tree_not_git_head": True,
         "source_status": subprocess.check_output(["git", "status", "--short", "--", *source_mapping.values()], cwd=ROOT, text=True).splitlines(),
         "python_verified": platform.python_version(), "dependencies_verified": dependencies,
-        "default_proposed_design": "joint-credit-v2",
+        "default_proposed_design": "joint-credit-v3",
+        "available_proposed_designs": ["joint-credit-v2", "joint-credit-v3", "joint-credit-v4", "joint-credit-v5"],
         "physical_signature_seed2026": signature,
         "source_mapping": source_mapping,
         "sha256": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(payload.items())},

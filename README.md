@@ -1,5 +1,18 @@
 # Edge DRL for Staged Edge Services
 
+Reallocation and independent graph Critic candidate: `--proposed-design joint-credit-v5`.
+Includes previous-window settled route/cost observations and window-level diagnostics.
+User-run training: `scripts/train_joint_credit_v5.ps1 -Updates 320 -Device cuda`.
+See [implementation and pending performance validation](docs/JOINT_CREDIT_V5.md).
+
+Transferable discrete Beta Count experiment: `--proposed-design joint-credit-v4`.
+See [probabilities, initialization and validation scope](docs/JOINT_CREDIT_V4.md).
+
+Slow integer-quota update (opt-in): `--proposed-design joint-credit-v3`
+uses a masked categorical Count over every physically feasible integer quota.
+Run `scripts/train_joint_credit_v3.ps1`; compare deployment with DARP using one
+frozen Fast through `evaluate_slow.py`. See [design and compatibility](docs/JOINT_CREDIT_V3.md).
+
 Proposed joint-learning repair (opt-in): `--proposed-design joint-credit-v2`
 uses learned stage quotas, prefix credit, guarded multi-step Fast PPO and
 post-update checkpoint probes. See [design, compatibility and training](docs/JOINT_CREDIT_V2.md).

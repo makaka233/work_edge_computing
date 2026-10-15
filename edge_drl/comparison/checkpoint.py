@@ -122,7 +122,8 @@ def build_proposed_agent(
     replicas = int(checkpoint_args.get("replicas_per_stage", 5))
     kwargs["replicas_per_stage"] = env.config.num_edge_nodes if replicas <= 0 else replicas
     agent = HierarchicalPPOAgent.from_env(env, **kwargs)
-    metadata = load_checkpoint(agent, Path(checkpoint_path))
+    # Inference/actor initialization must not restore a training run's RNG.
+    metadata = load_checkpoint(agent, Path(checkpoint_path), restore_rng=False)
     agent.slow_agent.count_ppo.policy.eval()
     if agent.slow_agent.stage_ppo is not None:
         agent.slow_agent.stage_ppo.policy.eval()

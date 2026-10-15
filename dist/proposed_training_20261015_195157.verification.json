@@ -1,0 +1,21 @@
+{
+  "integrity": true,
+  "isolated_imports": true,
+  "physical_signature": "d4f740a29d932442f7d9a830e985a5bada9783805a913f4b36b946255cb43df0",
+  "nic_certificates": [
+    {
+      "fixture": "shared_nic_update50_failure.npz",
+      "relative_gap": 1.8530924491927706e-09
+    },
+    {
+      "fixture": "shared_nic_wide_scale_stress.npz",
+      "relative_gap": 9.093275115973566e-08
+    }
+  ],
+  "device": "cpu",
+  "torch": "2.13.0+cu130",
+  "training_resume_verified": false,
+  "proposed_design": "joint-credit-v5",
+  "inference_smoke_verified": true,
+  "optimizer_steps": 0
+}

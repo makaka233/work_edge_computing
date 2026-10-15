@@ -488,9 +488,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--slow-team-value-coef", type=float, default=0.5,
                         help="detached normalized conditional critic loss weight in repaired mode")
-    parser.add_argument("--slow-deployment-context", choices=["auto", "legacy", "deployment-aware-v2"], default="auto",
+    parser.add_argument("--slow-deployment-context", choices=["auto", "legacy", "deployment-aware-v2", "deployment-chain-v3"], default="auto",
                         help="auto preserves checkpoint architecture; fresh repaired latency200 budget runs use deployment-aware-v2")
-    parser.add_argument("--slow-learning-repair", choices=["auto", "none", "conditional-replay-v1", "prefix-credit-v2"], default="auto",
+    parser.add_argument("--slow-learning-repair", choices=["auto", "none", "conditional-replay-v1", "prefix-credit-v2", "prefix-structured-v3"], default="auto",
                         help="fresh deployment-aware runs use conditional value replay and guarded minibatch epochs; resume preserves saved training semantics")
     parser.add_argument("--network-constraint-mode", choices=["edge-only", "shared-nic"], default="edge-only")
     parser.add_argument("--service-calibration-mode", choices=["legacy", "audited-v1"], default="legacy")
@@ -773,6 +773,10 @@ def parse_args() -> argparse.Namespace:
         help="Decode ordered Count actions by conservative posterior mean or categorical mode.",
     )
     parser.add_argument(
+        "--slow-quota-decode", choices=["auto", "mean", "integer-mode", "categorical-mode", "categorical-mean"],
+        default="auto", help="Versioned stage quota decoder; auto restores the checkpoint's rule.",
+    )
+    parser.add_argument(
         "--slow-allocation-mode",
         choices=[
             "legacy-factorized",
@@ -780,6 +784,9 @@ def parse_args() -> argparse.Namespace:
             "budget-incremental",
             "budget-continuous-v2",
             "stage-budget-v3",
+            "stage-budget-v4",
+            "stage-budget-v5",
+            "stage-budget-v6",
         ],
         default="legacy-factorized",
         help=(
@@ -885,6 +892,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-checkpoint", type=str, default="")
     parser.add_argument("--init-fast-checkpoint", type=str, default="",
                         help="initialize only Fast weights/value scale from compatible environment; fresh Slow and optimizer/RNG streams")
+    parser.add_argument("--init-slow-checkpoint", type=str, default="",
+                        help="initialize compatible Slow actors; fresh critics/optimizers, zero additional observation weights")
+    parser.add_argument("--init-slow-actor-scope", choices=["all", "stage-placement"], default="all",
+                        help="stage-placement permits a fresh Count architecture and compatible pretrained remaining actors")
     parser.add_argument("--deterministic-eval", action="store_true")
     parser.add_argument("--eval-baseline", action="store_true")
     parser.add_argument(
@@ -970,7 +981,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-lr-max-reductions", type=int, default=1)
     parser.add_argument("--slow-lr-cooldown-updates", type=int, default=20)
     parser.add_argument("--append-log", action="store_true")
-    parser.add_argument("--proposed-design", choices=["auto", "legacy", "joint-credit-v2"], default="auto",
+    parser.add_argument("--proposed-design", choices=["auto", "legacy", "joint-credit-v2", "joint-credit-v3", "joint-credit-v4", "joint-credit-v5"], default="auto",
                         help="Explicit joint PPO repair preset; auto preserves saved/legacy behavior")
     parser.add_argument("--fast-update-chunks", type=int, default=1)
     parser.add_argument("--fast-independent-critic", action=argparse.BooleanOptionalAction, default=False)
@@ -1043,6 +1054,9 @@ def parse_args() -> argparse.Namespace:
         "budget-incremental",
         "budget-continuous-v2",
             "stage-budget-v3",
+            "stage-budget-v4",
+            "stage-budget-v5",
+            "stage-budget-v6",
     }:
         parser.error(
             "--slow-replica-ablation-samples requires --slow-allocation-mode "
@@ -1880,6 +1894,7 @@ def rollout(
     total_stage_transitions = 0.0
     start_metrics = dict(env.metrics)
     rollout_start_minute = env.current_time_minute
+    planning_wall_s = scheduling_wall_s = settlement_wall_s = 0.0
     stop_time_minute = None
     if rollout_unit == "window":
         stop_time_minute = min(
@@ -1937,22 +1952,30 @@ def rollout(
             env.sample_interval_requests(step_represented_seconds)
         requests = list(env.current_requests)
         if train_mode == "fast-only":
+            started = time.perf_counter()
             if env.needs_deployment_update:
                 env.apply_deployment(frozen_slow_policy.act(env))
+            planning_wall_s += time.perf_counter()-started
+            started = time.perf_counter()
             actions = agent.fast_agent.schedule_batch(
                 env,
                 requests,
                 deterministic=deterministic_fast,
                 record=record_fast,
             )
+            scheduling_wall_s += time.perf_counter()-started
         else:
+            started = time.perf_counter()
             agent.maybe_update_deployment(env, deterministic=deterministic_slow, record=record_slow)
+            planning_wall_s += time.perf_counter()-started
+            started = time.perf_counter()
             actions = agent.fast_agent.schedule_batch(
                 env,
                 requests,
                 deterministic=deterministic_fast,
                 record=record_fast,
             )
+            scheduling_wall_s += time.perf_counter()-started
         batch_counterfactual_regrets = (
             [
                 agent.fast_agent.stage_counterfactual_regrets(env, request, schedule)
@@ -1999,7 +2022,9 @@ def rollout(
                 fast_oracle_weights.append(float(request.request_count))
                 oracle_requests_remaining -= 1
         deployment_window = int(env.metrics["deployment_updates"])
+        started = time.perf_counter()
         _, _, done, batch_info = env.step(actions, represented_seconds=step_represented_seconds)
+        settlement_wall_s += time.perf_counter()-started
         group_infos = batch_info["group_infos"]
         tick_kkt_predicted_total = 0.0
         tick_kkt_actual_total = 0.0
@@ -2088,6 +2113,7 @@ def rollout(
                     service_id=int(request.service_id),
                     stage_nodes=[int(node_id) for node_id in info["stage_nodes"]],
                     slow_stage_costs=stage_latency_costs,
+                    settlement_info=info,
                     slow_stage_marginal_values=batch_slow_marginal_values[group_idx],
                     env=env,
                     record_fast=record_fast,
@@ -2235,6 +2261,9 @@ def rollout(
     rollout_duration_minutes = max(env.current_time_minute - rollout_start_minute, 0.0)
     return {
         "requests": rollout_requests,
+        "slow_planning_wall_s":planning_wall_s,
+        "fast_scheduling_wall_s":scheduling_wall_s,
+        "environment_settlement_wall_s":settlement_wall_s,
         "request_events": rollout_request_events,
         "sampled_request_events": float(env.metrics.get("sampled_request_events", 0.) - start_metrics.get("sampled_request_events", 0.)),
         "settlement_steps": rollout_settlement_steps,
@@ -2695,6 +2724,9 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
         "settlement_steps": float(sum(r["settlement_steps"] for r in rollouts)),
         "logical_steps": float(sum(r["logical_steps"] for r in rollouts)),
         "simulated_hours": float(sum(r["simulated_hours"] for r in rollouts)),
+        "slow_planning_wall_s":float(sum(r.get("slow_planning_wall_s",0.) for r in rollouts)),
+        "fast_scheduling_wall_s":float(sum(r.get("fast_scheduling_wall_s",0.) for r in rollouts)),
+        "environment_settlement_wall_s":float(sum(r.get("environment_settlement_wall_s",0.) for r in rollouts)),
         "episode_complete": float(rollouts[-1]["episode_complete"]),
         "valid_requests": float(valid_requests.sum()),
         "invalid_actions": float(sum(r["invalid_actions"] for r in rollouts)),
@@ -3298,7 +3330,7 @@ def _serialize_pending_slow_collection(agent: HierarchicalPPOAgent) -> dict[str,
     return {
         "count_buffer": _serialize_rollout_buffer(
             slow.count_ppo.buffer,
-            continuous_actions=slow.allocation_mode == "budget-continuous-v2",
+            continuous_actions=slow.count_ppo.continuous_actions,
         ),
         "stage_buffer": (
             _serialize_rollout_buffer(slow.stage_ppo.buffer)
@@ -3322,6 +3354,7 @@ def _serialize_pending_slow_collection(agent: HierarchicalPPOAgent) -> dict[str,
         "window_returns": list(slow.window_returns),
         "window_dones": list(slow.window_dones),
         "window_episode_ids": list(slow.window_episode_ids),
+        "last_route_history":slow.last_route_history,
     }
 
 
@@ -3329,10 +3362,11 @@ def _restore_pending_slow_collection(agent: HierarchicalPPOAgent, state: object)
     if not isinstance(state, dict):
         return
     slow = agent.slow_agent
+    slow.last_route_history = state.get("last_route_history", {})
     _restore_rollout_buffer(
         slow.count_ppo.buffer,
         state.get("count_buffer"),
-        continuous_actions=slow.allocation_mode == "budget-continuous-v2",
+        continuous_actions=slow.count_ppo.continuous_actions,
     )
     if slow.stage_ppo is not None:
         _restore_rollout_buffer(slow.stage_ppo.buffer, state.get("stage_buffer"))
@@ -3405,6 +3439,7 @@ def save_checkpoint(
             # the architecture tag so resume failures are explicit instead of
             # surfacing later as opaque tensor-size mismatches.
             "slow_allocation_mode": agent.slow_agent.allocation_mode,
+            "slow_quota_decode": agent.slow_agent.quota_decode,
             "slow_deployment_context": agent.slow_agent.deployment_context,
             "slow_learning_repair": agent.slow_agent.learning_repair,
             "slow_conditional_learning_state": {
@@ -3480,12 +3515,15 @@ def load_checkpoint(
     agent: HierarchicalPPOAgent,
     path: Path,
     random_streams: TrainingRandomStreams | None = None,
+    *, restore_rng: bool = True,
 ) -> dict[str, object]:
     # Keep serialized RNG states on the CPU.  Mapping the whole checkpoint to
     # CUDA also moves ``torch_random_state`` to CUDA, but the default PyTorch
     # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
     # copy their tensors to the parameter device themselves.
     checkpoint = torch.load(path, map_location="cpu")
+    if checkpoint.get("slow_quota_decode", "mean") != agent.slow_agent.quota_decode:
+        raise ValueError("checkpoint Slow quota decoder differs; restore its saved decoder for full resume")
     if bool(checkpoint.get("fast_independent_critic", False)) != agent.fast_agent.independent_critic:
         raise ValueError("checkpoint Fast critic architecture differs; restore saved settings or start a fresh run")
     if checkpoint.get("slow_deployment_context", "legacy") != agent.slow_agent.deployment_context:
@@ -3627,9 +3665,9 @@ def load_checkpoint(
         agent.fast_agent.entropy_current_coef = float(checkpoint["fast_entropy_current_coef"])
         agent.fast_agent.ppo.entropy_coef = agent.fast_agent.entropy_current_coef
     _restore_pending_slow_collection(agent, checkpoint.get("pending_slow_collection"))
-    if random_streams is not None and checkpoint.get("training_random_streams") is not None:
+    if restore_rng and random_streams is not None and checkpoint.get("training_random_streams") is not None:
         random_streams.load_state_dict(checkpoint["training_random_streams"])
-    if "numpy_random_state" in checkpoint:
+    if restore_rng and "numpy_random_state" in checkpoint:
         numpy_state = checkpoint["numpy_random_state"]
         np.random.set_state(
             (
@@ -3640,9 +3678,9 @@ def load_checkpoint(
                 float(numpy_state["cached_gaussian"]),
             )
         )
-    if "torch_random_state" in checkpoint:
+    if restore_rng and "torch_random_state" in checkpoint:
         torch.set_rng_state(_cpu_byte_rng_state(checkpoint["torch_random_state"]))
-    if torch.cuda.is_available() and checkpoint.get("torch_cuda_random_state") is not None:
+    if restore_rng and torch.cuda.is_available() and checkpoint.get("torch_cuda_random_state") is not None:
         torch.cuda.set_rng_state_all(
             [_cpu_byte_rng_state(state) for state in checkpoint["torch_cuda_random_state"]]
         )
@@ -4117,7 +4155,18 @@ def resolve_slow_learning_repair(args: argparse.Namespace) -> str:
         return requested
     if args.load_checkpoint:
         return str(torch.load(Path(args.load_checkpoint), map_location="cpu").get("slow_learning_repair", "none"))
-    return "conditional-replay-v1" if args.slow_deployment_context == "deployment-aware-v2" else "none"
+    return "conditional-replay-v1" if args.slow_deployment_context in {"deployment-aware-v2", "deployment-chain-v3"} else "none"
+
+
+def resolve_slow_quota_decode(args: argparse.Namespace) -> str:
+    requested = getattr(args, "slow_quota_decode", "auto")
+    if requested != "auto":
+        return requested
+    if getattr(args, "load_checkpoint", None):
+        checkpoint = torch.load(Path(args.load_checkpoint), map_location="cpu")
+        return str(checkpoint.get("slow_quota_decode", "mean"))
+    return ("categorical-mean" if args.slow_allocation_mode in {"stage-budget-v5", "stage-budget-v6"}
+            else "categorical-mode" if args.slow_allocation_mode == "stage-budget-v4" else "mean")
 
 
 def initialize_fast_checkpoint(agent, path: Path, args) -> dict[str, object]:
@@ -4187,23 +4236,33 @@ def apply_proposed_design(args):
         saved = checkpoint_run_args(Path(args.load_checkpoint), checkpoint)
     requested = getattr(args, "proposed_design", "auto")
     args.proposed_design = saved.get("proposed_design", "legacy") if requested == "auto" else requested
-    if args.proposed_design != "joint-credit-v2":
+    if args.proposed_design not in {"joint-credit-v2", "joint-credit-v3", "joint-credit-v4", "joint-credit-v5"}:
         # New flags must also survive a legacy-design full resume.
         for name, default in (("fast_update_chunks", 1), ("fast_independent_critic", False),
                               ("checkpoint_probe_interval", 10)):
             if "--"+name.replace("_", "-") not in explicit:
                 setattr(args, name, saved.get(name, getattr(args, name, default)))
         return args
-    if saved and saved.get("proposed_design", "legacy") != "joint-credit-v2":
-        raise ValueError("joint-credit-v2 changes Slow action semantics: start a fresh run, not full legacy resume")
-    required = {"training_repair":"batch-credit-v1", "slow_deployment_context":"deployment-aware-v2",
-                "slow_learning_repair":"prefix-credit-v2", "slow_allocation_mode":"stage-budget-v3",
+    if saved and saved.get("proposed_design", "legacy") != args.proposed_design:
+        raise ValueError(f"{args.proposed_design} changes Slow action semantics: start a fresh run, not full legacy resume")
+    deployment_context = "deployment-aware-v2"
+    if args.proposed_design in {"joint-credit-v3", "joint-credit-v4", "joint-credit-v5"}:
+        deployment_context = (getattr(args, "slow_deployment_context", "auto")
+                              if "--slow-deployment-context" in explicit
+                              else saved.get("slow_deployment_context", "deployment-chain-v3" if args.proposed_design == "joint-credit-v5" else "deployment-aware-v2"))
+        if deployment_context == "auto":
+            deployment_context = saved.get("slow_deployment_context", "deployment-chain-v3" if args.proposed_design == "joint-credit-v5" else "deployment-aware-v2")
+        if deployment_context not in {"deployment-aware-v2", "deployment-chain-v3"}:
+            raise ValueError("integer joint designs require deployment-aware-v2 or deployment-chain-v3")
+    required = {"training_repair":"batch-credit-v1", "slow_deployment_context":deployment_context,
+                "slow_learning_repair":"prefix-structured-v3" if args.proposed_design == "joint-credit-v5" else "prefix-credit-v2",
+                "slow_allocation_mode":{"joint-credit-v2":"stage-budget-v3", "joint-credit-v3":"stage-budget-v4", "joint-credit-v4":"stage-budget-v5", "joint-credit-v5":"stage-budget-v6"}[args.proposed_design],
                 "fast_chain_context":"chain-kkt-v3", "fast_policy_kind":"gat_node_scorer",
                 "joint_training_schedule":"simultaneous", "train_mode":"joint"}
     for name, value in required.items():
         current = getattr(args, name, None)
         if "--"+name.replace("_", "-") in explicit and current not in {value, "auto"}:
-            raise ValueError(f"joint-credit-v2 requires --{name.replace('_','-')} {value}")
+            raise ValueError(f"{args.proposed_design} requires --{name.replace('_','-')} {value}")
         setattr(args, name, value)
     defaults = {"fast_update_chunks":4, "fast_independent_critic":True,
                 "slow_tail_latency_coef":0., "slow_deployment_memory_coef":0.,
@@ -4216,11 +4275,14 @@ def apply_proposed_design(args):
                 "slow_placement_compute_coef":0., "slow_count_shortage_coef":0.,
                 "slow_replica_ablation_samples":0, "fast_oracle_diagnostic_requests":0,
                 "fast_counterfactual_credit_coef":0., "fast_counterfactual_credit_final_coef":0.}
+    if args.proposed_design == "joint-credit-v5":
+        defaults.update(slow_critic_replay_windows=24, slow_critic_holdout_windows=6,
+                        slow_critic_holdout_episodes=1)
     for name, value in defaults.items():
         if not {"--"+name.replace("_", "-"), "--no-"+name.replace("_", "-")} & explicit:
             setattr(args, name, saved.get(name, value))
     if getattr(args, "fast_warmup_updates", 0) or getattr(args, "slow_warmup_updates", 0):
-        raise ValueError("joint-credit-v2 keeps simultaneous joint training without phased warmups")
+        raise ValueError(f"{args.proposed_design} keeps simultaneous joint training without phased warmups")
     return args
 
 
@@ -4231,8 +4293,11 @@ def main() -> None:
     args.training_repair = resolve_training_repair(args)
     args.slow_deployment_context = resolve_slow_deployment_context(args)
     args.slow_learning_repair = resolve_slow_learning_repair(args)
+    args.slow_quota_decode = resolve_slow_quota_decode(args)
     if args.load_checkpoint and args.init_fast_checkpoint:
         raise ValueError("--load-checkpoint and --init-fast-checkpoint are mutually exclusive")
+    if args.load_checkpoint and args.init_slow_checkpoint:
+        raise ValueError("--load-checkpoint and --init-slow-checkpoint are mutually exclusive")
     if args.init_fast_actor_only and not args.init_fast_checkpoint:
         raise ValueError("--init-fast-actor-only requires --init-fast-checkpoint")
     args.rollout_acceleration_version = "vector-features-v1"
@@ -4346,11 +4411,22 @@ def main() -> None:
         slow_shared_return_coef=args.slow_shared_return_coef,
         slow_deterministic_count_mode=args.slow_deterministic_count_mode,
         slow_allocation_mode=args.slow_allocation_mode,
+        slow_quota_decode=args.slow_quota_decode,
         slow_counterfactual_credit_coef=args.slow_counterfactual_credit_coef,
     )
     agent.window_replica_ablation_samples = args.slow_replica_ablation_samples
     args.fast_initialization = (initialize_fast_checkpoint(agent, Path(args.init_fast_checkpoint), args)
                                 if args.init_fast_checkpoint else None)
+    args.slow_initialization = None
+    if args.init_slow_checkpoint:
+        from edge_drl.agents.slow_transfer import initialize_slow_actors
+        args.slow_initialization = initialize_slow_actors(env, agent, args.init_slow_checkpoint,
+                                                       scope=args.init_slow_actor_scope)
+        # Matched actor-initialized arms start action sampling at the same RNG
+        # state even when their fresh observation encoders have different sizes.
+        action_sampling_seed = args.seed + 7_000_019
+        torch.manual_seed(action_sampling_seed)
+        args.slow_initialization["action_sampling_seed"] = action_sampling_seed
     loaded_metadata: dict[str, object] = {}
     if args.load_checkpoint:
         loaded_metadata = load_checkpoint(
@@ -4358,6 +4434,10 @@ def main() -> None:
             Path(args.load_checkpoint),
             training_random_streams,
         )
+        # Keep the run's original actor initialization provenance on resume.
+        # No initialization is executed again and no fresh RNG is installed.
+        args.fast_initialization = saved_args.get("fast_initialization")
+        args.slow_initialization = saved_args.get("slow_initialization")
     bc_metrics = pretrain_fast_agent(
         args,
         agent,
@@ -4383,10 +4463,14 @@ def main() -> None:
     print(f"  slow_learning_repair={args.slow_learning_repair}")
     print(f"  proposed_design={args.proposed_design} fast_update_chunks={args.fast_update_chunks} "
           f"fast_independent_critic={args.fast_independent_critic}")
-    if args.proposed_design == "joint-credit-v2":
+    if args.proposed_design in {"joint-credit-v2", "joint-credit-v3", "joint-credit-v4", "joint-credit-v5"}:
         print("  slow_credit=real_window_return_with_prefix_GAE legacy_factorized_terms=diagnostics_only legacy_window_critic=disabled")
-    if args.fast_initialization:
-        print(f"  Fast initialized from {args.fast_initialization['path']}; fresh Slow, optimizers and run counters")
+    if args.fast_initialization and not args.load_checkpoint:
+        print(f"  Fast initialized from {args.fast_initialization['path']}; fresh optimizers and run counters")
+    if args.slow_initialization and not args.load_checkpoint:
+        print(f"  Slow actors initialized from {args.slow_initialization['path']}; "
+              f"context={args.slow_initialization['source_context']}->{args.slow_initialization['target_context']} "
+              "new critics/optimizers, zero new observation weights")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
     print(
         f"  fast_chain_context={args.fast_chain_context} "
@@ -4571,7 +4655,7 @@ def main() -> None:
             args.slow_critic_k_epochs,
         )
     )
-    print(f"  slow_deterministic_count_mode={args.slow_deterministic_count_mode}")
+    print(f"  slow_deterministic_count_mode={args.slow_deterministic_count_mode} slow_quota_decode={args.slow_quota_decode}")
     print(
         "  ppo slow_lr={} count_lr={} stage_lr={} placement_lr={} fast_lr={} slow_epochs={} stage_epochs={} placement_epochs={} slow_entropy={} slow_count_entropy={} slow_placement_entropy={}->{} hold={} decay={} fast_entropy={} slow_value_coef={}".format(
             args.slow_lr,
@@ -4653,11 +4737,20 @@ def main() -> None:
     log_path = log_dir / "training.csv"
     episode_log_path = log_dir / "episode_metrics.csv"
     rollout_log_path = log_dir / "rollout_metrics.csv"
+    initial_path = save_dir / "initial.pt"
+    if args.init_slow_checkpoint and initial_path.exists():
+        raise FileExistsError(initial_path)
     if not args.append_log:
         for path in (log_path, episode_log_path, rollout_log_path):
             if path.exists():
                 path.unlink()
     write_metadata(run_dir, args, bc_metrics, loaded_metadata)
+    if args.init_slow_checkpoint:
+        # Retain the actual pre-training model for initialization/learning
+        # ablations. This does not participate in best-checkpoint selection.
+        save_checkpoint(agent, initial_path, {"update":0, "completed_updates":0,
+            "completed_rollouts":0, "completed_episodes":0, "args":vars(args),
+            "selection_kind":"actor_initialization_only"}, training_random_streams)
     resume_update_offset = int(
         loaded_metadata.get("completed_updates", loaded_metadata.get("update", 0))
     ) if args.load_checkpoint else 0
@@ -4680,7 +4773,7 @@ def main() -> None:
         loaded_metadata.get("best_checkpoint_score", float("inf"))
     )
     best_checkpoint_ready = bool(loaded_metadata.get("best_checkpoint_ready", False))
-    joint_credit_v2 = args.proposed_design == "joint-credit-v2"
+    joint_credit_v2 = args.proposed_design in {"joint-credit-v2", "joint-credit-v3", "joint-credit-v4", "joint-credit-v5"}
     best_probe_score = float(loaded_metadata.get("best_probe_score", float("inf")))
     reference_checkpoint_compute = float(loaded_metadata.get("checkpoint_reference_compute",
         np.mean([user.service_weights for user in env.scenario.users], axis=0)
@@ -5484,7 +5577,8 @@ def main() -> None:
         if agent.slow_agent.deployment_aware and slow_updated:
             # An explicitly upgraded resume may append to an old run. Do not
             # silently append wider rows under the old CSV header.
-            diagnostic_file = ("slow_update_metrics_prefix_credit_v2.csv" if agent.slow_agent.learning_repair == "prefix-credit-v2" else
+            diagnostic_file = ("slow_update_metrics_prefix_structured_v3.csv" if agent.slow_agent.learning_repair == "prefix-structured-v3" else
+                               "slow_update_metrics_prefix_credit_v2.csv" if agent.slow_agent.learning_repair == "prefix-credit-v2" else
                                "slow_update_metrics_conditional_replay_v1.csv"
                                if agent.slow_agent.learning_repair != "none" else "slow_update_metrics.csv")
             append_log(run_dir / "logs" / diagnostic_file, {

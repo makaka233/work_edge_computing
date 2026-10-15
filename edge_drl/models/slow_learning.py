@@ -6,6 +6,7 @@ for a rollout is fixed from PREVIOUS rollouts, never fitted to its own returns.
 from __future__ import annotations
 
 import copy
+from time import perf_counter
 import numpy as np
 import torch
 from torch import nn
@@ -30,7 +31,8 @@ class SlowConditionalLearning:
                 "trace_reliability": self.trace_reliability, "prefix_credit": self.prefix_credit,
                 "replay": [{"states": torch.from_numpy(x["states"].copy()),
                             "returns": torch.from_numpy(x["returns"].copy()),
-                            "update": x["update"]} for x in self.replay]}
+                            "update": x["update"], "behavior_update":x.get("behavior_update", x["update"]-1),
+                            "window_id":x.get("window_id",-1)} for x in self.replay]}
 
     def load_state_dict(self, state):
         self.update_index = int(state["update_index"])
@@ -42,7 +44,8 @@ class SlowConditionalLearning:
             raise ValueError("invalid conditional baseline multiplier")
         self.replay = [{"states": x["states"].detach().cpu().numpy().copy(),
                         "returns": x["returns"].detach().cpu().numpy().copy(),
-                        "update": int(x["update"])} for x in state["replay"]][-self.windows:]
+                        "update": int(x["update"]), "behavior_update":int(x.get("behavior_update",x["update"]-1)),
+                        "window_id":int(x.get("window_id",-1))} for x in state["replay"]][-self.windows:]
 
     @staticmethod
     def prediction_metrics(returns, values, weights):
@@ -63,6 +66,15 @@ class SlowConditionalLearning:
         used_coef = self.baseline_coef
         old_values = np.asarray(ppo.buffer.values, dtype=np.float32)
         before = self.prediction_metrics(returns, old_values, critic_weights)
+        extra_diagnostics = {}
+        structured = bool(getattr(ppo.policy,"structured_critic",False))
+        if structured:
+            from edge_drl.models.slow_diagnostics import baseline_diagnostics, score_gradient_diagnostics
+            extra_diagnostics.update(baseline_diagnostics(returns,old_values,critic_weights,window_ids,used_coef))
+            if self.update_index % 10 == 0:
+                extra_diagnostics.update(score_gradient_diagnostics(ppo,states_np,masks_np,actions,returns,
+                                                              old_values,window_ids,used_coef))
+        actor_started = perf_counter()
         accepted = backtracks = actor_steps = consumed = checks = 0
         stopped = False
         metrics = {"loss": 0., "policy_loss": 0., "value_loss": 0.}
@@ -133,13 +145,18 @@ class SlowConditionalLearning:
             if stopped:
                 break
         metrics.update(ppo._buffer_policy_diagnostics(actions, logprobs, weights))
+        if structured:
+            from edge_drl.models.slow_diagnostics import window_policy_change
+            extra_diagnostics.update(window_policy_change(ppo,states_np,masks_np,actions,logprobs,window_ids))
+            extra_diagnostics['actor_update_time_s'] = perf_counter()-actor_started
         self.update_index += 1
         for window in np.unique(window_ids):
             idx = np.flatnonzero(window_ids == window)
             rng = np.random.default_rng(self.update_index * 100003 + int(window))
             idx = rng.choice(idx, min(len(idx), self.samples_per_window), replace=False)
             self.replay.append({"states": states_np[idx].copy(), "returns": returns[idx].copy(),
-                                "update": self.update_index})
+                                "update": self.update_index, "behavior_update":self.update_index-1,
+                                "window_id":int(window)})
         self.replay = self.replay[-self.windows:]
         critic_metrics = self.fit_critic(ppo)
         with torch.no_grad():
@@ -160,6 +177,7 @@ class SlowConditionalLearning:
         self.trace_reliability = .8 * self.trace_reliability + .2 * float(np.clip(before["ev"], 0, 1))
         metrics.update(critic_metrics)
         metrics.update(gradient_metrics)
+        metrics.update(extra_diagnostics)
         metrics["value_loss"] = critic_metrics["critic_extra_value_loss"]
         metrics.update({"epochs_completed": float(accepted), "optimizer_steps": float(actor_steps),
                         "minibatches_completed": float(consumed), "minibatches_planned": float(ppo.k_epochs * int(np.ceil(n/size))),
@@ -176,6 +194,7 @@ class SlowConditionalLearning:
         return metrics
 
     def fit_critic(self, ppo):
+        started = perf_counter()
         states_np = np.concatenate([x["states"] for x in self.replay])
         returns = np.concatenate([x["returns"] for x in self.replay])
         weights_np = np.concatenate([np.full(len(x["returns"]), self.decay**(self.update_index-x["update"]) / len(x["returns"]), dtype=np.float32) for x in self.replay])
@@ -193,10 +212,24 @@ class SlowConditionalLearning:
         epochs = max(1, ppo.critic_extra_epochs + ppo.k_epochs)
         for _ in range(epochs):
             ppo.optimizer.zero_grad(set_to_none=True)
-            values = ppo.policy.critic(features).squeeze(-1)
-            loss = (F.smooth_l1_loss(values, targets, reduction="none") * weights).sum() / weights.sum()
-            (ppo.value_coef * loss).backward()
+            if getattr(ppo.policy,"structured_critic",False):
+                loss = torch.zeros((),device=ppo.device)
+                size = min(64,ppo.minibatch_size)
+                # Accumulate the same weighted full-batch gradient while
+                # bounding graph activations; do not cache learned critic encodings.
+                for start in range(0,len(features),size):
+                    selected = slice(start,start+size)
+                    values = ppo.policy.critic(features[selected]).squeeze(-1)
+                    local = (F.smooth_l1_loss(values,targets[selected],reduction="none")*weights[selected]).sum()/weights.sum()
+                    (ppo.value_coef*local).backward()
+                    loss += local.detach()
+            else:
+                values = ppo.policy.critic(features).squeeze(-1)
+                loss = (F.smooth_l1_loss(values, targets, reduction="none") * weights).sum() / weights.sum()
+                (ppo.value_coef * loss).backward()
             nn.utils.clip_grad_norm_(ppo.policy.critic.parameters(), 5.)
             ppo.optimizer.step()
         return {"critic_extra_optimizer_steps": float(epochs), "critic_optimizer_steps": float(epochs),
-                "critic_extra_value_loss": float(loss.detach()), "critic_replay_samples": float(len(targets))}
+                "critic_extra_value_loss": float(loss.detach()), "critic_replay_samples": float(len(targets)),
+                "critic_update_time_s":perf_counter()-started,
+                "critic_replay_max_age":float(max(self.update_index-x['update'] for x in self.replay))}

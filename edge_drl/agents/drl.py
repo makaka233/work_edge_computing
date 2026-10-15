@@ -15,6 +15,10 @@ from edge_drl.agents.slow_context import (
     SlowDeploymentContext, SLOW_DEPLOYMENT_CONTEXT, INVENTORY_DIM, BUDGET_DIM,
     CURRENT_STAGE_DIM, CANDIDATE_DIM, STAGE_COST_DIM,
 )
+from edge_drl.agents.slow_chain_context import (
+    SlowChainContext, SLOW_CHAIN_CONTEXT, CHAIN_NODE_DIM, CHAIN_STAGE_DIM,
+)
+from edge_drl.agents.slow_history import HISTORY_NODE_DIM, HISTORY_STAGE_DIM, SlowRouteHistory
 
 
 SLOW_GLOBAL_DIM = 17
@@ -47,27 +51,33 @@ def _discounted_window_returns(
 
 
 def slow_node_feature_dim(num_service_types: int, cost_context: bool = False,
-                          max_service_stages: int = 3, deployment_context: bool = False) -> int:
+                          max_service_stages: int = 3, deployment_context: bool = False,
+                          chain_context: bool = False, history_context: bool = False) -> int:
     return SLOW_NODE_BASE_FEATURE_DIM + num_service_types + (2 if cost_context else 0) + (
-        num_service_types * max_service_stages + CANDIDATE_DIM if deployment_context else 0)
+        num_service_types * max_service_stages + CANDIDATE_DIM if deployment_context else 0) + (CHAIN_NODE_DIM if chain_context else 0) + (HISTORY_NODE_DIM if history_context else 0)
 
 
 def slow_global_dim(num_service_types: int, cost_context: bool = False,
-                    max_service_stages: int = 3, deployment_context: bool = False) -> int:
+                    max_service_stages: int = 3, deployment_context: bool = False,
+                    integer_quotas: bool = False, tail_reallocation: bool = False) -> int:
     return SLOW_GLOBAL_DIM + (5 * num_service_types if cost_context else 0) + (
         INVENTORY_DIM * num_service_types * max_service_stages + BUDGET_DIM + CURRENT_STAGE_DIM
-        if deployment_context else 0)
+        if deployment_context else 0) + (5 if integer_quotas else 0) + (
+        1 + num_service_types * max_service_stages if tail_reallocation else 0)
 
 
-def slow_stage_feature_dim(cost_context: bool = False, deployment_context: bool = False) -> int:
-    return SLOW_STAGE_FEATURE_DIM + (2 if cost_context else 0) + (STAGE_COST_DIM if deployment_context else 0)
+def slow_stage_feature_dim(cost_context: bool = False, deployment_context: bool = False,
+                           chain_context: bool = False, history_context: bool = False) -> int:
+    return SLOW_STAGE_FEATURE_DIM + (2 if cost_context else 0) + (STAGE_COST_DIM if deployment_context else 0) + (CHAIN_STAGE_DIM if chain_context else 0) + (HISTORY_STAGE_DIM if history_context else 0)
 
 
 def slow_obs_dim(num_nodes: int, num_service_types: int, cost_context: bool = False,
-                 max_service_stages: int = 3, deployment_context: bool = False) -> int:
+                 max_service_stages: int = 3, deployment_context: bool = False,
+                 integer_quotas: bool = False, chain_context: bool = False,
+                 tail_reallocation: bool = False) -> int:
     return (
-        slow_global_dim(num_service_types, cost_context, max_service_stages, deployment_context)
-        + num_nodes * slow_node_feature_dim(num_service_types, cost_context, max_service_stages, deployment_context)
+        slow_global_dim(num_service_types, cost_context, max_service_stages, deployment_context, integer_quotas, tail_reallocation)
+        + num_nodes * slow_node_feature_dim(num_service_types, cost_context, max_service_stages, deployment_context, chain_context, tail_reallocation)
         + num_nodes * num_nodes * SLOW_EDGE_FEATURE_DIM
     )
 
@@ -78,9 +88,12 @@ def slow_incremental_obs_dim(
     max_service_stages: int,
     cost_context: bool = False,
     deployment_context: bool = False,
+    integer_quotas: bool = False,
+    chain_context: bool = False,
+    tail_reallocation: bool = False,
 ) -> int:
-    return slow_obs_dim(num_nodes, num_service_types, cost_context, max_service_stages, deployment_context) + (
-        num_service_types * max_service_stages * slow_stage_feature_dim(cost_context, deployment_context)
+    return slow_obs_dim(num_nodes, num_service_types, cost_context, max_service_stages, deployment_context, integer_quotas, chain_context, tail_reallocation) + (
+        num_service_types * max_service_stages * slow_stage_feature_dim(cost_context, deployment_context, chain_context, tail_reallocation)
     )
 
 
@@ -175,6 +188,7 @@ class SlowDeploymentPPOAgent:
     tail_latency_coef: float = 0.35
     deterministic_count_mode: str = "expected"
     allocation_mode: str = "legacy-factorized"
+    quota_decode: str = "auto"
     counterfactual_credit_coef: float = 0.0
     cost_context: bool = False
     team_window_credit: bool = False
@@ -226,6 +240,7 @@ class SlowDeploymentPPOAgent:
     window_episode_ids: list[int] = field(default_factory=list)
     pending_window_id: int | None = None
     last_window_feedback: dict[str, float] = field(default_factory=dict)
+    last_route_history: dict = field(default_factory=dict)
     placement_updates_completed: int = field(default=0, init=False)
     placement_entropy_current_coef: float = field(default=0.0, init=False)
     last_window_critic_holdout_ev: float = field(default=0.0, init=False)
@@ -239,14 +254,27 @@ class SlowDeploymentPPOAgent:
     critic_episode_index: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
-        if self.deployment_context not in {"legacy", SLOW_DEPLOYMENT_CONTEXT}:
+        if self.quota_decode == "auto":
+            self.quota_decode = ("categorical-mean" if self.allocation_mode in {"stage-budget-v5", "stage-budget-v6"}
+                                 else "categorical-mode" if self.integer_quotas else "mean")
+        expected_decoders = ({"categorical-mode", "categorical-mean"} if self.integer_quotas else
+                             {"mean", "integer-mode"} if self.allocation_mode == "stage-budget-v3" else {"mean"})
+        if self.quota_decode not in expected_decoders:
+            raise ValueError(f"quota decoder {self.quota_decode!r} is incompatible with {self.allocation_mode}")
+        if self.deployment_context not in {"legacy", SLOW_DEPLOYMENT_CONTEXT, SLOW_CHAIN_CONTEXT}:
             raise ValueError("unknown Slow deployment context")
-        if self.learning_repair not in {"none", "conditional-replay-v1", "prefix-credit-v2"}:
+        if self.chain_context and not self.integer_quotas:
+            raise ValueError("deployment-chain-v3 requires integer stage budgets")
+        if self.tail_reallocation and not self.chain_context:
+            raise ValueError("stage-budget-v6 requires deployment-chain-v3")
+        if self.learning_repair not in {"none", "conditional-replay-v1", "prefix-credit-v2", "prefix-structured-v3"}:
             raise ValueError("unknown Slow learning repair")
         if self.learning_repair != "none" and not self.deployment_aware:
             raise ValueError("Slow learning repair requires deployment-aware-v2")
-        if self.deployment_aware and (not self.team_window_credit or self.allocation_mode not in {"budget-continuous-v2", "stage-budget-v3"}):
+        if self.deployment_aware and (not self.team_window_credit or self.allocation_mode not in {"budget-continuous-v2", "stage-budget-v3", "stage-budget-v4", "stage-budget-v5", "stage-budget-v6"}):
             raise ValueError("deployment-aware-v2 requires repaired team credit and budget-continuous-v2")
+        if self.integer_quotas and not self.deployment_aware:
+            raise ValueError("stage-budget-v4 requires deployment-aware-v2")
         if self.team_window_credit and (not np.isfinite(self.team_value_coef) or self.team_value_coef <= 0):
             raise ValueError("conditional team critic requires a positive finite team_value_coef")
         if not 0.0 <= self.tail_latency_coef <= 1.0:
@@ -259,6 +287,9 @@ class SlowDeploymentPPOAgent:
             "budget-incremental",
             "budget-continuous-v2",
             "stage-budget-v3",
+            "stage-budget-v4",
+            "stage-budget-v5",
+            "stage-budget-v6",
         }:
             raise ValueError(
                 "allocation_mode must be 'legacy-factorized', 'global-incremental', "
@@ -316,11 +347,17 @@ class SlowDeploymentPPOAgent:
             "budget-incremental",
             "budget-continuous-v2",
             "stage-budget-v3",
+            "stage-budget-v4",
+            "stage-budget-v5",
+            "stage-budget-v6",
         }
         budget_allocation = self.allocation_mode in {
             "budget-incremental",
             "budget-continuous-v2",
             "stage-budget-v3",
+            "stage-budget-v4",
+            "stage-budget-v5",
+            "stage-budget-v6",
         }
         continuous_budget = self.allocation_mode in {"budget-continuous-v2", "stage-budget-v3"}
         maximum_extra_replicas = (
@@ -341,7 +378,9 @@ class SlowDeploymentPPOAgent:
                 else self._obs_dim()
             ),
             action_dim=(
-                1
+                self.num_nodes + 1
+                if self.integer_quotas
+                else 1
                 if continuous_budget
                 else maximum_extra_replicas + 1
                 if budget_allocation
@@ -361,7 +400,11 @@ class SlowDeploymentPPOAgent:
             target_kl=self.count_target_kl,
             minibatch_size=self.minibatch_size,
             policy_kind=(
-                "slow_gat_budget"
+                "slow_gat_beta_quota"
+                if self.allocation_mode in {"stage-budget-v5", "stage-budget-v6"}
+                else "slow_gat_quota"
+                if self.integer_quotas
+                else "slow_gat_budget"
                 if continuous_budget
                 else "slow_gat_count"
                 if budget_allocation
@@ -373,7 +416,7 @@ class SlowDeploymentPPOAgent:
             node_feature_dim=self._node_dim(),
             edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
             stage_feature_dim=(
-                slow_stage_feature_dim(self.cost_context, self.deployment_aware)
+                slow_stage_feature_dim(self.cost_context, self.deployment_aware, self.chain_context)
                 if incremental_allocation and not budget_allocation
                 else None
             ),
@@ -384,7 +427,8 @@ class SlowDeploymentPPOAgent:
             critic_lr=self.critic_lr if self.deployment_aware else None,
             critic_extra_epochs=max(self.critic_k_epochs - self.k_epochs, 0) if self.deployment_aware else 0,
             slow_learning_repair=self.learning_repair != "none",
-            prefix_credit=self.learning_repair == "prefix-credit-v2",
+            prefix_credit=self.prefix_credit,
+            structured_critic=self.learning_repair == "prefix-structured-v3",
             conditional_replay_windows=self.critic_replay_windows,
             conditional_replay_decay=self.critic_replay_decay,
             full_batch_kl_stop=self.deployment_aware,
@@ -417,7 +461,8 @@ class SlowDeploymentPPOAgent:
             critic_lr=self.critic_lr if self.deployment_aware else None,
             critic_extra_epochs=max(self.critic_k_epochs - self.placement_ppo_epochs, 0) if self.deployment_aware else 0,
             slow_learning_repair=self.learning_repair != "none",
-            prefix_credit=self.learning_repair == "prefix-credit-v2",
+            prefix_credit=self.prefix_credit,
+            structured_critic=self.learning_repair == "prefix-structured-v3",
             conditional_replay_windows=self.critic_replay_windows,
             conditional_replay_decay=self.critic_replay_decay,
             full_batch_kl_stop=self.deployment_aware,
@@ -445,6 +490,9 @@ class SlowDeploymentPPOAgent:
                     self.max_service_stages,
                     self.cost_context,
                     self.deployment_aware,
+                    self.integer_quotas,
+                    self.chain_context,
+                    self.tail_reallocation,
                 ),
                 action_dim=self.num_service_types * self.max_service_stages + 1,
                 hidden_dim=128,
@@ -467,7 +515,7 @@ class SlowDeploymentPPOAgent:
                 global_dim=self._global_dim(),
                 node_feature_dim=self._node_dim(),
                 edge_feature_dim=SLOW_EDGE_FEATURE_DIM,
-                stage_feature_dim=slow_stage_feature_dim(self.cost_context, self.deployment_aware),
+                stage_feature_dim=slow_stage_feature_dim(self.cost_context, self.deployment_aware, self.chain_context, self.tail_reallocation),
                 num_nodes=self.num_nodes,
                 detach_critic_backbone=True,
                 normalize_value_targets=self.team_window_credit,
@@ -475,7 +523,8 @@ class SlowDeploymentPPOAgent:
                 critic_lr=self.critic_lr if self.deployment_aware else None,
                 critic_extra_epochs=max(self.critic_k_epochs - (self.stage_k_epochs or self.k_epochs), 0) if self.deployment_aware else 0,
                 slow_learning_repair=self.learning_repair != "none",
-                prefix_credit=self.learning_repair == "prefix-credit-v2",
+                prefix_credit=self.prefix_credit,
+                structured_critic=self.learning_repair == "prefix-structured-v3",
                 conditional_replay_windows=self.critic_replay_windows,
                 conditional_replay_decay=self.critic_replay_decay,
                 full_batch_kl_stop=self.deployment_aware,
@@ -484,24 +533,40 @@ class SlowDeploymentPPOAgent:
             )
 
     @property
+    def integer_quotas(self) -> bool:
+        return self.allocation_mode in {"stage-budget-v4", "stage-budget-v5", "stage-budget-v6"}
+
+    @property
+    def tail_reallocation(self) -> bool:
+        return self.allocation_mode == "stage-budget-v6"
+
+    @property
+    def prefix_credit(self) -> bool:
+        return self.learning_repair in {"prefix-credit-v2", "prefix-structured-v3"}
+
+    @property
     def deployment_aware(self) -> bool:
-        return self.deployment_context == SLOW_DEPLOYMENT_CONTEXT
+        return self.deployment_context in {SLOW_DEPLOYMENT_CONTEXT, SLOW_CHAIN_CONTEXT}
+
+    @property
+    def chain_context(self) -> bool:
+        return self.deployment_context == SLOW_CHAIN_CONTEXT
 
     @property
     def placement_ppo_epochs(self) -> int:
         return self.k_epochs if self.placement_k_epochs is None else self.placement_k_epochs
 
     def _global_dim(self) -> int:
-        return slow_global_dim(self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware)
+        return slow_global_dim(self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware, self.integer_quotas, self.tail_reallocation)
 
     def _node_dim(self) -> int:
-        return slow_node_feature_dim(self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware)
+        return slow_node_feature_dim(self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware, self.chain_context, self.tail_reallocation)
 
     def _obs_dim(self) -> int:
-        return slow_obs_dim(self.num_nodes, self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware)
+        return slow_obs_dim(self.num_nodes, self.num_service_types, self.cost_context, self.max_service_stages, self.deployment_aware, self.integer_quotas, self.chain_context, self.tail_reallocation)
 
     def _context(self, env, demand):
-        return self._active_context or SlowDeploymentContext(env, demand)
+        return self._active_context or (SlowChainContext(env, demand, history=self.last_route_history if self.tail_reallocation else None) if self.chain_context else SlowDeploymentContext(env, demand))
 
     def _deployment_features(self, env, demand, deployment, service_id=None, stage_id=None):
         context = self._context(env, demand)
@@ -514,10 +579,18 @@ class SlowDeploymentPPOAgent:
         global_features, node_features = context.features(
             deployment, budget=budget, service_id=service_id, stage_id=stage_id)
         visited = getattr(self, "_stage_budget_visited", None)
-        if self.allocation_mode == "stage-budget-v3" and visited is not None:
+        if self.allocation_mode in {"stage-budget-v3", "stage-budget-v4", "stage-budget-v5", "stage-budget-v6"} and visited is not None:
             # Preserve visited stages even when Count chose zero extra replicas.
             # Valid=1, valid+already-processed=2; no hidden executor-only state.
             global_features[:context.size * INVENTORY_DIM:INVENTORY_DIM] += visited
+        if self.integer_quotas:
+            maximum, selected, remaining, phase = getattr(self, "_quota_state", (0, 0, 0, "coverage"))
+            global_features = np.r_[global_features, maximum / self.num_nodes,
+                selected / self.num_nodes, remaining / self.num_nodes,
+                float(phase == "count"), float(phase == "placement")]
+        if self.tail_reallocation:
+            closed = getattr(self, "_reallocation_closed", np.zeros(context.size, dtype=bool))
+            global_features = np.r_[global_features, float(getattr(self, "_reallocation_phase", False)), closed]
         return global_features, node_features
 
     def _placement_entropy_start(self) -> float:
@@ -599,8 +672,10 @@ class SlowDeploymentPPOAgent:
         remaining_storage = env.service_storage_capacities()
         demand = self._node_service_demand(env)
         if self.deployment_aware:
-            self._active_context = SlowDeploymentContext(env, demand,
-                competition_aware=self.allocation_mode == "stage-budget-v3")
+            context_class = SlowChainContext if self.chain_context else SlowDeploymentContext
+            self._active_context = context_class(env, demand,
+                **({"history":self.last_route_history} if self.tail_reallocation else {}),
+                competition_aware=self.allocation_mode in {"stage-budget-v3", "stage-budget-v4", "stage-budget-v5", "stage-budget-v6"})
         self.pending_count_indices.clear()
         self.pending_placement_indices.clear()
         self.pending_count_stage_keys.clear()
@@ -620,6 +695,9 @@ class SlowDeploymentPPOAgent:
         self.pending_budget_used_storage_gb = 0.0
         self.pending_placement_stage_keys.clear()
         self._stage_budget_visited = None
+        self._reallocation_phase = False
+        self._reallocation_closed = np.zeros(self.num_service_types * self.max_service_stages, dtype=bool)
+        self._quota_state = (0, 0, 0, "coverage")
         self.last_stage_budget_diagnostics = []
         window_id: int | None = None
         if record:
@@ -627,7 +705,7 @@ class SlowDeploymentPPOAgent:
                 raise RuntimeError("previous slow deployment window has no completed return")
             window_state = self._build_window_state(env, demand, remaining_memory, remaining_storage)
             old_value = 0.
-            if self.learning_repair != "prefix-credit-v2":
+            if not self.prefix_credit:
                 state_t = torch.as_tensor(window_state, dtype=torch.float32, device=self.device).unsqueeze(0)
                 with torch.no_grad():
                     normalized_value = float(self.window_critic(state_t).item())
@@ -637,7 +715,7 @@ class SlowDeploymentPPOAgent:
             self.window_old_values.append(old_value)
             self.pending_window_id = window_id
 
-        if self.allocation_mode == "stage-budget-v3":
+        if self.allocation_mode in {"stage-budget-v3", "stage-budget-v4", "stage-budget-v5", "stage-budget-v6"}:
             from edge_drl.agents.stage_budget import plan_stage_budgets
             return plan_stage_budgets(self, env, deployment, remaining_memory, remaining_storage,
                                       demand, window_id, deterministic, record)
@@ -1489,6 +1567,9 @@ class SlowDeploymentPPOAgent:
                 "budget-incremental",
                 "budget-continuous-v2",
                 "stage-budget-v3",
+                "stage-budget-v4",
+                "stage-budget-v5",
+            "stage-budget-v6",
             }
             else np.asarray(
                 [
@@ -1572,7 +1653,12 @@ class SlowDeploymentPPOAgent:
                                 "baseline_coef_used", "baseline_coef_next", "critic_replay_windows",
                                 "critic_replay_samples", "critic_optimizer_steps", "prefix_trace_lambda",
                                 "prefix_advantage_std", "mc_advantage_std", "actor_gradient_norm",
-                                "entropy_gradient_norm")
+                                "entropy_gradient_norm", "baseline_return_variance", "baseline_residual_variance",
+                                "baseline_residual_variance_ratio", "baseline_window_residual_variance", "diagnostic_windows",
+                                "score_gradient_mc_variance", "score_gradient_baseline_variance", "score_gradient_variance_ratio",
+                                "score_gradient_mean_cosine", "window_log_ratio_mean", "window_log_ratio_abs_max",
+                                "window_kl_proxy_mean", "window_kl_proxy_max", "actor_update_time_s",
+                                "critic_update_time_s", "critic_replay_max_age")
                 })
         critic_metrics = self._update_window_critic(trajectory_returns)
         self.last_window_critic_holdout_ev = float(
@@ -1631,7 +1717,7 @@ class SlowDeploymentPPOAgent:
                 + placement_metrics.get("explained_variance", 0.0)
             ),
             "window_critic_explained_variance": critic_metrics["explained_variance"],
-            "window_critic_active": float(self.learning_repair != "prefix-credit-v2"),
+            "window_critic_active": float(not self.prefix_credit),
             "window_critic_value_loss": critic_metrics["value_loss"],
             "window_critic_raw_value_mse": critic_metrics["raw_value_mse"],
             "window_critic_train_explained_variance": critic_metrics[
@@ -1849,7 +1935,7 @@ class SlowDeploymentPPOAgent:
         return np.clip(attribution, -2.0, 2.0)
 
     def _update_window_critic(self, returns: np.ndarray) -> dict[str, float]:
-        if self.learning_repair == "prefix-credit-v2":
+        if self.prefix_credit:
             # Conditional prefix critics are the actual Actor baselines. Do
             # not spend updates on the legacy critic whose credit is disabled.
             return dict.fromkeys(("value_loss", "raw_value_mse", "explained_variance",
@@ -2144,7 +2230,7 @@ class SlowDeploymentPPOAgent:
             for stage_id in range(self.max_service_stages):
                 valid = stage_id < len(service.stages)
                 if not valid:
-                    stage_features.extend([0.0] * slow_stage_feature_dim(self.cost_context, self.deployment_aware))
+                    stage_features.extend([0.0] * slow_stage_feature_dim(self.cost_context, self.deployment_aware, self.chain_context, self.tail_reallocation))
                     continue
                 stage = service.stages[stage_id]
                 placed = deployment[service_id, stage_id]
@@ -3583,6 +3669,7 @@ class HierarchicalPPOAgent:
     window_stage_latency_samples: dict[tuple[int, int], list[tuple[float, float]]] = field(default_factory=dict)
     window_stage_deadline_violations: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_weights: dict[tuple[int, int], float] = field(default_factory=dict)
+    window_route_history: SlowRouteHistory | None = field(default=None, repr=False)
     window_stage_cross_transitions: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_transition_weights: dict[tuple[int, int], float] = field(default_factory=dict)
     window_stage_cross_data_mb: dict[tuple[int, int], float] = field(default_factory=dict)
@@ -3700,6 +3787,7 @@ class HierarchicalPPOAgent:
         slow_shared_return_coef: float = 0.0,
         slow_deterministic_count_mode: str = "expected",
         slow_allocation_mode: str = "legacy-factorized",
+        slow_quota_decode: str = "auto",
         slow_counterfactual_credit_coef: float = 0.0,
         training_repair: str = "legacy",
         slow_team_value_coef: float = 0.5,
@@ -3760,6 +3848,7 @@ class HierarchicalPPOAgent:
                 tail_latency_coef=slow_tail_latency_coef,
                 deterministic_count_mode=slow_deterministic_count_mode,
                 allocation_mode=slow_allocation_mode,
+                quota_decode=slow_quota_decode,
                 counterfactual_credit_coef=slow_counterfactual_credit_coef,
                 cost_context=repair,
                 team_window_credit=repair,
@@ -3961,6 +4050,8 @@ class HierarchicalPPOAgent:
         """
 
         self.slow_agent.last_window_feedback = {}
+        self.slow_agent.last_route_history = {}
+        self.window_route_history = None
         self.last_slow_window_metrics = {}
         self.fast_agent.pending_kkt_stage_costs.clear()
         clear_batch_context = getattr(
@@ -4009,6 +4100,7 @@ class HierarchicalPPOAgent:
         service_id: int | None = None,
         stage_nodes: list[int] | tuple[int, ...] | None = None,
         slow_stage_costs: list[float] | None = None,
+        settlement_info: dict | None = None,
         slow_stage_marginal_values: list[float] | None = None,
         env: EdgeComputingEnv | None = None,
         record_fast: bool = True,
@@ -4032,6 +4124,10 @@ class HierarchicalPPOAgent:
                     self.fast_agent.assign_schedule_rewards(fast_stage_rewards, done=done, weight=weight)
         if not record_slow:
             return
+        if self.slow_agent.tail_reallocation and settlement_info is not None and service_id is not None and stage_nodes is not None:
+            if self.window_route_history is None:
+                self.window_route_history = SlowRouteHistory(self.slow_agent.num_nodes)
+            self.window_route_history.add(service_id,stage_nodes,settlement_info,weight)
         self.window_reward += (reward if slow_reward is None else slow_reward) * weight
         self.window_steps += weight
         if latency_s is not None:
@@ -4205,7 +4301,7 @@ class HierarchicalPPOAgent:
             stage_key == (-1, -1)
             for stage_key in self.slow_agent.pending_count_stage_keys
         )
-        if self.slow_agent.allocation_mode == "stage-budget-v3":
+        if self.slow_agent.allocation_mode in {"stage-budget-v3", "stage-budget-v4", "stage-budget-v5", "stage-budget-v6"}:
             incremental_add_actions = self.slow_agent.pending_budget_requested_replicas
         budget_fraction = 0.0
         budget_feasible_capacity = 0.0
@@ -4222,6 +4318,9 @@ class HierarchicalPPOAgent:
                 "budget-incremental",
                 "budget-continuous-v2",
                 "stage-budget-v3",
+                "stage-budget-v4",
+                "stage-budget-v5",
+            "stage-budget-v6",
             }
             and self.slow_agent.pending_count_indices
         ):
@@ -4275,6 +4374,9 @@ class HierarchicalPPOAgent:
             placement_stage_returns=placement_stage_returns,
         )
         self.slow_agent.last_window_feedback = feedback
+        if self.slow_agent.tail_reallocation:
+            self.slow_agent.last_route_history = self.window_route_history.snapshot() if self.window_route_history is not None else {}
+            self.window_route_history = None
         self.last_slow_window_metrics = {
             "slow_window_return": float(window_return),
             "slow_window_latency_return": float(latency_return),

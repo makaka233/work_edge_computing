@@ -1,0 +1,2 @@
+seed,load,candidate,failed,trace_hash,slow_latency_ms,darp_latency_ms,slow_minus_darp_ms
+2030,1.0,Slow-01-checkpoint,False,4e1a6831c5312a070184a3523af4db5faff3dd6987a3233f8c084507744ec4ec,331.67999587365864,178.79441244602984,152.8855834276288
