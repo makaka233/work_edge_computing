@@ -456,3 +456,10 @@ It adds replicas to the feasible stage with the fewest replicas, with fixed
 service/stage ordering and ascending-node First-Fit placement. It reuses the
 frozen Proposed Fast PPO and public KKT settlement. See
 [UNIFORM_FIRST_FIT.md](UNIFORM_FIRST_FIT.md) for its fixed rules.
+
+Proposed's targeted Slow learning repair is selected by
+`--slow-learning-repair conditional-replay-v1`: bounded value-only conditional
+replay, a lagged baseline multiplier, and whole-epoch KL-guarded minibatch actor
+updates. Fresh deployment-aware runs enable it automatically; old checkpoints
+retain their saved learning behavior unless explicitly upgraded. Environment,
+Fast and KKT are unchanged. See [Slow learning repair](docs/SLOW_LEARNING_REPAIR.md).

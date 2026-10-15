@@ -490,6 +490,8 @@ def parse_args() -> argparse.Namespace:
                         help="detached normalized conditional critic loss weight in repaired mode")
     parser.add_argument("--slow-deployment-context", choices=["auto", "legacy", "deployment-aware-v2"], default="auto",
                         help="auto preserves checkpoint architecture; fresh repaired latency200 budget runs use deployment-aware-v2")
+    parser.add_argument("--slow-learning-repair", choices=["auto", "none", "conditional-replay-v1"], default="auto",
+                        help="fresh deployment-aware runs use conditional value replay and guarded minibatch epochs; resume preserves saved training semantics")
     parser.add_argument("--network-constraint-mode", choices=["edge-only", "shared-nic"], default="edge-only")
     parser.add_argument("--service-calibration-mode", choices=["legacy", "audited-v1"], default="legacy")
     parser.add_argument("--service-calibration-file", default=None, help="schema-1 measured/estimated budget JSON")
@@ -3391,6 +3393,12 @@ def save_checkpoint(
             # surfacing later as opaque tensor-size mismatches.
             "slow_allocation_mode": agent.slow_agent.allocation_mode,
             "slow_deployment_context": agent.slow_agent.deployment_context,
+            "slow_learning_repair": agent.slow_agent.learning_repair,
+            "slow_conditional_learning_state": {
+                name: None if ppo is None or ppo.slow_conditional_learning is None else ppo.slow_conditional_learning.state_dict()
+                for name, ppo in (("count", agent.slow_agent.count_ppo), ("stage", agent.slow_agent.stage_ppo),
+                                  ("placement", agent.slow_agent.placement_ppo))
+            },
             "slow_count_agent": agent.slow_agent.count_ppo.policy.state_dict(),
             "slow_count_optimizer": agent.slow_agent.count_ppo.optimizer.state_dict(),
             "slow_stage_agent": (
@@ -3581,6 +3589,18 @@ def load_checkpoint(
             state = checkpoint["slow_component_value_normalization"].get(name)
             if ppo is not None and state is not None:
                 ppo.load_value_normalization_state(state)
+    if agent.slow_agent.learning_repair != "none":
+        for name, ppo in (("count", agent.slow_agent.count_ppo), ("stage", agent.slow_agent.stage_ppo),
+                          ("placement", agent.slow_agent.placement_ppo)):
+            state = checkpoint.get("slow_conditional_learning_state", {}).get(name)
+            if ppo is not None and state is not None:
+                ppo.slow_conditional_learning.load_state_dict(state)
+            if ppo is not None and checkpoint.get("slow_learning_repair", "none") == "none":
+                # MSE -> Huber changes the value-gradient scale and direction.
+                # Preserve policy/Actor Adam exactly; start only Critic moments
+                # afresh rather than dragging obsolete MSE momentum into replay.
+                for parameter in ppo.policy.critic.parameters():
+                    ppo.optimizer.state.pop(parameter, None)
     if "slow_placement_updates_completed" in checkpoint:
         agent.slow_agent.placement_updates_completed = int(checkpoint["slow_placement_updates_completed"])
     if "slow_placement_entropy_current_coef" in checkpoint:
@@ -4062,6 +4082,15 @@ def resolve_slow_deployment_context(args: argparse.Namespace) -> str:
             else "legacy")
 
 
+def resolve_slow_learning_repair(args: argparse.Namespace) -> str:
+    requested = getattr(args, "slow_learning_repair", "auto")
+    if requested != "auto":
+        return requested
+    if args.load_checkpoint:
+        return str(torch.load(Path(args.load_checkpoint), map_location="cpu").get("slow_learning_repair", "none"))
+    return "conditional-replay-v1" if args.slow_deployment_context == "deployment-aware-v2" else "none"
+
+
 def initialize_fast_checkpoint(agent, path: Path, args) -> dict[str, object]:
     """Transfer Fast only. This is NOT continuation of a previous training run."""
     checkpoint = torch.load(path, map_location="cpu")
@@ -4118,6 +4147,7 @@ def main() -> None:
     args.fast_chain_context = resolve_fast_chain_context(args)
     args.training_repair = resolve_training_repair(args)
     args.slow_deployment_context = resolve_slow_deployment_context(args)
+    args.slow_learning_repair = resolve_slow_learning_repair(args)
     if args.load_checkpoint and args.init_fast_checkpoint:
         raise ValueError("--load-checkpoint and --init-fast-checkpoint are mutually exclusive")
     args.rollout_acceleration_version = "vector-features-v1"
@@ -4205,6 +4235,7 @@ def main() -> None:
         training_repair=args.training_repair,
         slow_team_value_coef=args.slow_team_value_coef,
         slow_deployment_context=args.slow_deployment_context,
+        slow_learning_repair=args.slow_learning_repair,
         fast_reservation_microbatch_size=args.fast_reservation_microbatch_size,
         fast_load_balanced_updates=args.fast_load_balanced_updates,
         fast_load_group_weights=_load_probabilities_for_args(
@@ -4262,6 +4293,7 @@ def main() -> None:
     print(f"  train_mode={args.train_mode}")
     print(f"  training_design={args.training_design}")
     print(f"  slow_deployment_context={args.slow_deployment_context}")
+    print(f"  slow_learning_repair={args.slow_learning_repair}")
     if args.fast_initialization:
         print(f"  Fast initialized from {args.fast_initialization['path']}; fresh Slow, optimizers and run counters")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
@@ -5350,7 +5382,11 @@ def main() -> None:
             slow_metrics = agent.slow_agent.empty_update_metrics()
         losses = {"slow": slow_metrics, "fast": fast_metrics}
         if agent.slow_agent.deployment_aware and slow_updated:
-            append_log(run_dir / "logs" / "slow_update_metrics.csv", {
+            # An explicitly upgraded resume may append to an old run. Do not
+            # silently append wider rows under the old CSV header.
+            diagnostic_file = ("slow_update_metrics_conditional_replay_v1.csv"
+                               if agent.slow_agent.learning_repair != "none" else "slow_update_metrics.csv")
+            append_log(run_dir / "logs" / diagnostic_file, {
                 "update": update + 1, "context_version": args.slow_deployment_context,
                 **agent.slow_agent.last_update_diagnostics,
             })

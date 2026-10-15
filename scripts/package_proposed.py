@@ -69,7 +69,7 @@ def main():
     payload = {relative: (ROOT / relative).read_bytes() for relative in closure}
     source_mapping = {relative: relative for relative in closure}
     for name in ["LATENCY200_SCENARIO.md", "LATENCY200_TRAINING_REPAIR.md",
-                 "SLOW_DEPLOYMENT_CONTEXT_REPAIR.md", "SHARED_NIC_PRECISION_REPAIR.md"]:
+                 "SLOW_DEPLOYMENT_CONTEXT_REPAIR.md", "SHARED_NIC_PRECISION_REPAIR.md", "SLOW_LEARNING_REPAIR.md"]:
         relative = "docs/" + name
         payload[relative] = (ROOT / relative).read_bytes()
         source_mapping[relative] = relative

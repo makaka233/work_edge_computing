@@ -180,6 +180,7 @@ class SlowDeploymentPPOAgent:
     team_window_credit: bool = False
     team_value_coef: float = 0.5
     deployment_context: str = "legacy"
+    learning_repair: str = "none"
     device: str = "cpu"
     _active_context: SlowDeploymentContext | None = field(default=None, init=False, repr=False)
     last_deployment_diagnostics: list[dict] = field(default_factory=list, init=False)
@@ -239,6 +240,10 @@ class SlowDeploymentPPOAgent:
     def __post_init__(self) -> None:
         if self.deployment_context not in {"legacy", SLOW_DEPLOYMENT_CONTEXT}:
             raise ValueError("unknown Slow deployment context")
+        if self.learning_repair not in {"none", "conditional-replay-v1"}:
+            raise ValueError("unknown Slow learning repair")
+        if self.learning_repair != "none" and not self.deployment_aware:
+            raise ValueError("Slow learning repair requires deployment-aware-v2")
         if self.deployment_aware and (not self.team_window_credit or self.allocation_mode != "budget-continuous-v2"):
             raise ValueError("deployment-aware-v2 requires repaired team credit and budget-continuous-v2")
         if self.team_window_credit and (not np.isfinite(self.team_value_coef) or self.team_value_coef <= 0):
@@ -374,6 +379,9 @@ class SlowDeploymentPPOAgent:
             independent_critic=self.deployment_aware,
             critic_lr=self.critic_lr if self.deployment_aware else None,
             critic_extra_epochs=max(self.critic_k_epochs - self.k_epochs, 0) if self.deployment_aware else 0,
+            slow_learning_repair=self.learning_repair != "none",
+            conditional_replay_windows=self.critic_replay_windows,
+            conditional_replay_decay=self.critic_replay_decay,
             full_batch_kl_stop=self.deployment_aware,
             guarded_epochs=self.deployment_aware,
             device=self.device,
@@ -403,6 +411,9 @@ class SlowDeploymentPPOAgent:
             independent_critic=self.deployment_aware,
             critic_lr=self.critic_lr if self.deployment_aware else None,
             critic_extra_epochs=max(self.critic_k_epochs - self.placement_ppo_epochs, 0) if self.deployment_aware else 0,
+            slow_learning_repair=self.learning_repair != "none",
+            conditional_replay_windows=self.critic_replay_windows,
+            conditional_replay_decay=self.critic_replay_decay,
             full_batch_kl_stop=self.deployment_aware,
             guarded_epochs=self.deployment_aware,
             device=self.device,
@@ -457,6 +468,9 @@ class SlowDeploymentPPOAgent:
                 independent_critic=self.deployment_aware,
                 critic_lr=self.critic_lr if self.deployment_aware else None,
                 critic_extra_epochs=max(self.critic_k_epochs - (self.stage_k_epochs or self.k_epochs), 0) if self.deployment_aware else 0,
+                slow_learning_repair=self.learning_repair != "none",
+                conditional_replay_windows=self.critic_replay_windows,
+                conditional_replay_decay=self.critic_replay_decay,
                 full_batch_kl_stop=self.deployment_aware,
                 guarded_epochs=self.deployment_aware,
                 device=self.device,
@@ -1462,6 +1476,7 @@ class SlowDeploymentPPOAgent:
         )
         count_metrics = self.count_ppo.update_from_returns(
             count_returns,
+            **({"critic_window_ids": count_ids} if self.learning_repair != "none" else {}),
             **({"critic_sample_weights": self._equal_window_action_weights(count_ids)} if self.deployment_aware else {}),
             sample_weights=(np.ones(len(count_ids), dtype=np.float32) if self.team_window_credit
                             else self._equal_window_action_weights(count_ids)),
@@ -1477,6 +1492,7 @@ class SlowDeploymentPPOAgent:
                 raise RuntimeError("Slow Stage returns exist without a Stage actor")
             stage_metrics = self.stage_ppo.update_from_returns(
                 stage_returns,
+                **({"critic_window_ids": stage_ids} if self.learning_repair != "none" else {}),
                 **({"critic_sample_weights": self._equal_window_action_weights(stage_ids)} if self.deployment_aware else {}),
                 sample_weights=(np.ones(len(stage_ids), dtype=np.float32) if self.team_window_credit
                                 else self._equal_window_action_weights(stage_ids)),
@@ -1504,6 +1520,7 @@ class SlowDeploymentPPOAgent:
         self.placement_ppo.entropy_coef = placement_entropy_coef
         placement_metrics = self.placement_ppo.update_from_returns(
             placement_returns,
+            **({"critic_window_ids": placement_ids} if self.learning_repair != "none" else {}),
             **({"critic_sample_weights": self._equal_window_action_weights(placement_ids)} if self.deployment_aware else {}),
             sample_weights=placement_action_weights,
             advantage_group_ids=placement_group_ids,
@@ -1523,6 +1540,14 @@ class SlowDeploymentPPOAgent:
                             "kl_backtracks", "accepted_step_lr", "critic_extra_optimizer_steps",
                             "value_return_std", "explained_variance", "post_explained_variance")
             }
+            if self.learning_repair != "none":
+                self.last_update_diagnostics.update({
+                    f"{head}_{key}": metrics.get(key, 0.)
+                    for head, metrics in (("count", count_metrics), ("stage", stage_metrics), ("placement", placement_metrics))
+                    for key in ("critic_prequential_ev", "critic_prequential_mse", "critic_post_mse",
+                                "baseline_coef_used", "baseline_coef_next", "critic_replay_windows",
+                                "critic_replay_samples", "critic_optimizer_steps")
+                })
         critic_metrics = self._update_window_critic(trajectory_returns)
         self.last_window_critic_holdout_ev = float(
             critic_metrics["holdout_explained_variance"]
@@ -3639,6 +3664,7 @@ class HierarchicalPPOAgent:
         training_repair: str = "legacy",
         slow_team_value_coef: float = 0.5,
         slow_deployment_context: str = "legacy",
+        slow_learning_repair: str = "none",
     ) -> "HierarchicalPPOAgent":
         if training_repair not in {"legacy", "batch-credit-v1"}:
             raise ValueError("unknown training repair version")
@@ -3647,6 +3673,10 @@ class HierarchicalPPOAgent:
         # silently change architecture. The training entry point resolves auto.
         if slow_deployment_context == "auto":
             slow_deployment_context = "legacy"
+        if slow_learning_repair == "auto":
+            # Only the Proposed training entry point resolves fresh-run auto.
+            # Legacy/MSO/evaluation adapters may carry unresolved parser args.
+            slow_learning_repair = "none"
         return cls(
             slow_agent=SlowDeploymentPPOAgent(
                 num_nodes=env.config.num_edge_nodes,
@@ -3695,6 +3725,7 @@ class HierarchicalPPOAgent:
                 team_window_credit=repair,
                 team_value_coef=slow_team_value_coef,
                 deployment_context=slow_deployment_context,
+                learning_repair=slow_learning_repair,
                 device=device,
             ),
             fast_agent=FastSchedulingPPOAgent(

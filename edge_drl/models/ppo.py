@@ -596,6 +596,17 @@ class GraphAttentionActorCritic(nn.Module):
         values = self.critic(critic_context).squeeze(-1)
         return dist, values
 
+    def conditional_critic_features(self, states: torch.Tensor) -> torch.Tensor:
+        """Value-only encoding; callers detach it before fitting the critic."""
+        if not self.independent_critic:
+            raise ValueError("conditional value-only replay requires an independent critic")
+        global_emb = self.global_encoder(states[:, :self.global_dim])
+        nodes = states[:, self.node_offset:self.stage_offset].reshape(-1, self.num_nodes, self.node_feature_dim)
+        edges = states[:, self.edge_offset:].reshape(-1, self.num_nodes, self.num_nodes, self.edge_feature_dim)
+        graph = self._graph_attention(self.node_encoder(nodes), edges)
+        context = torch.cat([global_emb, graph.mean(dim=1)], dim=-1).detach()
+        return torch.cat([states[:, :self.edge_offset], context], dim=-1)
+
     def _graph_attention(self, node_emb: torch.Tensor, edge_features: torch.Tensor) -> torch.Tensor:
         adjacency = edge_features[..., 0] > 0.5
         eye = torch.eye(self.num_nodes, dtype=torch.bool, device=edge_features.device).unsqueeze(0)
@@ -641,6 +652,9 @@ class PPOAgent:
         independent_critic: bool = False,
         critic_lr: float | None = None,
         critic_extra_epochs: int = 0,
+        slow_learning_repair: bool = False,
+        conditional_replay_windows: int = 96,
+        conditional_replay_decay: float = .9,
         device: str = "cpu",
     ):
         self.gamma = gamma
@@ -674,6 +688,12 @@ class PPOAgent:
         self.value_return_mean = 0.0
         self.value_return_std = 1.0
         self.value_normalization_initialized = False
+        self.slow_conditional_learning = None
+        if slow_learning_repair:
+            if not independent_critic or not guarded_epochs:
+                raise ValueError("Slow learning repair requires an independent critic and guarded epochs")
+            from edge_drl.models.slow_learning import SlowConditionalLearning
+            self.slow_conditional_learning = SlowConditionalLearning(conditional_replay_windows, decay=conditional_replay_decay)
         if self.guarded_epochs and not self.full_batch_kl_stop:
             raise ValueError("guarded_epochs requires full_batch_kl_stop")
         self.device = torch.device(device)
@@ -1503,6 +1523,7 @@ class PPOAgent:
         *,
         sample_weights: np.ndarray | None = None,
         critic_sample_weights: np.ndarray | None = None,
+        critic_window_ids: np.ndarray | None = None,
         advantage_group_ids: np.ndarray | None = None,
         actor_use_value_baseline: bool = True,
         actor_baseline_values: np.ndarray | None = None,
@@ -1575,6 +1596,8 @@ class PPOAgent:
         # returns centered within comparable service stages, while the value
         # head still learns the original absolute returns below.
         baseline_np = old_values_np
+        if self.slow_conditional_learning is not None:
+            baseline_np = self.slow_conditional_learning.baseline_coef * baseline_np
         if actor_baseline_values is not None:
             baseline_np = np.asarray(actor_baseline_values, dtype=np.float32)
             if baseline_np.shape != (n,) or not np.isfinite(baseline_np).all():
@@ -1670,6 +1693,17 @@ class PPOAgent:
             dtype=np.float32 if self.continuous_actions else np.int64,
         )
         old_logprobs_np = np.asarray(self.buffer.logprobs, dtype=np.float32)
+        if self.slow_conditional_learning is not None:
+            window_ids = np.arange(n) if critic_window_ids is None else np.asarray(critic_window_ids, dtype=np.int64)
+            if window_ids.shape != (n,) or np.any(window_ids < 0):
+                raise ValueError("conditional critic window ids must be nonnegative and match actions")
+            metrics = self.slow_conditional_learning.update(
+                self, actions_np, old_logprobs_np, advantages_np, returns_np,
+                weights_np, critic_weights_np, window_ids,
+            )
+            metrics.update({"explained_variance": explained_variance, "advantage_mean": advantage_mean,
+                            "advantage_std": advantage_std, "combined_advantage_std": combined_advantage_std})
+            return metrics
         if self.guarded_epochs:
             metrics = self._update_guarded_epochs(
                 actions_np, old_logprobs_np, advantages_np, value_targets_np,
