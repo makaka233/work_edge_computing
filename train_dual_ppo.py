@@ -490,7 +490,7 @@ def parse_args() -> argparse.Namespace:
                         help="detached normalized conditional critic loss weight in repaired mode")
     parser.add_argument("--slow-deployment-context", choices=["auto", "legacy", "deployment-aware-v2"], default="auto",
                         help="auto preserves checkpoint architecture; fresh repaired latency200 budget runs use deployment-aware-v2")
-    parser.add_argument("--slow-learning-repair", choices=["auto", "none", "conditional-replay-v1"], default="auto",
+    parser.add_argument("--slow-learning-repair", choices=["auto", "none", "conditional-replay-v1", "prefix-credit-v2"], default="auto",
                         help="fresh deployment-aware runs use conditional value replay and guarded minibatch epochs; resume preserves saved training semantics")
     parser.add_argument("--network-constraint-mode", choices=["edge-only", "shared-nic"], default="edge-only")
     parser.add_argument("--service-calibration-mode", choices=["legacy", "audited-v1"], default="legacy")
@@ -779,6 +779,7 @@ def parse_args() -> argparse.Namespace:
             "global-incremental",
             "budget-incremental",
             "budget-continuous-v2",
+            "stage-budget-v3",
         ],
         default="legacy-factorized",
         help=(
@@ -969,6 +970,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slow-lr-max-reductions", type=int, default=1)
     parser.add_argument("--slow-lr-cooldown-updates", type=int, default=20)
     parser.add_argument("--append-log", action="store_true")
+    parser.add_argument("--proposed-design", choices=["auto", "legacy", "joint-credit-v2"], default="auto",
+                        help="Explicit joint PPO repair preset; auto preserves saved/legacy behavior")
+    parser.add_argument("--fast-update-chunks", type=int, default=1)
+    parser.add_argument("--fast-independent-critic", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--checkpoint-probe-interval", type=int, default=10)
+    parser.add_argument("--init-fast-actor-only", action="store_true",
+                        help="Explicitly transfer only Fast actor/backbone; reset changed critic and all optimizers")
     parser.add_argument(
         "--progress-interval-seconds",
         type=float,
@@ -1034,6 +1042,7 @@ def parse_args() -> argparse.Namespace:
         "global-incremental",
         "budget-incremental",
         "budget-continuous-v2",
+            "stage-budget-v3",
     }:
         parser.error(
             "--slow-replica-ablation-samples requires --slow-allocation-mode "
@@ -1043,6 +1052,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--slow-replica-ablation-samples requires positive --slow-counterfactual-credit-coef")
     if args.fast_updates_per_cycle < 1:
         parser.error("--fast-updates-per-cycle must be >= 1")
+    if args.fast_update_chunks < 1 or args.checkpoint_probe_interval < 1:
+        parser.error("Fast update chunks and checkpoint probe interval must be positive")
     if args.fast_warmup_updates < 0 or args.slow_warmup_updates < 0:
         parser.error("--fast-warmup-updates and --slow-warmup-updates must be >= 0")
     if args.joint_training_schedule == "alternating" and args.rollout_unit != "window":
@@ -1877,13 +1888,11 @@ def rollout(
         )
     represented_seconds = 1.0
     if record and rollout_unit == "window":
+        from edge_drl.sampling import interval_seconds
         sampled_seconds = int(getattr(args, "sampled_seconds_per_window", 0))
         window_seconds = float(env.config.deployment_interval_minutes * 60)
-        if 0 < sampled_seconds < window_seconds:
-            represented_seconds = window_seconds / float(sampled_seconds)
-            hold_cap = float(getattr(args, "sampling_max_interval_seconds", 0.0))
-            if hold_cap > 0:
-                represented_seconds = min(represented_seconds, hold_cap)
+        represented_seconds = interval_seconds(window_seconds, sampled_seconds,
+                                               float(getattr(args, "sampling_max_interval_seconds", 0.)))
     if rollout_unit == "requests":
         target_requests = max_requests
     elif rollout_unit == "window":
@@ -2227,6 +2236,7 @@ def rollout(
     return {
         "requests": rollout_requests,
         "request_events": rollout_request_events,
+        "sampled_request_events": float(env.metrics.get("sampled_request_events", 0.) - start_metrics.get("sampled_request_events", 0.)),
         "settlement_steps": rollout_settlement_steps,
         "logical_steps": rollout_logical_steps,
         "temporal_sampling_fraction": float(rollout_settlement_steps / max(rollout_logical_steps, 1.0)),
@@ -2681,6 +2691,7 @@ def aggregate_rollout_stats(rollouts: list[dict[str, float]]) -> dict[str, float
     aggregated: dict[str, float] = {
         "requests": float(requests.sum()),
         "request_events": float(request_events.sum()),
+        "sampled_request_events": float(sum(r.get("sampled_request_events", 0.) for r in rollouts)),
         "settlement_steps": float(sum(r["settlement_steps"] for r in rollouts)),
         "logical_steps": float(sum(r["logical_steps"] for r in rollouts)),
         "simulated_hours": float(sum(r["simulated_hours"] for r in rollouts)),
@@ -3387,6 +3398,8 @@ def save_checkpoint(
     }
     checkpoint = {
             "training_repair": "batch-credit-v1" if agent.fast_agent.batch_credit else "legacy",
+            "fast_independent_critic": agent.fast_agent.independent_critic,
+            "fast_update_chunks": agent.fast_agent.update_chunks,
             # The global incremental Count head has a different action space
             # and network topology from the legacy per-stage Count head.  Save
             # the architecture tag so resume failures are explicit instead of
@@ -3473,6 +3486,8 @@ def load_checkpoint(
     # generator only accepts a CPU ByteTensor.  Model/optimizer state loaders
     # copy their tensors to the parameter device themselves.
     checkpoint = torch.load(path, map_location="cpu")
+    if bool(checkpoint.get("fast_independent_critic", False)) != agent.fast_agent.independent_critic:
+        raise ValueError("checkpoint Fast critic architecture differs; restore saved settings or start a fresh run")
     if checkpoint.get("slow_deployment_context", "legacy") != agent.slow_agent.deployment_context:
         raise ValueError("checkpoint Slow deployment context differs; resume the saved architecture or start a fresh Slow with --init-fast-checkpoint")
     requested_repair = "batch-credit-v1" if agent.fast_agent.batch_credit else "legacy"
@@ -3642,14 +3657,28 @@ def _cpu_byte_rng_state(state: object) -> torch.Tensor:
     return torch.as_tensor(state, dtype=torch.uint8, device="cpu").contiguous()
 
 
+_LOG_HEADERS = {}
+
+
 def append_log(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
+    write_header = not path.exists() or path.stat().st_size == 0
+    if write_header:
+        _LOG_HEADERS[path] = list(row)
+    elif path not in _LOG_HEADERS:
+        with path.open(newline="", encoding="utf-8") as source:
+            _LOG_HEADERS[path] = next(csv.reader(source))
+    fields = _LOG_HEADERS[path]
     with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+    extra = {key:value for key,value in row.items() if key not in fields}
+    if extra:
+        # Never append wider/reordered rows beneath an archived CSV header.
+        identity = {key:row[key] for key in ("update", "episode", "rollout") if key in row}
+        append_log(path.with_name(path.stem+"_extensions_v2.csv"), {**identity, **extra})
 
 
 def write_single_row_csv(path: Path, row: dict[str, float | int | str]) -> None:
@@ -4113,11 +4142,18 @@ def initialize_fast_checkpoint(agent, path: Path, args) -> dict[str, object]:
         raise ValueError("Fast initialization service calibration document differs")
     if checkpoint.get("training_repair", "legacy") != args.training_repair:
         raise ValueError("Fast initialization training repair differs")
-    agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"], strict=True)
-    if agent.fast_agent.batch_credit:
+    actor_only = bool(getattr(args, "init_fast_actor_only", False))
+    if actor_only:
+        state = {key:value for key,value in checkpoint["fast_agent"].items() if not key.startswith("critic.")}
+        missing, unexpected = agent.fast_agent.ppo.policy.load_state_dict(state, strict=False)
+        if unexpected or any(not key.startswith("critic.") for key in missing):
+            raise ValueError("Fast actor-only initialization architecture mismatch")
+    else:
+        agent.fast_agent.ppo.policy.load_state_dict(checkpoint["fast_agent"], strict=True)
+    if agent.fast_agent.batch_credit and not actor_only:
         agent.fast_agent.ppo.load_value_normalization_state(checkpoint["fast_value_normalization"])
     return {"path": str(path.resolve()), "source_update": checkpoint.get("metadata", {}).get("update"),
-            "scope": "fast_weights_and_value_scale_only", "resume": False}
+            "scope": "fast_actor_only_new_critic" if actor_only else "fast_weights_and_value_scale_only", "resume": False}
 
 
 def checkpoint_run_args(path: Path, checkpoint: dict) -> dict:
@@ -4142,14 +4178,63 @@ def checkpoint_run_args(path: Path, checkpoint: dict) -> dict:
     return {}
 
 
+def apply_proposed_design(args):
+    """Opt-in preset; archived commands/checkpoints never silently upgrade."""
+    explicit = {token.split("=", 1)[0] for token in sys.argv[1:]}
+    saved = {}
+    if getattr(args, "load_checkpoint", None):
+        checkpoint = torch.load(Path(args.load_checkpoint), map_location="cpu")
+        saved = checkpoint_run_args(Path(args.load_checkpoint), checkpoint)
+    requested = getattr(args, "proposed_design", "auto")
+    args.proposed_design = saved.get("proposed_design", "legacy") if requested == "auto" else requested
+    if args.proposed_design != "joint-credit-v2":
+        # New flags must also survive a legacy-design full resume.
+        for name, default in (("fast_update_chunks", 1), ("fast_independent_critic", False),
+                              ("checkpoint_probe_interval", 10)):
+            if "--"+name.replace("_", "-") not in explicit:
+                setattr(args, name, saved.get(name, getattr(args, name, default)))
+        return args
+    if saved and saved.get("proposed_design", "legacy") != "joint-credit-v2":
+        raise ValueError("joint-credit-v2 changes Slow action semantics: start a fresh run, not full legacy resume")
+    required = {"training_repair":"batch-credit-v1", "slow_deployment_context":"deployment-aware-v2",
+                "slow_learning_repair":"prefix-credit-v2", "slow_allocation_mode":"stage-budget-v3",
+                "fast_chain_context":"chain-kkt-v3", "fast_policy_kind":"gat_node_scorer",
+                "joint_training_schedule":"simultaneous", "train_mode":"joint"}
+    for name, value in required.items():
+        current = getattr(args, name, None)
+        if "--"+name.replace("_", "-") in explicit and current not in {value, "auto"}:
+            raise ValueError(f"joint-credit-v2 requires --{name.replace('_','-')} {value}")
+        setattr(args, name, value)
+    defaults = {"fast_update_chunks":4, "fast_independent_critic":True,
+                "slow_tail_latency_coef":0., "slow_deployment_memory_coef":0.,
+                "slow_deployment_storage_coef":0., "slow_deadline_violation_coef":0.,
+                "slow_colocation_coef":0., "slow_colocation_final_coef":0.,
+                "slow_shared_return_coef":0., "slow_counterfactual_credit_coef":0.,
+                "slow_count_global_advantage_coef":0., "slow_placement_global_advantage_coef":0.,
+                "slow_placement_global_attribution_coef":0., "slow_idle_replica_coef":0.,
+                "slow_count_unused_replica_coef":0., "slow_placement_idle_coef":0.,
+                "slow_placement_compute_coef":0., "slow_count_shortage_coef":0.,
+                "slow_replica_ablation_samples":0, "fast_oracle_diagnostic_requests":0,
+                "fast_counterfactual_credit_coef":0., "fast_counterfactual_credit_final_coef":0.}
+    for name, value in defaults.items():
+        if not {"--"+name.replace("_", "-"), "--no-"+name.replace("_", "-")} & explicit:
+            setattr(args, name, saved.get(name, value))
+    if getattr(args, "fast_warmup_updates", 0) or getattr(args, "slow_warmup_updates", 0):
+        raise ValueError("joint-credit-v2 keeps simultaneous joint training without phased warmups")
+    return args
+
+
 def main() -> None:
     args = parse_args()
+    args = apply_proposed_design(args)
     args.fast_chain_context = resolve_fast_chain_context(args)
     args.training_repair = resolve_training_repair(args)
     args.slow_deployment_context = resolve_slow_deployment_context(args)
     args.slow_learning_repair = resolve_slow_learning_repair(args)
     if args.load_checkpoint and args.init_fast_checkpoint:
         raise ValueError("--load-checkpoint and --init-fast-checkpoint are mutually exclusive")
+    if args.init_fast_actor_only and not args.init_fast_checkpoint:
+        raise ValueError("--init-fast-actor-only requires --init-fast-checkpoint")
     args.rollout_acceleration_version = "vector-features-v1"
     args.network_allocator_version = "shared-nic-certified-v4"
     if args.training_repair == "batch-credit-v1":
@@ -4243,6 +4328,8 @@ def main() -> None:
             len(_load_strata_for_args(args)),
         ),
         fast_full_batch_kl_stop=args.fast_full_batch_kl_stop,
+        fast_update_chunks=args.fast_update_chunks,
+        fast_independent_critic=args.fast_independent_critic,
         slow_reward_scale=args.reward_scale,
         slow_tail_latency_coef=args.slow_tail_latency_coef,
         slow_colocation_coef=args.slow_colocation_coef,
@@ -4294,6 +4381,10 @@ def main() -> None:
     print(f"  training_design={args.training_design}")
     print(f"  slow_deployment_context={args.slow_deployment_context}")
     print(f"  slow_learning_repair={args.slow_learning_repair}")
+    print(f"  proposed_design={args.proposed_design} fast_update_chunks={args.fast_update_chunks} "
+          f"fast_independent_critic={args.fast_independent_critic}")
+    if args.proposed_design == "joint-credit-v2":
+        print("  slow_credit=real_window_return_with_prefix_GAE legacy_factorized_terms=diagnostics_only legacy_window_critic=disabled")
     if args.fast_initialization:
         print(f"  Fast initialized from {args.fast_initialization['path']}; fresh Slow, optimizers and run counters")
     print(f"  fast_policy_kind={args.fast_policy_kind}")
@@ -4589,6 +4680,12 @@ def main() -> None:
         loaded_metadata.get("best_checkpoint_score", float("inf"))
     )
     best_checkpoint_ready = bool(loaded_metadata.get("best_checkpoint_ready", False))
+    joint_credit_v2 = args.proposed_design == "joint-credit-v2"
+    best_probe_score = float(loaded_metadata.get("best_probe_score", float("inf")))
+    reference_checkpoint_compute = float(loaded_metadata.get("checkpoint_reference_compute",
+        np.mean([user.service_weights for user in env.scenario.users], axis=0)
+        @ np.asarray([sum(stage.compute_gcycles_mean for stage in service.stages)
+                      for service in env.scenario.services]) * env.config.task_compute_scale))
     raw_selection_history = loaded_metadata.get("checkpoint_selection_history", [])
     checkpoint_selection_history: list[dict[str, float]] = []
     if isinstance(raw_selection_history, list):
@@ -4598,6 +4695,7 @@ def main() -> None:
                     {
                         "latency_s": float(item.get("latency_s", np.nan)),
                         "load_multiplier": float(item.get("load_multiplier", np.nan)),
+                        "compute_gcycles": float(item.get("compute_gcycles", np.nan)),
                     }
                 )
     reference_checkpoint_load = checkpoint_reference_load(args)
@@ -5302,6 +5400,8 @@ def main() -> None:
                 append_log(run_dir / "logs" / "slow_deployment_metrics.csv", {
                     **episode_context, "context_version": args.slow_deployment_context,
                     "budget_fraction": one_stats.get("slow_budget_fraction", 0.0),
+                    "allocation_mode":agent.slow_agent.allocation_mode,
+                    "quota_json":json.dumps(agent.slow_agent.last_stage_budget_diagnostics, separators=(",", ":")),
                     "stages_json": json.dumps(agent.slow_agent.last_deployment_diagnostics, separators=(",", ":")),
                 })
             if (
@@ -5384,7 +5484,8 @@ def main() -> None:
         if agent.slow_agent.deployment_aware and slow_updated:
             # An explicitly upgraded resume may append to an old run. Do not
             # silently append wider rows under the old CSV header.
-            diagnostic_file = ("slow_update_metrics_conditional_replay_v1.csv"
+            diagnostic_file = ("slow_update_metrics_prefix_credit_v2.csv" if agent.slow_agent.learning_repair == "prefix-credit-v2" else
+                               "slow_update_metrics_conditional_replay_v1.csv"
                                if agent.slow_agent.learning_repair != "none" else "slow_update_metrics.csv")
             append_log(run_dir / "logs" / diagnostic_file, {
                 "update": update + 1, "context_version": args.slow_deployment_context,
@@ -5395,13 +5496,30 @@ def main() -> None:
             {
                 "latency_s": float(stats["avg_latency_s"]),
                 "load_multiplier": float(load_multiplier_mean),
+                "compute_gcycles": float(stats["demand_expected_compute_gcycles"]),
             }
         )
-        checkpoint_score, checkpoint_load_slope = load_adjusted_rolling_latency(
-            checkpoint_selection_history,
-            args.best_checkpoint_window,
-            reference_checkpoint_load,
-        )
+        if joint_credit_v2:
+            checkpoint_selection_history = checkpoint_selection_history[-max(80, args.best_checkpoint_window):]
+            from edge_drl.checkpoint_selection import recent_workload_score
+            checkpoint_score, checkpoint_load_slope = recent_workload_score(
+                checkpoint_selection_history, args.best_checkpoint_window,
+                reference_checkpoint_load, reference_checkpoint_compute)
+        else:
+            checkpoint_score, checkpoint_load_slope = load_adjusted_rolling_latency(
+                checkpoint_selection_history,
+                args.best_checkpoint_window,
+                reference_checkpoint_load,
+            )
+        probe_result = None
+        if joint_credit_v2 and ((update+1) == 1 or (update+1) % args.checkpoint_probe_interval == 0
+                                or (update+1) == target_update):
+            from edge_drl.checkpoint_selection import checkpoint_probe
+            probe_result = checkpoint_probe(agent, env.config, seed=args.seed,
+                samples=args.sampled_seconds_per_window, hold_cap=args.sampling_max_interval_seconds)
+            append_log(run_dir / "logs" / "checkpoint_probe_metrics.csv", {"update":update+1, **probe_result})
+            print(f"  checkpoint_probe update={update+1} latency={1000*probe_result['mean_latency_s']:.2f}ms "
+                  f"minutes={probe_result['minutes']} steps={probe_result['sampled_steps']}", flush=True)
         checkpoint_ready = len(checkpoint_selection_history) >= args.best_checkpoint_window
         slow_lr_decayed = slow_lr_controller.observe(
             checkpoint_score,
@@ -5476,6 +5594,7 @@ def main() -> None:
             "window_in_episode": window_in_episode,
             "requests": int(stats["requests"]),
             "request_events": int(stats["request_events"]),
+            "sampled_request_events": int(stats.get("sampled_request_events", 0.)),
             "settlement_steps": int(stats["settlement_steps"]),
             "logical_steps": int(round(stats["logical_steps"])),
             "temporal_sampling_fraction": stats["temporal_sampling_fraction"],
@@ -5663,6 +5782,8 @@ def main() -> None:
             "slow_windows_buffered": int(slow_windows_buffered),
             "checkpoint_score": checkpoint_score,
             "checkpoint_score_load_slope": checkpoint_load_slope,
+            "checkpoint_probe_latency_s": probe_result["mean_latency_s"] if probe_result else float("nan"),
+            "checkpoint_probe_best_latency_s": min(best_probe_score, probe_result["mean_latency_s"]) if probe_result else best_probe_score,
             "slow_count_lr": slow_count_lr,
             "slow_stage_lr": slow_stage_lr,
             "slow_placement_lr": slow_placement_lr,
@@ -6118,6 +6239,9 @@ def main() -> None:
             if should_replace_best
             else best_checkpoint_score,
             "best_checkpoint_ready": best_checkpoint_ready or checkpoint_ready,
+            "best_probe_score": min(best_probe_score, probe_result["mean_latency_s"]) if probe_result else best_probe_score,
+            "checkpoint_reference_compute": reference_checkpoint_compute,
+            "proposed_design": args.proposed_design,
             "checkpoint_score": checkpoint_score,
             "checkpoint_score_load_slope": checkpoint_load_slope,
             "checkpoint_reference_load": reference_checkpoint_load,
@@ -6132,19 +6256,26 @@ def main() -> None:
             best_checkpoint_ready = checkpoint_ready
             common_checkpoint_metadata["best_checkpoint_score"] = best_checkpoint_score
             common_checkpoint_metadata["best_checkpoint_ready"] = best_checkpoint_ready
-            save_checkpoint(
-                agent,
-                save_dir / "best.pt",
-                {**common_checkpoint_metadata, "selection_kind": "load_adjusted_rolling_train"},
-                training_random_streams,
-            )
+            if not joint_credit_v2:
+                save_checkpoint(
+                    agent,
+                    save_dir / "best.pt",
+                    {**common_checkpoint_metadata, "selection_kind": "load_adjusted_rolling_train"},
+                    training_random_streams,
+                )
             if checkpoint_ready:
                 save_checkpoint(
                     agent,
                     save_dir / "best_rolling.pt",
-                    {**common_checkpoint_metadata, "selection_kind": "load_adjusted_rolling_train"},
+                    {**common_checkpoint_metadata, "selection_kind": "recent_workload_rolling_train_v2" if joint_credit_v2 else "load_adjusted_rolling_train"},
                     training_random_streams,
                 )
+        if joint_credit_v2 and args.save_best and probe_result and probe_result["mean_latency_s"] < best_probe_score:
+            best_probe_score = probe_result["mean_latency_s"]
+            common_checkpoint_metadata["best_probe_score"] = best_probe_score
+            save_checkpoint(agent, save_dir / "best.pt", {
+                **common_checkpoint_metadata, "selection_kind":"post_update_nominal_probe_v2",
+                "selection_score":best_probe_score, "probe_result":probe_result}, training_random_streams)
         if eval_stats and args.save_best:
             selection_latency = float(eval_stats["eval_avg_latency_s"])
             if selection_latency < best_latency:
@@ -6220,6 +6351,9 @@ def main() -> None:
                 "best_latency_s": best_latency,
                 "best_checkpoint_score": best_checkpoint_score,
                 "best_checkpoint_ready": best_checkpoint_ready,
+                "best_probe_score": best_probe_score,
+                "checkpoint_reference_compute": reference_checkpoint_compute,
+                "proposed_design": args.proposed_design,
                 "checkpoint_score": checkpoint_score,
                 "checkpoint_score_load_slope": checkpoint_load_slope,
                 "checkpoint_reference_load": reference_checkpoint_load,

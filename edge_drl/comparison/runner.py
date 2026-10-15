@@ -114,6 +114,7 @@ def run_comparison(
     learned_fast_eval_mode: str = "deterministic",
     routing_repeats_override: int | None = None,
     baseline_implementation: str = GREEDY_IMPLEMENTATION,
+    sampling_protocol: str = "auto",
 ) -> Path:
     schemes = tuple(canonical_scheme_id(name) for name in schemes)
     if baseline_implementation not in BASELINE_IMPLEMENTATIONS:
@@ -150,6 +151,14 @@ def run_comparison(
             "to name one checkpoint file"
         )
     checkpoint_path, checkpoint_args, checkpoint_internal = load_checkpoint_configuration(checkpoint)
+    if sampling_protocol == "auto":
+        sampling_protocol = ("training-equivalent-v2" if checkpoint_args.get("proposed_design") == "joint-credit-v2"
+                             else "legacy-left-hold")
+    if sampling_protocol not in {"legacy-left-hold", "training-equivalent-v2"}:
+        raise ValueError("unknown comparison sampling protocol")
+    if phase == 3:
+        _require_phase2_validation(phase2_validation_run, schemes=schemes,
+            baseline_implementation=baseline_implementation, sampling_protocol=sampling_protocol)
     unknown = sorted(set(schemes) - set(AVAILABLE_SCHEMES))
     if unknown:
         raise ValueError(f"formal comparison does not include schemes: {unknown}")
@@ -181,6 +190,10 @@ def run_comparison(
         else min(float(sampled_seconds_per_window), deployment_window_seconds)
     )
     represented_seconds = deployment_window_seconds / max(effective_sampled_seconds, 1.0)
+    if sampling_protocol == "training-equivalent-v2":
+        from edge_drl.sampling import interval_seconds
+        represented_seconds = interval_seconds(deployment_window_seconds, sampled_seconds_per_window,
+                                               checkpoint_args.get("sampling_max_interval_seconds", 0.))
     selected_run_id = run_id or f"phase{phase}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output = Path(output_root) / selected_run_id
     output.mkdir(parents=True, exist_ok=False)
@@ -202,6 +215,7 @@ def run_comparison(
             baseline_implementation == GREEDY_IMPLEMENTATION and bool(set(schemes) & {"DARP", "DPMS"})
         ),
         "baseline_implementation": baseline_implementation,
+        "sampling_protocol": sampling_protocol,
         "scheme_implementations": {
             name: baseline_implementation if name in {"DARP", "DPMS"} else "unchanged"
             for name in schemes
@@ -353,6 +367,8 @@ def run_comparison(
                             routing_repeat=repeat,
                             sampled_seconds_per_window=sampled_seconds_per_window,
                             service_latency_rows=service_latency_rows,
+                            sampling_protocol=sampling_protocol,
+                            sampling_max_interval_seconds=checkpoint_args.get("sampling_max_interval_seconds", 0.),
                         )
                         for service_row in service_latency_rows[service_rows_start:]:
                             service_row["scheme_implementation"] = metadata["scheme_implementations"][scheme_name]
@@ -432,6 +448,7 @@ def run_comparison(
                 "expected_rows": len(points) * len(eval_seeds) * len(schemes) * routing_repeats,
                 "schemes": list(schemes),
                 "baseline_implementation": baseline_implementation,
+                "sampling_protocol": sampling_protocol,
             },
         )
     return output
@@ -440,6 +457,7 @@ def run_comparison(
 def _require_phase2_validation(
     run: str | Path | None, *, schemes: tuple[str, ...] = FORMAL_SCHEMES,
     baseline_implementation: str = "legacy-v1",
+    sampling_protocol: str | None = None,
 ) -> None:
     if run is None:
         raise ValueError("Phase 3 requires --phase2-validation-run from a successful complete Phase 2 run")
@@ -457,6 +475,8 @@ def _require_phase2_validation(
     if (set(map(canonical_scheme_id, schemes)) & {"DARP", "DPMS"}
             and payload.get("baseline_implementation", "legacy-v1") != baseline_implementation):
         raise ValueError("Phase 2 baseline implementation differs from the requested Phase 3 design")
+    if sampling_protocol is not None and payload.get("sampling_protocol", "legacy-left-hold") != sampling_protocol:
+        raise ValueError("Phase 2 temporal sampling protocol differs from the requested Phase 3 design")
 
 
 def _make_scheme(

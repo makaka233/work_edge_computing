@@ -2,8 +2,10 @@
 
 本包保留当前项目 Proposed 的原始训练代码与功能：Slow PPO（Count、Stage、
 Placement）+ Fast PPO、串行服务链、计算KKT与共享NIC连续带宽分配。
-核心 Python 文件未经裁剪或重写。包含最新 shared-nic-certified-v4 严格精度修复，
-不包含已撤回的 guarded-minibatch-v2／独立 Fast Critic 改动。
+核心 Python 文件未经裁剪或重写。包含 shared-nic-certified-v4 严格精度修复和
+最新 `joint-credit-v2`：阶段额度、部署前缀信用、竞争观测、独立 Fast Critic、
+完整epoch内的受控多步PPO、更新后checkpoint探针与版本化抽样流程。
+实现与适用边界见 `docs/JOINT_CREDIT_V2.md`；不是之前撤回的实验版本。
 
 ## 安装与独立运行
 
@@ -24,7 +26,9 @@ Python、第三方库和CUDA驱动不包含在这个**代码**压缩包中。
 
 `verify_bundle.py` 在本包中创建`_verification_runs`，验证完整60分钟episode、
 联合更新、同目录续训、模型加载、Fast-only初始化、绘图及校准工具。
-采用8节点、2服务的低成本配置，**不是性能/收敛证明**。
+采用8节点、2服务、每分钟600请求的低成本配置，启用新版设计，
+检查Slow/Fast更新、阶段额度、独立Critic、更新后探针及真实采样计数。
+**不是性能/收敛证明**。
 要重复运行完整验证，请使用新的解压目录，旧验证产物不会自动删除。
 只检查哈希、导入、32节点物理场景签名及NIC精度：
 
@@ -43,14 +47,25 @@ python .\verify_bundle.py --imports-only
 - seed2026，mec-latency200，12000用户、32节点、10服务；
 - 60分钟episode、10分钟部署窗口；每update十二窗口（两个完整episode）；
 - 每窗口六个抽样秒，维持上限100秒，stratified-jitter；
-- batch-credit-v1、deployment-aware-v2、budget-continuous-v2；
+- joint-credit-v2、batch-credit-v1、deployment-aware-v2、stage-budget-v3、prefix-credit-v2；
 - Slow/Fast始终joint，Count/Stage/Placement/Fast分别2/3/3/4 epochs；
-- masked GAT Fast，chain-kkt-v3，无oracle／counterfactual初始化；
+- masked GAT Fast、chain-kkt-v3、独立Critic；4个epochs最多16个接受的优化步骤；
+- 共同目标默认为平均时延，不额外收取P95/RAM/SSD/违约价格，物理硬约束不变；
 - shared-nic、audited-v1服务预算、300Mbps接入+10ms，reward-scale10；
-- 不启用周期性评估（eval-interval0），保存原有必要检查点和分级日志；
+- 不启用原周期性评估（eval-interval0）；每10次更新及首末更新执行独立10分钟基准探针，
+  按更新后策略选择best.pt，并保留latest/last/滚动最优/快照和分级日志；
 - 数值库线程限制为1。训练时间与收敛情况不能由迁移包保证。
 
 脚本支持`-RunName 自定义名称`；`-Device cpu`可在无GPU环境运行。
+默认完全从头初始化，不依赖本项目原机器的checkpoint。若已复制旧训练文件夹，
+可选择仅迁移Fast Actor，Slow、新Critic和优化器从头开始，随后同时联合训练：
+
+```powershell
+.\train_proposed.ps1 -Updates 80 -InitFastCheckpoint ".\runs\<旧运行名称>\checkpoints\latest.pt"
+```
+
+也保留仓库原启动脚本 `scripts/train_joint_credit_v2.ps1`；在纯代码包中使用它时，
+请加 `-FromScratch`，或提供实际存在的 `-InitFastCheckpoint`，因为包不含旧模型。
 原训练入口的其他模式、参数、内置评估和可选BC功能均保留：
 
 ```powershell
@@ -80,6 +95,9 @@ python .\train_dual_ppo.py --help
 ```
 
 其他历史场景请使用原入口并传入它们原本的完整训练参数，不套用当前配置脚本。
+续训脚本使用 `--proposed-design auto` 保留checkpoint的设计版本。
+旧budget-continuous-v2模型不能完整续训成stage-budget-v3；想启用新版必须新开运行，
+可用上面的Fast Actor迁移方式，不能伪称完整续训。
 `--append-log`不可遗漏，否则原主日志被清空。
 如果异常中断留下了超过checkpoint更新编号的部分rollout/episode记录，
 先备份并归档未提交记录，再同目录续训，避免重复计入绘图。
@@ -103,9 +121,9 @@ python .\scripts\calibrate_environment.py --output .\reports\resource_report.jso
 
 - `train_dual_ppo.py`：原Proposed完整入口，含训练/内置评估/断点恢复。
 - `edge_drl/agents`、`models`、`env`、`allocators`：原核心实现与全部必要依赖。
-- `edge_drl/comparison`：仅通用检查点和请求回放模块；不是额外对比算法。
+- `edge_drl/comparison`：必要的检查点、请求回放与Proposed探针评估模块；不含其他对比算法。
 - `scripts`：原训练绘图、趋势分析和资源/抽样校准工具。
-- `docs`：当前场景、训练信用、Slow条件观测和NIC严格精度说明。
+- `docs`：当前场景、joint-credit-v2、训练信用、Slow条件观测和NIC严格精度说明。
 - `validation/fixtures`：真实NIC故障及病态尺度测试数据，无实验训练产物。
 - `manifest.json`：打包时间、原Git HEAD、本地改动、逐文件哈希、依赖环境。
 

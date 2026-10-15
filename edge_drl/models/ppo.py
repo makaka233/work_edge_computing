@@ -309,6 +309,7 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         num_nodes: int,
         hidden_dim: int = 128,
         detach_critic_backbone: bool = False,
+        independent_critic: bool = False,
     ):
         super().__init__()
         self.global_dim = global_dim
@@ -316,6 +317,7 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         self.edge_feature_dim = edge_feature_dim
         self.num_nodes = num_nodes
         self.detach_critic_backbone = bool(detach_critic_backbone)
+        self.independent_critic = bool(independent_critic)
         self.node_offset = global_dim
         self.edge_offset = global_dim + num_nodes * node_feature_dim
 
@@ -345,7 +347,7 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         self.critic = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 2 + (self.edge_offset if independent_critic else 0), hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -384,6 +386,10 @@ class GraphAttentionNodeScoringActorCritic(nn.Module):
         critic_input = torch.cat([global_emb, pooled_nodes], dim=-1)
         if self.detach_critic_backbone:
             critic_input = critic_input.detach()
+        if self.independent_critic:
+            # Explicit remaining-batch globals and ALL node ledgers, not just
+            # an actor-trained masked graph pool. Value gradients stay isolated.
+            critic_input = torch.cat([states[:, :self.edge_offset], critic_input], dim=-1)
         values = self.critic(critic_input).squeeze(-1)
         return dist, values
 
@@ -655,6 +661,8 @@ class PPOAgent:
         slow_learning_repair: bool = False,
         conditional_replay_windows: int = 96,
         conditional_replay_decay: float = .9,
+        prefix_credit: bool = False,
+        guarded_update_chunks: int = 1,
         device: str = "cpu",
     ):
         self.gamma = gamma
@@ -680,6 +688,9 @@ class PPOAgent:
         self.full_batch_kl_stop = bool(full_batch_kl_stop)
         self.normalize_value_targets = bool(normalize_value_targets)
         self.guarded_epochs = bool(guarded_epochs)
+        self.guarded_update_chunks = int(guarded_update_chunks)
+        if self.guarded_update_chunks < 1:
+            raise ValueError("guarded_update_chunks must be positive")
         self.critic_extra_epochs = int(critic_extra_epochs)
         if self.critic_extra_epochs < 0:
             raise ValueError("critic_extra_epochs must be nonnegative")
@@ -693,7 +704,8 @@ class PPOAgent:
             if not independent_critic or not guarded_epochs:
                 raise ValueError("Slow learning repair requires an independent critic and guarded epochs")
             from edge_drl.models.slow_learning import SlowConditionalLearning
-            self.slow_conditional_learning = SlowConditionalLearning(conditional_replay_windows, decay=conditional_replay_decay)
+            self.slow_conditional_learning = SlowConditionalLearning(
+                conditional_replay_windows, decay=conditional_replay_decay, prefix_credit=prefix_credit)
         if self.guarded_epochs and not self.full_batch_kl_stop:
             raise ValueError("guarded_epochs requires full_batch_kl_stop")
         self.device = torch.device(device)
@@ -720,6 +732,7 @@ class PPOAgent:
                 num_nodes=num_nodes,
                 hidden_dim=hidden_dim,
                 detach_critic_backbone=detach_critic_backbone,
+                independent_critic=independent_critic,
             ).to(self.device)
         elif policy_kind in {
             "slow_gat_node",
@@ -1264,6 +1277,11 @@ class PPOAgent:
         excessive *post-step* KL, restoring both parameters and Adam moments,
         and backtrack the same gradient. A rejected step is never committed.
         """
+        if self.guarded_update_chunks > 1:
+            from edge_drl.models.guarded_chunks import update_guarded_chunks
+            return update_guarded_chunks(
+                self, actions_np, old_logprobs_np, advantages_np, value_targets_np,
+                weights_np, group_ids_np, advantage_mean, advantage_std, critic_weights_np)
         n = len(actions_np)
         size = max(1, min(self.minibatch_size, n))
         batches = int(np.ceil(n / size))
@@ -1603,6 +1621,22 @@ class PPOAgent:
             if baseline_np.shape != (n,) or not np.isfinite(baseline_np).all():
                 raise ValueError("actor baseline must be finite and match actions")
         advantages_np = returns_np - baseline_np if actor_use_value_baseline else returns_np.copy()
+        prefix_metrics = {}
+        if self.slow_conditional_learning is not None and self.slow_conditional_learning.prefix_credit:
+            if critic_window_ids is None or not actor_use_value_baseline:
+                raise ValueError("prefix credit requires aligned windows and pre-action baselines")
+            from edge_drl.models.prefix_credit import prefix_advantages
+            # Only PREVIOUS-window prediction quality chooses lambda. Start at
+            # exact MC; gradually bootstrap only when the critic predicts well.
+            reliability = self.slow_conditional_learning.trace_reliability
+            trace_lambda = 1.0 - .05 * reliability
+            mc_std = float(np.std(advantages_np))
+            # Bellman bootstrapping uses RAW value predictions, not a shrunken
+            # control-variate baseline. Blend its correction conservatively.
+            raw_gae = prefix_advantages(returns_np, old_values_np, critic_window_ids, trace_lambda)
+            advantages_np = advantages_np + reliability * (raw_gae - (returns_np-old_values_np))
+            prefix_metrics = {"prefix_trace_lambda": trace_lambda, "mc_advantage_std": mc_std,
+                              "prefix_advantage_std": float(np.std(advantages_np))}
         if advantage_group_ids is not None:
             group_ids_np = np.asarray(advantage_group_ids)
             if group_ids_np.shape != (n,):
@@ -1703,6 +1737,7 @@ class PPOAgent:
             )
             metrics.update({"explained_variance": explained_variance, "advantage_mean": advantage_mean,
                             "advantage_std": advantage_std, "combined_advantage_std": combined_advantage_std})
+            metrics.update(prefix_metrics)
             return metrics
         if self.guarded_epochs:
             metrics = self._update_guarded_epochs(

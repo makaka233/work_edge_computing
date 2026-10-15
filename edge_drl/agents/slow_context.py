@@ -20,7 +20,8 @@ STAGE_COST_DIM = 6
 class SlowDeploymentContext:
     """Fixed demand/network data for ONE planning call; deployment stays live."""
 
-    def __init__(self, env, demand):
+    def __init__(self, env, demand, competition_aware=False):
+        self.competition_aware = bool(competition_aware)
         self.nodes = env.config.num_edge_nodes
         self.services = env.config.num_service_types
         self.stages = env.config.max_service_stages
@@ -67,6 +68,14 @@ class SlowDeploymentContext:
         selected = deployment.reshape(self.size, self.nodes)
         pooled = selected @ self.capacities
         proxy = np.divide(self.numerators, pooled, out=np.zeros(self.size), where=pooled > 0)
+        if self.competition_aware:
+            # Capacity-weighted routing is an observation-only approximation.
+            # Include single-request work AND other services in the same causal
+            # phase. Never give every service exclusive ownership of a node.
+            roots, _, _ = self._competition(deployment, pooled)
+            proxy = (self.mass*self.compute*selected.sum(axis=1)
+                     + self.mass*np.sqrt(self.compute)*(selected*roots).sum(axis=1)) / np.maximum(pooled,1e-9)
+            proxy = np.where(self.valid & (pooled > 0), proxy, 0.)
         values = np.column_stack([
             self.valid, selected.sum(axis=1) / self.nodes, pooled / self.total_compute,
             np.log1p(self.arrival * self.mass * self.compute), np.log1p(1000 * proxy),
@@ -75,13 +84,45 @@ class SlowDeploymentContext:
         ])
         return values, pooled, proxy
 
+    def _competition(self, deployment, pooled):
+        selected = deployment.reshape(self.size,self.nodes)
+        theta = selected*self.capacities / np.maximum(pooled[:,None],1e-9)
+        root = self.arrival*self.mass*np.sqrt(self.compute)
+        own = root[:,None]*theta
+        pooled_roots = np.zeros((self.stages,self.nodes))
+        pooled_h = np.zeros_like(pooled_roots)
+        h = self.mass[:,None]*np.sqrt(self.compute[:,None])*selected / np.maximum(pooled[:,None],1e-9)
+        for phase in range(self.stages):
+            pooled_roots[phase] = own[phase::self.stages].sum(axis=0)
+            pooled_h[phase] = h[phase::self.stages].sum(axis=0)
+        phase_ids = np.arange(self.size) % self.stages
+        return pooled_roots[phase_ids], own, pooled_h[phase_ids]-h
+
+    def candidate_gains(self, deployment, pooled, proxy):
+        if not self.competition_aware:
+            after = self.numerators[:,None] / np.maximum(pooled[:,None]+self.capacities,1e-9)
+            return np.maximum(proxy[:,None]-after,0.)
+        selected = deployment.reshape(self.size,self.nodes)
+        roots, own, other_h = self._competition(deployment,pooled)
+        others = roots-own
+        root = self.arrival*self.mass*np.sqrt(self.compute)
+        after_pool = np.maximum(pooled[:,None]+self.capacities,1e-9)
+        after_own = (self.mass[:,None]*self.compute[:,None]*(selected.sum(axis=1)[:,None]+1)
+                     + self.mass[:,None]*np.sqrt(self.compute[:,None]) * (
+                         (selected*others).sum(axis=1)[:,None]+others+root[:,None])) / after_pool
+        # Redistribution of this stage's arrivals also changes other services'
+        # sharing cost; include that externality in the observation surrogate.
+        previous = (selected*self.capacities*other_h).sum(axis=1)
+        externality = root[:,None]*(previous[:,None]*(1/after_pool-1/np.maximum(pooled[:,None],1e-9))
+                                   + self.capacities*other_h/after_pool)
+        return np.maximum(proxy[:,None]-after_own-externality,0.)
+
     def stage_costs(self, deployment, remaining_memory, remaining_storage):
         selected = deployment.reshape(self.size, self.nodes)
         _, pooled, proxy = self.inventory(deployment)
         feasible = (~selected & (remaining_memory[None, :] + 1e-9 >= self.memory[:, None])
                     & (remaining_storage[None, :] + 1e-9 >= self.storage[:, None]) & self.valid[:, None])
-        after = self.numerators[:, None] / np.maximum(pooled[:, None] + self.capacities, 1e-9)
-        gain = np.maximum(proxy[:, None] - after, 0)
+        gain = self.candidate_gains(deployment, pooled, proxy)
         gain = np.where(feasible, gain, 0)
         footprint = self.memory[:, None] / self.memory_capacity + self.storage[:, None] / self.storage_capacity
         values = np.column_stack([
@@ -105,7 +146,7 @@ class SlowDeploymentContext:
                           pooled[i] / self.total_compute, np.log1p(1000 * proxy[i])]
             selected = deployment[service_id, stage_id]
             # Ineligible nodes are still observable; action feasibility comes ONLY from masks.
-            gain = np.maximum(proxy[i] - self.numerators[i] / np.maximum(pooled[i] + self.capacities, 1e-9), 0)
+            gain = self.candidate_gains(deployment, pooled, proxy)[i]
             gain[selected] = 0
             sources = self.home_weights[:, service_id]
             if stage_id > 0:

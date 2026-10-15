@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 
 class SlowConditionalLearning:
-    def __init__(self, windows=96, samples_per_window=8, decay=.9):
+    def __init__(self, windows=96, samples_per_window=8, decay=.9, prefix_credit=False):
         self.windows = int(windows)
         self.samples_per_window = int(samples_per_window)
         self.decay = float(decay)
@@ -22,9 +22,12 @@ class SlowConditionalLearning:
         self.replay = []
         self.update_index = 0
         self.baseline_coef = 0.0
+        self.prefix_credit = bool(prefix_credit)
+        self.trace_reliability = 0.0
 
     def state_dict(self):
         return {"update_index": self.update_index, "baseline_coef": self.baseline_coef,
+                "trace_reliability": self.trace_reliability, "prefix_credit": self.prefix_credit,
                 "replay": [{"states": torch.from_numpy(x["states"].copy()),
                             "returns": torch.from_numpy(x["returns"].copy()),
                             "update": x["update"]} for x in self.replay]}
@@ -32,6 +35,9 @@ class SlowConditionalLearning:
     def load_state_dict(self, state):
         self.update_index = int(state["update_index"])
         self.baseline_coef = float(state["baseline_coef"])
+        if bool(state.get("prefix_credit", False)) != self.prefix_credit:
+            raise ValueError("Slow prefix credit mode differs from checkpoint")
+        self.trace_reliability = float(state.get("trace_reliability", 0.0))
         if not 0 <= self.baseline_coef <= 1:
             raise ValueError("invalid conditional baseline multiplier")
         self.replay = [{"states": x["states"].detach().cpu().numpy().copy(),
@@ -60,6 +66,7 @@ class SlowConditionalLearning:
         accepted = backtracks = actor_steps = consumed = checks = 0
         stopped = False
         metrics = {"loss": 0., "policy_loss": 0., "value_loss": 0.}
+        gradient_metrics = {"actor_gradient_norm": float("nan"), "entropy_gradient_norm": float("nan")}
         rates = [float(g["lr"]) for g in ppo.optimizer.param_groups]
         for _ in range(ppo.k_epochs):
             order = np.random.permutation(n)
@@ -88,7 +95,15 @@ class SlowConditionalLearning:
                     ratio = (dist.log_prob(acts) - old).exp()
                     surrogate = torch.minimum(ratio * adv, ratio.clamp(1-ppo.eps_clip, 1+ppo.eps_clip) * adv)
                     policy_loss = -(surrogate*w).sum() / w.sum().clamp_min(1e-8)
-                    loss = policy_loss - ppo.entropy_coef * (dist.entropy()*w).sum() / w.sum().clamp_min(1e-8)
+                    entropy_loss = -ppo.entropy_coef * (dist.entropy()*w).sum() / w.sum().clamp_min(1e-8)
+                    loss = policy_loss + entropy_loss
+                    if self.update_index % 10 == 0 and accepted == 0 and attempt == 0 and start == 0:
+                        actor_parameters = [p for name,p in ppo.policy.named_parameters()
+                                            if p.requires_grad and not name.startswith("critic.")]
+                        for label, objective in (("actor_gradient_norm",policy_loss),
+                                                 ("entropy_gradient_norm",entropy_loss)):
+                            grads = torch.autograd.grad(objective, actor_parameters, retain_graph=True, allow_unused=True)
+                            gradient_metrics[label] = float(torch.sqrt(sum(g.square().sum() for g in grads if g is not None)))
                     ppo.optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     ppo._clip_policy_gradients()
@@ -142,7 +157,9 @@ class SlowConditionalLearning:
         covariance = np.average(centered_returns*centered_values, weights=critic_weights)
         optimal = float(np.clip(covariance / max(variance, 1e-8), 0., 1.))
         self.baseline_coef = .8 * self.baseline_coef + .2 * optimal
+        self.trace_reliability = .8 * self.trace_reliability + .2 * float(np.clip(before["ev"], 0, 1))
         metrics.update(critic_metrics)
+        metrics.update(gradient_metrics)
         metrics["value_loss"] = critic_metrics["critic_extra_value_loss"]
         metrics.update({"epochs_completed": float(accepted), "optimizer_steps": float(actor_steps),
                         "minibatches_completed": float(consumed), "minibatches_planned": float(ppo.k_epochs * int(np.ceil(n/size))),

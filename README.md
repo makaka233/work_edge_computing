@@ -1,5 +1,10 @@
 # Edge DRL for Staged Edge Services
 
+Proposed joint-learning repair (opt-in): `--proposed-design joint-credit-v2`
+uses learned stage quotas, prefix credit, guarded multi-step Fast PPO and
+post-update checkpoint probes. See [design, compatibility and training](docs/JOINT_CREDIT_V2.md).
+PowerShell helper: `scripts/train_joint_credit_v2.ps1 -Updates 80`.
+
 Comparison update (2026-10-15): DARP and DPMS retain their scheme names but
 default to the versioned `demand-greedy-v2` design. Pass
 `--baseline-implementation legacy-v1` to reproduce their archived implementations.

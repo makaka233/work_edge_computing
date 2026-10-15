@@ -184,6 +184,7 @@ class SlowDeploymentPPOAgent:
     device: str = "cpu"
     _active_context: SlowDeploymentContext | None = field(default=None, init=False, repr=False)
     last_deployment_diagnostics: list[dict] = field(default_factory=list, init=False)
+    last_stage_budget_diagnostics: list[dict] = field(default_factory=list, init=False)
     last_update_diagnostics: dict = field(default_factory=dict, init=False)
     count_ppo: PPOAgent = field(init=False)
     stage_ppo: PPOAgent | None = field(init=False, default=None)
@@ -240,11 +241,11 @@ class SlowDeploymentPPOAgent:
     def __post_init__(self) -> None:
         if self.deployment_context not in {"legacy", SLOW_DEPLOYMENT_CONTEXT}:
             raise ValueError("unknown Slow deployment context")
-        if self.learning_repair not in {"none", "conditional-replay-v1"}:
+        if self.learning_repair not in {"none", "conditional-replay-v1", "prefix-credit-v2"}:
             raise ValueError("unknown Slow learning repair")
         if self.learning_repair != "none" and not self.deployment_aware:
             raise ValueError("Slow learning repair requires deployment-aware-v2")
-        if self.deployment_aware and (not self.team_window_credit or self.allocation_mode != "budget-continuous-v2"):
+        if self.deployment_aware and (not self.team_window_credit or self.allocation_mode not in {"budget-continuous-v2", "stage-budget-v3"}):
             raise ValueError("deployment-aware-v2 requires repaired team credit and budget-continuous-v2")
         if self.team_window_credit and (not np.isfinite(self.team_value_coef) or self.team_value_coef <= 0):
             raise ValueError("conditional team critic requires a positive finite team_value_coef")
@@ -257,6 +258,7 @@ class SlowDeploymentPPOAgent:
             "global-incremental",
             "budget-incremental",
             "budget-continuous-v2",
+            "stage-budget-v3",
         }:
             raise ValueError(
                 "allocation_mode must be 'legacy-factorized', 'global-incremental', "
@@ -313,12 +315,14 @@ class SlowDeploymentPPOAgent:
             "global-incremental",
             "budget-incremental",
             "budget-continuous-v2",
+            "stage-budget-v3",
         }
         budget_allocation = self.allocation_mode in {
             "budget-incremental",
             "budget-continuous-v2",
+            "stage-budget-v3",
         }
-        continuous_budget = self.allocation_mode == "budget-continuous-v2"
+        continuous_budget = self.allocation_mode in {"budget-continuous-v2", "stage-budget-v3"}
         maximum_extra_replicas = (
             self.num_nodes * self.num_service_types * self.max_service_stages
         )
@@ -380,6 +384,7 @@ class SlowDeploymentPPOAgent:
             critic_lr=self.critic_lr if self.deployment_aware else None,
             critic_extra_epochs=max(self.critic_k_epochs - self.k_epochs, 0) if self.deployment_aware else 0,
             slow_learning_repair=self.learning_repair != "none",
+            prefix_credit=self.learning_repair == "prefix-credit-v2",
             conditional_replay_windows=self.critic_replay_windows,
             conditional_replay_decay=self.critic_replay_decay,
             full_batch_kl_stop=self.deployment_aware,
@@ -412,6 +417,7 @@ class SlowDeploymentPPOAgent:
             critic_lr=self.critic_lr if self.deployment_aware else None,
             critic_extra_epochs=max(self.critic_k_epochs - self.placement_ppo_epochs, 0) if self.deployment_aware else 0,
             slow_learning_repair=self.learning_repair != "none",
+            prefix_credit=self.learning_repair == "prefix-credit-v2",
             conditional_replay_windows=self.critic_replay_windows,
             conditional_replay_decay=self.critic_replay_decay,
             full_batch_kl_stop=self.deployment_aware,
@@ -469,6 +475,7 @@ class SlowDeploymentPPOAgent:
                 critic_lr=self.critic_lr if self.deployment_aware else None,
                 critic_extra_epochs=max(self.critic_k_epochs - (self.stage_k_epochs or self.k_epochs), 0) if self.deployment_aware else 0,
                 slow_learning_repair=self.learning_repair != "none",
+                prefix_credit=self.learning_repair == "prefix-credit-v2",
                 conditional_replay_windows=self.critic_replay_windows,
                 conditional_replay_decay=self.critic_replay_decay,
                 full_batch_kl_stop=self.deployment_aware,
@@ -504,7 +511,14 @@ class SlowDeploymentPPOAgent:
                   max(self.pending_budget_target_memory_gb - self.pending_budget_used_memory_gb, 0) / max(context.memory_capacity.sum(), 1e-9),
                   max(self.pending_budget_target_storage_gb - self.pending_budget_used_storage_gb, 0) / max(context.storage_capacity.sum(), 1e-9),
                   float(self.pending_budget_target_memory_gb > 0)]
-        return context.features(deployment, budget=budget, service_id=service_id, stage_id=stage_id)
+        global_features, node_features = context.features(
+            deployment, budget=budget, service_id=service_id, stage_id=stage_id)
+        visited = getattr(self, "_stage_budget_visited", None)
+        if self.allocation_mode == "stage-budget-v3" and visited is not None:
+            # Preserve visited stages even when Count chose zero extra replicas.
+            # Valid=1, valid+already-processed=2; no hidden executor-only state.
+            global_features[:context.size * INVENTORY_DIM:INVENTORY_DIM] += visited
+        return global_features, node_features
 
     def _placement_entropy_start(self) -> float:
         return float(self.entropy_coef if self.placement_entropy_coef is None else self.placement_entropy_coef)
@@ -585,7 +599,8 @@ class SlowDeploymentPPOAgent:
         remaining_storage = env.service_storage_capacities()
         demand = self._node_service_demand(env)
         if self.deployment_aware:
-            self._active_context = SlowDeploymentContext(env, demand)
+            self._active_context = SlowDeploymentContext(env, demand,
+                competition_aware=self.allocation_mode == "stage-budget-v3")
         self.pending_count_indices.clear()
         self.pending_placement_indices.clear()
         self.pending_count_stage_keys.clear()
@@ -604,20 +619,28 @@ class SlowDeploymentPPOAgent:
         self.pending_budget_used_memory_gb = 0.0
         self.pending_budget_used_storage_gb = 0.0
         self.pending_placement_stage_keys.clear()
+        self._stage_budget_visited = None
+        self.last_stage_budget_diagnostics = []
         window_id: int | None = None
         if record:
             if self.pending_window_id is not None:
                 raise RuntimeError("previous slow deployment window has no completed return")
             window_state = self._build_window_state(env, demand, remaining_memory, remaining_storage)
-            state_t = torch.as_tensor(window_state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            with torch.no_grad():
-                normalized_value = float(self.window_critic(state_t).item())
-                old_value = normalized_value * self.critic_return_std + self.critic_return_mean
+            old_value = 0.
+            if self.learning_repair != "prefix-credit-v2":
+                state_t = torch.as_tensor(window_state, dtype=torch.float32, device=self.device).unsqueeze(0)
+                with torch.no_grad():
+                    normalized_value = float(self.window_critic(state_t).item())
+                    old_value = normalized_value * self.critic_return_std + self.critic_return_mean
             window_id = len(self.window_states)
             self.window_states.append(window_state)
             self.window_old_values.append(old_value)
             self.pending_window_id = window_id
 
+        if self.allocation_mode == "stage-budget-v3":
+            from edge_drl.agents.stage_budget import plan_stage_budgets
+            return plan_stage_budgets(self, env, deployment, remaining_memory, remaining_storage,
+                                      demand, window_id, deterministic, record)
         if self.allocation_mode in {"budget-incremental", "budget-continuous-v2"}:
             return self._plan_deployment_budget(
                 env,
@@ -1465,6 +1488,7 @@ class SlowDeploymentPPOAgent:
                 "global-incremental",
                 "budget-incremental",
                 "budget-continuous-v2",
+                "stage-budget-v3",
             }
             else np.asarray(
                 [
@@ -1546,7 +1570,9 @@ class SlowDeploymentPPOAgent:
                     for head, metrics in (("count", count_metrics), ("stage", stage_metrics), ("placement", placement_metrics))
                     for key in ("critic_prequential_ev", "critic_prequential_mse", "critic_post_mse",
                                 "baseline_coef_used", "baseline_coef_next", "critic_replay_windows",
-                                "critic_replay_samples", "critic_optimizer_steps")
+                                "critic_replay_samples", "critic_optimizer_steps", "prefix_trace_lambda",
+                                "prefix_advantage_std", "mc_advantage_std", "actor_gradient_norm",
+                                "entropy_gradient_norm")
                 })
         critic_metrics = self._update_window_critic(trajectory_returns)
         self.last_window_critic_holdout_ev = float(
@@ -1605,6 +1631,7 @@ class SlowDeploymentPPOAgent:
                 + placement_metrics.get("explained_variance", 0.0)
             ),
             "window_critic_explained_variance": critic_metrics["explained_variance"],
+            "window_critic_active": float(self.learning_repair != "prefix-credit-v2"),
             "window_critic_value_loss": critic_metrics["value_loss"],
             "window_critic_raw_value_mse": critic_metrics["raw_value_mse"],
             "window_critic_train_explained_variance": critic_metrics[
@@ -1822,6 +1849,12 @@ class SlowDeploymentPPOAgent:
         return np.clip(attribution, -2.0, 2.0)
 
     def _update_window_critic(self, returns: np.ndarray) -> dict[str, float]:
+        if self.learning_repair == "prefix-credit-v2":
+            # Conditional prefix critics are the actual Actor baselines. Do
+            # not spend updates on the legacy critic whose credit is disabled.
+            return dict.fromkeys(("value_loss", "raw_value_mse", "explained_variance",
+                "train_explained_variance", "holdout_explained_variance", "replay_size",
+                "train_size", "holdout_size", "train_episode_count", "holdout_episode_count"), 0.)
         current_states = np.stack(self.window_states).astype(np.float32, copy=False)
         current_returns = np.asarray(returns, dtype=np.float32)
         self.critic_update_index += 1
@@ -2316,6 +2349,8 @@ class FastSchedulingPPOAgent:
     load_group_weights: tuple[float, ...] | None = None
     full_batch_kl_stop: bool = True
     batch_credit: bool = False
+    update_chunks: int = 1
+    independent_critic: bool = False
     vectorized_features: bool = True
     device: str = "cpu"
     ppo: PPOAgent = field(init=False)
@@ -2368,6 +2403,9 @@ class FastSchedulingPPOAgent:
             detach_critic_backbone=self.batch_credit,
             normalize_value_targets=self.batch_credit,
             guarded_epochs=self.batch_credit,
+            guarded_update_chunks=self.update_chunks,
+            independent_critic=self.independent_critic,
+            critic_lr=5e-4 if self.independent_critic else None,
             device=self.device,
         )
 
@@ -3644,6 +3682,8 @@ class HierarchicalPPOAgent:
         fast_load_balanced_updates: bool = True,
         fast_load_group_weights: tuple[float, ...] | None = None,
         fast_full_batch_kl_stop: bool = True,
+        fast_update_chunks: int = 1,
+        fast_independent_critic: bool = False,
         slow_reward_scale: float = 1.0,
         slow_tail_latency_coef: float = 0.35,
         slow_colocation_coef: float = 0.05,
@@ -3748,6 +3788,8 @@ class HierarchicalPPOAgent:
                 load_group_weights=fast_load_group_weights,
                 full_batch_kl_stop=fast_full_batch_kl_stop,
                 batch_credit=repair,
+                update_chunks=fast_update_chunks,
+                independent_critic=fast_independent_critic,
                 device=device,
             ),
             slow_reward_scale=slow_reward_scale,
@@ -4163,6 +4205,8 @@ class HierarchicalPPOAgent:
             stage_key == (-1, -1)
             for stage_key in self.slow_agent.pending_count_stage_keys
         )
+        if self.slow_agent.allocation_mode == "stage-budget-v3":
+            incremental_add_actions = self.slow_agent.pending_budget_requested_replicas
         budget_fraction = 0.0
         budget_feasible_capacity = 0.0
         budget_replica_slot_upper_bound = 0.0
@@ -4177,6 +4221,7 @@ class HierarchicalPPOAgent:
             self.slow_agent.allocation_mode in {
                 "budget-incremental",
                 "budget-continuous-v2",
+                "stage-budget-v3",
             }
             and self.slow_agent.pending_count_indices
         ):

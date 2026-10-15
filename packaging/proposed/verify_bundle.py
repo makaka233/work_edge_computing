@@ -87,10 +87,10 @@ def main():
             raise RuntimeError(result.stdout + "\n" + result.stderr)
         return result.stdout
     if not options.imports_only:
-        common = ["train_dual_ppo.py", "--pressure-profile", "mec-latency200", "--training-repair", "batch-credit-v1",
-                  "--slow-deployment-context", "deployment-aware-v2", "--train-mode", "joint", "--rollout-unit", "window",
-                  "--slow-allocation-mode", "budget-continuous-v2", "--replicas-per-stage", "0",
+        common = ["train_dual_ppo.py", "--pressure-profile", "mec-latency200", "--proposed-design", "joint-credit-v2",
+                  "--train-mode", "joint", "--rollout-unit", "window", "--replicas-per-stage", "0",
                   "--num-users", "10000", "--num-edge-nodes", "8", "--num-service-types", "2",
+                  "--mean-requests-per-minute", "600",
                   "--episode-minutes", "60", "--fast-windows-per-update", "6", "--slow-windows-per-update", "6",
                   "--sampled-seconds-per-window", "1", "--sampling-max-interval-seconds", "600",
                   "--slow-critic-k-epochs", "2", "--slow-k-epochs", "1", "--slow-stage-k-epochs", "1",
@@ -109,10 +109,19 @@ def main():
         assert args["network_constraint_mode"] == "shared-nic"
         assert args["service_calibration_mode"] == "audited-v1"
         assert args["temporal_sampling_mode"] == "stratified-jitter"
+        assert args["proposed_design"] == "joint-credit-v2"
+        assert args["slow_allocation_mode"] == "stage-budget-v3"
+        assert args["slow_learning_repair"] == "prefix-credit-v2"
+        assert data["fast_independent_critic"]
+        assert data["fast_update_chunks"] == 4
+        best = torch.load(target / "checkpoints/best.pt", map_location="cpu", weights_only=False)
+        assert best["metadata"]["selection_kind"] == "post_update_nominal_probe_v2"
         with (target / "logs/training.csv").open(encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
         assert [int(row["update"]) for row in rows] == [1, 2]
         assert all(float(row["invalid_actions"]) == 0 for row in rows)
+        assert all(float(row["slow_updated"]) == 1 and float(row["fast_optimizer_steps"]) > 0 for row in rows)
+        assert all(float(row["sampled_request_events"]) < float(row["request_events"]) for row in rows)
         with (target / "logs/episode_metrics.csv").open(encoding="utf-8", newline="") as handle:
             episodes = list(csv.DictReader(handle))
         assert len(episodes) == 2 and all(float(row["episode_complete"]) == 1 for row in episodes)
@@ -124,8 +133,10 @@ def main():
         run(["scripts/analyze_convergence.py", str(target / "logs/training.csv")])
         run(["scripts/calibrate_environment.py", "--output", "_verification_runs/resource_report.json"])
         # Fast-only initialization exercises a lazy import not used by fresh training.
-        run(common + ["--run-name", "fast_init", "--init-fast-checkpoint", str(checkpoint)])
+        run(common + ["--run-name", "fast_init", "--init-fast-checkpoint", str(checkpoint), "--init-fast-actor-only"])
         report["fast_initialization_verified"] = True
+        report["proposed_design"] = args["proposed_design"]
+        report["post_update_probe_selection_verified"] = True
         from edge_drl.comparison.checkpoint import build_proposed_agent
         from train_dual_ppo import build_env
         from argparse import Namespace

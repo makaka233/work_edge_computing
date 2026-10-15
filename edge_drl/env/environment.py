@@ -660,6 +660,7 @@ class EdgeComputingEnv:
         # Each entry is now one independent request.  All requests in this
         # second are still settled jointly, preserving one-second time steps.
         self.metrics["request_events"] += float(len(requests)) * represented_seconds
+        self.metrics["sampled_request_events"] = self.metrics.get("sampled_request_events", 0.) + len(requests)
         self.metrics["time_steps"] += represented_seconds
         self.metrics["settlement_steps"] += 1.0
         self._update_dynamic_loads_batch(group_infos, requests, represented_seconds=represented_seconds)

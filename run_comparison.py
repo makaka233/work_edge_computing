@@ -80,6 +80,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional number of independently seeded routing repeats per trace",
     )
+    parser.add_argument("--sampling-protocol", choices=("auto", "legacy-left-hold", "training-equivalent-v2"),
+                        default="auto", help="auto preserves old checkpoints; new joint-credit-v2 uses training jitter/hold cap")
     return parser.parse_args()
 
 
@@ -93,6 +95,7 @@ def main() -> None:
         run_id=args.run_id,
         schemes=tuple(args.schemes),
         baseline_implementation=args.baseline_implementation,
+        sampling_protocol=args.sampling_protocol,
         phase2_validation_run=args.phase2_validation_run,
         monolithic_checkpoint=args.monolithic_checkpoint,
         monolithic_checkpoint_mode=args.monolithic_checkpoint_mode,

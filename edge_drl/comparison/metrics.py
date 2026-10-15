@@ -17,6 +17,8 @@ def evaluate_scheme_episode(
     routing_repeat: int,
     sampled_seconds_per_window: int = 0,
     service_latency_rows: list[dict] | None = None,
+    sampling_protocol: str = "legacy-left-hold",
+    sampling_max_interval_seconds: float = 0.,
 ) -> EpisodeResult:
     if sampled_seconds_per_window < 0:
         raise ValueError("sampled_seconds_per_window must be >= 0")
@@ -47,9 +49,12 @@ def evaluate_scheme_episode(
     wall_start = time.perf_counter()
 
     window_seconds = float(env.config.deployment_interval_minutes * 60)
-    represented_seconds = 1.0
-    if 0 < sampled_seconds_per_window < window_seconds:
-        represented_seconds = window_seconds / float(sampled_seconds_per_window)
+    if sampling_protocol not in {"legacy-left-hold", "training-equivalent-v2"}:
+        raise ValueError("unknown comparison sampling protocol")
+    from edge_drl.sampling import interval_seconds
+    represented_seconds = interval_seconds(
+        window_seconds, sampled_seconds_per_window,
+        sampling_max_interval_seconds if sampling_protocol == "training-equivalent-v2" else 0.)
 
     while not env.done:
         remaining_seconds = max(
@@ -59,6 +64,8 @@ def evaluate_scheme_episode(
         step_represented_seconds = min(represented_seconds, remaining_seconds)
         if step_represented_seconds < 1.0 - 1e-9:
             break
+        if sampling_protocol == "training-equivalent-v2":
+            env.sample_interval_requests(step_represented_seconds)
         planning_start = time.perf_counter()
         scheme.maybe_plan(env)
         planning_time += time.perf_counter() - planning_start
